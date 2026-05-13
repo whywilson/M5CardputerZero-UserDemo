@@ -81,6 +81,27 @@ static bool g_mod_aa   = false;  // CapsLock / Shift
 static bool g_mod_fn   = false;  // Fn layer
 static bool g_mod_ctrl = false;  // Ctrl
 static bool g_mod_alt  = false;  // Alt
+static SDL_Keycode g_pressed_key = SDLK_UNKNOWN;
+
+static void inject_sdl_key(SDL_Keycode key, bool down);
+
+static SDL_Keycode resolve_click_key(int r, int c)
+{
+    const SDL_Keycode base = g_keys[r][c].key;
+    if (!g_mod_fn) return base;
+
+    switch (base) {
+    case SDLK_f: return SDLK_UP;
+    case SDLK_z: return SDLK_LEFT;
+    case SDLK_x: return SDLK_DOWN;
+    case SDLK_c: return SDLK_RIGHT;
+    case SDLK_k: return SDLK_PAGEUP;
+    case SDLK_l: return SDLK_PAGEDOWN;
+    case SDLK_n: return SDLK_HOME;
+    case SDLK_m: return SDLK_END;
+    default: return base;
+    }
+}
 
 static bool is_modifier(int r, int c)
 {
@@ -93,11 +114,28 @@ static bool is_modifier(int r, int c)
 
 static void toggle_modifier(int r, int c)
 {
-    if (r == MOD_SYM_R && c == MOD_SYM_C)   g_mod_sym = !g_mod_sym;
-    if (r == MOD_AA_R && c == MOD_AA_C)      g_mod_aa = !g_mod_aa;
-    if (r == MOD_FN_R && c == MOD_FN_C)      g_mod_fn = !g_mod_fn;
-    if (r == MOD_CTRL_R && c == MOD_CTRL_C)  g_mod_ctrl = !g_mod_ctrl;
-    if (r == MOD_ALT_R && c == MOD_ALT_C)    g_mod_alt = !g_mod_alt;
+    if (r == MOD_SYM_R && c == MOD_SYM_C) {
+        g_mod_sym = !g_mod_sym;
+        inject_sdl_key(SDLK_F1, true);
+        inject_sdl_key(SDLK_F1, false);
+    }
+    if (r == MOD_AA_R && c == MOD_AA_C) {
+        g_mod_aa = !g_mod_aa;
+        inject_sdl_key(SDLK_LSHIFT, g_mod_aa);
+    }
+    if (r == MOD_FN_R && c == MOD_FN_C) {
+        g_mod_fn = !g_mod_fn;
+        inject_sdl_key(SDLK_F2, true);
+        inject_sdl_key(SDLK_F2, false);
+    }
+    if (r == MOD_CTRL_R && c == MOD_CTRL_C) {
+        g_mod_ctrl = !g_mod_ctrl;
+        inject_sdl_key(SDLK_LCTRL, g_mod_ctrl);
+    }
+    if (r == MOD_ALT_R && c == MOD_ALT_C) {
+        g_mod_alt = !g_mod_alt;
+        inject_sdl_key(SDLK_LALT, g_mod_alt);
+    }
 }
 
 static int g_pr = -1, g_pc = -1;
@@ -247,21 +285,111 @@ static void render()
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
+#include <sys/stat.h>
 
 typedef void (*ui_init_fn)(void);
+
+// ── Hot-reload state ─────────────────────────────────────────────
+static void   *g_app_handle = nullptr;
+static ui_init_fn g_app_init  = nullptr;
+static char    g_app_path[512] = {};
+static int     g_reload_gen   = 0;   // incremented each reload
+static time_t  g_dylib_mtime  = 0;
+
+static time_t dylib_mtime(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return st.st_mtime;
+}
+
+// Copy dylib to a versioned temp name so dyld doesn't cache the old one.
+// Returns true and fills dst_path on success.
+static bool copy_dylib(const char *src, char *dst, size_t dst_size, int gen)
+{
+    // Build temp path next to the source
+    const char *dot = strrchr(src, '.');
+    if (!dot) dot = src + strlen(src);
+    snprintf(dst, dst_size, "%.*s_live%d.dylib", (int)(dot - src), src, gen);
+    FILE *in  = fopen(src, "rb");
+    FILE *out = fopen(dst, "wb");
+    if (!in || !out) {
+        if (in)  fclose(in);
+        if (out) fclose(out);
+        return false;
+    }
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+        fwrite(buf, 1, n, out);
+    fclose(in);
+    fclose(out);
+    return true;
+}
+
+static bool load_app(const char *path)
+{
+    char tmp[512];
+    if (!copy_dylib(path, tmp, sizeof(tmp), g_reload_gen)) {
+        fprintf(stderr, "[HOT] copy failed: %s\n", path);
+        return false;
+    }
+    void *h = emu_dlopen(tmp);
+    if (!h) {
+        fprintf(stderr, "[HOT] dlopen %s: %s\n", tmp, emu_dlerror());
+        return false;
+    }
+
+    auto kbd_create = (sdl_kbd_create_fn)emu_dlsym(h, "lv_sdl_keyboard_create");
+    auto kbd_handler = (sdl_kbd_handler_fn)emu_dlsym(h, "lv_sdl_keyboard_handler");
+    auto app_init   = (ui_init_fn)emu_dlsym(h, "ui_init");
+    if (!app_init) {
+        fprintf(stderr, "[HOT] ui_init missing in %s\n", tmp);
+        emu_dlclose(h);
+        return false;
+    }
+
+    // Tear down previous app
+    if (g_app_handle) {
+        lv_obj_clean(lv_screen_active());
+        emu_dlclose(g_app_handle);
+    }
+
+    g_app_handle  = h;
+    g_app_init    = app_init;
+    g_kbd_handler = kbd_handler;
+
+    if (kbd_create) kbd_create();
+    app_init();
+    g_dylib_mtime = dylib_mtime(path);
+    printf("[HOT] gen=%d  loaded %s\n", g_reload_gen, tmp);
+    ++g_reload_gen;
+    return true;
+}
 
 #ifdef EMU_STATIC_APP
 extern "C" {
     void ui_init(void);
     void lv_sdl_keyboard_handler(SDL_Event *event);
 }
-// APPLaunch's src/main.cpp defines LV_EVENT_BATTERY, but the Windows
-// static build doesn't compile that file — provide a stub here so the
-// UI code that references it links. (Never fired on emulator.)
+// Windows static build: provide symbols that APPLaunch's src/main.cpp normally defines.
 #if defined(_WIN32) && defined(EMU_STATIC_APP)
 #include <cstdint>
 extern "C" volatile uint32_t LV_EVENT_BATTERY = 0;
 #endif
+#endif
+
+// macOS dynamic (dlopen) build: the dylib uses -undefined dynamic_lookup, so
+// undefined symbols in the dylib must exist in the host executable at dlopen time.
+#if defined(__APPLE__) && !defined(EMU_STATIC_APP)
+#include <cstdint>
+extern "C" {
+    volatile uint32_t LV_EVENT_BATTERY    = 0;
+    volatile uint32_t LV_EVENT_KEYBOARD   = 0;
+    volatile int      LVGL_HOME_KEY_FLAGE = 0;
+    volatile int      LVGL_RUN_FLAGE      = 1;
+    void*             g_launch_thread_pool = nullptr;
+}
 #endif
 
 // Set working directory to the exe's directory so relative paths work
@@ -352,27 +480,11 @@ int main(int argc, char *argv[])
     printf("[EMU] Loaded: %s\n", app_path);
     ui_init();
 #else
-    void *app = emu_dlopen(app_path);
-    if (!app) { fprintf(stderr, "[EMU] dlopen: %s\n", emu_dlerror()); return 1; }
-    printf("[EMU] Loaded: %s\n", app_path);
-
-    auto kbd_create = (sdl_kbd_create_fn)emu_dlsym(app, "lv_sdl_keyboard_create");
-    g_kbd_handler = (sdl_kbd_handler_fn)emu_dlsym(app, "lv_sdl_keyboard_handler");
-
-    if (kbd_create) {
-        kbd_create();
-        printf("[EMU] App keyboard driver loaded\n");
-    } else {
-        lv_indev_t *kb = lv_indev_create();
-        lv_indev_set_type(kb, LV_INDEV_TYPE_KEYPAD);
-        printf("[EMU] Built-in keyboard driver\n");
-    }
-
-    ui_init_fn app_init = (ui_init_fn)emu_dlsym(app, "ui_init");
-    if (!app_init) { fprintf(stderr, "[EMU] ui_init missing\n"); return 1; }
-    app_init();
+    strncpy(g_app_path, app_path, sizeof(g_app_path) - 1);
+    if (!load_app(g_app_path)) return 1;
+    printf("[EMU] App keyboard driver loaded\n");
 #endif
-    printf("[EMU] Running.\n");
+    printf("[EMU] Running.  F5 = hot reload\n");
 
     while (true) {
         SDL_Event ev;
@@ -403,7 +515,7 @@ int main(int argc, char *argv[])
 #ifdef EMU_STATIC_APP
                         ui_init();
 #else
-                        app_init();
+                        if (g_app_init) { lv_obj_clean(lv_screen_active()); g_app_init(); }
 #endif
                     }
                     g_side_pr = -1;
@@ -415,7 +527,8 @@ int main(int argc, char *argv[])
                         toggle_modifier(r, c);
                     } else {
                         g_pr = r; g_pc = c;
-                        inject_sdl_key(g_keys[r][c].key, true);
+                        g_pressed_key = resolve_click_key(r, c);
+                        inject_sdl_key(g_pressed_key, true);
                     }
                 }
             }
@@ -424,12 +537,22 @@ int main(int argc, char *argv[])
                     inject_sdl_key(g_side_keys[g_side_pr].key, false);
                     g_side_pr = -1;
                 } else if (g_pr >= 0) {
-                    inject_sdl_key(g_keys[g_pr][g_pc].key, false);
+                    inject_sdl_key(g_pressed_key == SDLK_UNKNOWN ? g_keys[g_pr][g_pc].key : g_pressed_key, false);
                     g_pr = -1;
+                    g_pc = -1;
+                    g_pressed_key = SDLK_UNKNOWN;
                 }
             }
             else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP ||
                      ev.type == SDL_TEXTINPUT) {
+#ifndef EMU_STATIC_APP
+                // F5 = manual hot reload
+                if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F5) {
+                    printf("[HOT] F5 — reloading\n");
+                    load_app(g_app_path);
+                    continue;
+                }
+#endif
                 if (g_kbd_handler) g_kbd_handler(&ev);
             }
         }
@@ -438,12 +561,25 @@ int main(int argc, char *argv[])
         lv_timer_handler();
         render();
         SDL_Delay(5);
+
+#ifndef EMU_STATIC_APP
+        // Auto hot-reload: check dylib mtime every ~30 frames (~150ms)
+        static int mtime_tick = 0;
+        if (++mtime_tick >= 30) {
+            mtime_tick = 0;
+            time_t mt = dylib_mtime(g_app_path);
+            if (mt && mt != g_dylib_mtime) {
+                printf("[HOT] dylib changed — reloading\n");
+                load_app(g_app_path);
+            }
+        }
+#endif
     }
 
 done:
     free(g_lcd_buf);
 #ifndef EMU_STATIC_APP
-    emu_dlclose(app);
+    if (g_app_handle) emu_dlclose(g_app_handle);
 #endif
     SDL_DestroyTexture(g_lcd_tex);
     SDL_DestroyTexture(g_skin_tex);

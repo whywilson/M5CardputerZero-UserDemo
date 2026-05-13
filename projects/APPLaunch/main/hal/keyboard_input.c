@@ -989,8 +989,11 @@ void lv_sdl_keyboard_handler(SDL_Event * event)
             }
             dsc->cur_valid = true;
 
-            /* 控制键 -> LV_KEY_* */
-            const uint32_t ctrl_key = keycode_to_ctrl_key(sym);
+            /* 控制键 -> LV_KEY_*；Ctrl+S 作为保存快捷键抛出 KEY_S */
+            uint32_t ctrl_key = keycode_to_ctrl_key(sym);
+            if(ctrl_key == '\0' && (md & KMOD_CTRL) && sym == SDLK_s) {
+                ctrl_key = KEY_S;
+            }
             if(ctrl_key == '\0') return;    /* 普通字符交给 SDL_TEXTINPUT 处理 */
 
             const size_t blen = lv_strlen(dsc->buf);

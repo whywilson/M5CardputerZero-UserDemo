@@ -172,8 +172,10 @@ public:
                               img_path("mesh.png"), page_v<UIMeshPage>);
         app_list.emplace_back("REC",
                               img_path("rec.png"), page_v<UIRecPage>);
+#ifndef HAL_PLATFORM_SDL
         app_list.emplace_back("CAMERA",
                               img_path("camera.png"), page_v<UICameraPage>);
+#endif
         app_list.emplace_back("GAME",
                               img_path("gmae.png"), page_v<UIGamePage>);
         app_list.emplace_back("UnitEnv",
@@ -184,9 +186,13 @@ public:
         app_list.emplace_back("Gpio",
                               img_path("Gpio.png"), page_v<UIGpioPage>);
         
+#ifndef HAL_PLATFORM_SDL
         app_list.emplace_back("LORA", img_path("mesh.png"), page_v<UILoraPage>);
+#endif
 
         app_list.emplace_back("GALLERY", img_path("camera.png"), page_v<UIGalleryPage>);
+
+        app_list.emplace_back("RFID", img_path("rfid.png"), page_v<UINfcPage>);
 
         app_list.emplace_back("HIKEPOD", img_path("hack.png"), page_v<UIHikePodPage>);
 

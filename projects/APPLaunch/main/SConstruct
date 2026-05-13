@@ -42,6 +42,10 @@ REQUIREMENTS += ['lvgl_component', 'pthread']
 
 # add miniaudio
 REQUIREMENTS += ['Miniaudio']
+# Ensure miniaudio.h is findable on all platforms (ext_components/Miniaudio/include)
+_miniaudio_include = os.path.join(os.environ.get("EXT_COMPONENTS_PATH", ""), "Miniaudio", "include")
+if os.path.isdir(_miniaudio_include):
+    INCLUDE += [_miniaudio_include]
 
 # add 
 if 'CONFIG_BACKWARD_CPP_ENABLED' in os.environ:
