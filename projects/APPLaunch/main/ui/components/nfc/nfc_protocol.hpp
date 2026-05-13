@@ -8,6 +8,10 @@
 #include <sstream>
 #include <vector>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 namespace nfc_app {
 
 struct Pn532FirmwareInfo {
@@ -87,6 +91,41 @@ class Pn532KillerClient {
 public:
     explicit Pn532KillerClient(INfcTransport *transport) : transport_(transport) {}
 
+    // Send HSU wakeup preamble and drain any stale bytes.
+    // Must be called once after opening the serial port.
+    void send_wakeup()
+    {
+        static const uint8_t wake[] = {
+            0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        };
+        transport_->write_bytes(wake, sizeof(wake), nullptr);
+        // Drain any pending RX bytes and wait ~15 ms for the chip to wake.
+        uint8_t drain[64];
+        transport_->read_bytes(drain, sizeof(drain), 15, nullptr);
+    }
+
+    // SAMConfiguration – put PN532 into Normal mode (required before NFC ops).
+    bool sam_configuration(std::string *error)
+    {
+        // Mode 0x01 = Normal, Timeout 0x00, IRQ 0x01
+        const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0x14, {0x01, 0x00, 0x01});
+        if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) return false;
+        std::vector<uint8_t> rx;
+        collect_response(&rx, nullptr); // response is 0xD5 0x15, ignore errors
+        return true;
+    }
+
+    // SetWorkMode for PN532Killer (0xAC): mode=1 READER, type=1 MFC, index=0.
+    bool set_work_mode(uint8_t mode, uint8_t type, uint8_t index, std::string *error)
+    {
+        const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0xAC, {mode, type, index});
+        if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) return false;
+        std::vector<uint8_t> rx;
+        collect_response(&rx, nullptr);
+        return true;
+    }
+
     std::optional<Pn532FirmwareInfo> query_firmware(std::string *error)
     {
         if (!transport_ || !transport_->is_open()) {
@@ -124,10 +163,9 @@ public:
         return info;
     }
 
-    // Attempt to identify PN532Killer by sending a vendor-specific probe.
-    // PN532Killer firmware (Bruce project) responds to 0xFE with a 2-byte
-    // version string if enabled; plain PN532 will return an error frame or
-    // time-out.  Returns true only when a PN532Killer vendor reply is seen.
+    // Detect PN532Killer using checkPn532Killer vendor command (0xAA).
+    // PN532Killer responds with TFI=0xD5, cmd=0xAB, status 0x00.
+    // Plain PN532 returns an error frame (cmd=0x7F) or times out.
     bool probe_pn532killer(std::string *error)
     {
         if (!transport_ || !transport_->is_open()) {
@@ -135,51 +173,60 @@ public:
             return false;
         }
 
-        // PN532Killer "GetKillerVersion" vendor command (0xFE payload 0x00)
-        const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0xFE, {0x00});
+        // Pn532KillerCommand.checkPn532Killer = 0xAA
+        const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0xAA, {});
         if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) {
             return false;
         }
 
         std::vector<uint8_t> rx;
-        // Short timeout: real PN532 will either not respond or return error frame
         uint8_t buf[64];
         rx.clear();
-        for (int i = 0; i < 4; ++i) {
-            ssize_t got = transport_->read_bytes(buf, sizeof(buf), 80, error);
+        for (int i = 0; i < 5; ++i) {
+            ssize_t got = transport_->read_bytes(buf, sizeof(buf), 100, error);
             if (got > 0) rx.insert(rx.end(), buf, buf + got);
-            if (!rx.empty()) break;
+            if (Pn532FrameCodec::parse_first_frame(rx, nullptr)) break;
         }
         if (rx.empty()) return false;
 
-        // PN532Killer replies with a response frame whose TFI byte is 0xD5
-        // and command byte 0xFF (0xFE+1); plain PN532 replies with an error
-        // frame (TFI=0xD5, cmd=0x7F) or nothing.
         std::vector<uint8_t> data;
         if (!Pn532FrameCodec::parse_first_frame(rx, &data)) return false;
         if (data.size() < 2) return false;
         if (data[0] != 0xD5) return false;
-        // Error frame from real PN532 has cmd 0x7F
+        // Error frame from plain PN532: cmd byte 0x7F
         if (data[1] == 0x7F) return false;
-        // Any non-error response to cmd 0xFE is treated as PN532Killer
-        return (data[1] == 0xFF);
+        // PN532Killer responds with cmd = 0xAB (0xAA + 1)
+        return (data[1] == 0xAB);
     }
 
     // Convenience: probe device kind in one call.
     // Returns DeviceKind and fills firmware string.
+    // Flow: wakeup → GetFirmwareVersion → checkPn532Killer
+    //        → for PN532Killer: SetWorkMode(READER)
+    //        → for plain PN532: SAMConfiguration(Normal)
     DeviceKind detect_device(std::string *firmware_out, std::string *error)
     {
         if (firmware_out) firmware_out->clear();
 
+        // Step 1: HSU wakeup preamble (required for both PN532 and PN532Killer)
+        send_wakeup();
+
+        // Step 2: query firmware version
         auto fw = query_firmware(error);
         if (!fw) return DeviceKind::Unknown;
 
         const std::string fw_str = fw->chip + " " + fw->version;
         if (firmware_out) *firmware_out = fw_str;
 
-        // Only attempt PN532Killer probe when connected over USB-serial
-        // (UART plain PN532 doesn't have killer firmware in typical setups)
-        if (probe_pn532killer(nullptr)) return DeviceKind::PN532Killer;
+        // Step 3: distinguish PN532Killer from plain PN532
+        if (probe_pn532killer(nullptr)) {
+            // Step 4a: set PN532Killer to READER mode (type=MFC=1, slot=0)
+            set_work_mode(0x01, 0x01, 0x00, nullptr);
+            return DeviceKind::PN532Killer;
+        }
+
+        // Step 4b: configure plain PN532 into Normal mode
+        sam_configuration(nullptr);
         return DeviceKind::PN532;
     }
 
