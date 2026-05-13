@@ -157,6 +157,69 @@ public:
         selected_endpoint_ = (selected_endpoint_ + delta + count) % count;
     }
 
+    // Cycle through MOCK → USB → UART → MOCK (skip kinds not available).
+    // Does NOT auto-connect; just selects the endpoint and returns.
+    bool cycle_device_mode(std::string *status = nullptr)
+    {
+        refresh_endpoints();
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // Build ordered cycle: Mock always present, then USB/UART if available
+        std::vector<TransportKind> cycle;
+        cycle.push_back(TransportKind::Mock);
+        bool has_usb = false, has_uart = false;
+        for (const auto &ep : endpoints_) {
+            if (ep.kind == TransportKind::UsbSerial)  has_usb  = true;
+            if (ep.kind == TransportKind::UartSerial) has_uart = true;
+        }
+        if (has_usb)  cycle.push_back(TransportKind::UsbSerial);
+        if (has_uart) cycle.push_back(TransportKind::UartSerial);
+
+        // Determine current kind
+        TransportKind current_kind = TransportKind::Mock;
+        if (!endpoints_.empty() && selected_endpoint_ < static_cast<int>(endpoints_.size()))
+            current_kind = endpoints_[selected_endpoint_].kind;
+
+        // Find next kind in cycle
+        TransportKind target_kind = cycle[0];
+        for (size_t i = 0; i < cycle.size(); ++i) {
+            if (cycle[i] == current_kind) {
+                target_kind = cycle[(i + 1) % cycle.size()];
+                break;
+            }
+        }
+
+        // Select first endpoint matching target kind (prefer configured UART path)
+        int target_index = -1;
+        if (target_kind == TransportKind::UartSerial && !uart_config_.device_path.empty()) {
+            for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
+                if (endpoints_[i].kind == target_kind && endpoints_[i].path == uart_config_.device_path) {
+                    target_index = i;
+                    break;
+                }
+            }
+        }
+        if (target_index < 0) {
+            for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
+                if (endpoints_[i].kind == target_kind) {
+                    target_index = i;
+                    break;
+                }
+            }
+        }
+        if (target_index < 0) {
+            if (status) *status = std::string("No ") + to_string(target_kind) + " endpoint";
+            return false;
+        }
+
+        // Disconnect old transport before switching
+        if (transport_) { transport_->close(); transport_.reset(); }
+        connection_ = ConnectionState{};
+        selected_endpoint_ = target_index;
+        if (status) *status = std::string("Mode: ") + to_string(target_kind);
+        return true;
+    }
+
     // Toggle between USB and UART endpoint groups, prefer configured UART path,
     // then auto-connect and probe the selected device.
     bool cycle_transport_mode(std::string *status = nullptr)

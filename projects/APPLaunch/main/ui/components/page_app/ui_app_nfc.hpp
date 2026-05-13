@@ -172,7 +172,7 @@ private:
             break;
         case KEY_TAB:
             if (current_tab_ == Tab::Read) {
-                service_.cycle_transport_mode(&ui_message_);
+                service_.cycle_device_mode(&ui_message_);
                 render_all();
             } else if (current_tab_ == Tab::Emulator) {
                 service_.toggle_slot_protocol();
@@ -401,17 +401,38 @@ private:
         const auto endpoint = service_.current_endpoint();
 
         lv_obj_t *summary = create_panel(parent, 0, 0, 320, 34, 0x161616);
-        create_text(summary, 6, 4, "Transport", 0x8E8E8E, 11);
-        create_text(summary, 64, 4,
-                    endpoint.kind == nfc_app::TransportKind::UartSerial ? "UART" :
-                    endpoint.kind == nfc_app::TransportKind::UsbSerial ? "USB" : "MOCK",
-                    0xFFFFFF, 12);
-        create_text(summary, 6, 18, to_compact(endpoint.label, 24).c_str(), 0x00D2FF, 11);
-        create_text(summary, 164, 18, connection.detail.empty() ? "Tab switch transport" : to_compact(connection.detail, 22).c_str(), 0xA8A8A8, 11);
+        // Mode tabs: MOCK | USB | UART
+        {
+            const nfc_app::TransportKind cur = endpoint.kind;
+            struct { const char *label; nfc_app::TransportKind kind; int x; } modes[] = {
+                {"MOCK", nfc_app::TransportKind::Mock,        4},
+                {"USB",  nfc_app::TransportKind::UsbSerial,  56},
+                {"UART", nfc_app::TransportKind::UartSerial, 100},
+            };
+            for (auto &m : modes) {
+                const bool active = (m.kind == cur);
+                lv_obj_t *pill = lv_obj_create(summary);
+                lv_obj_set_size(pill, 44, 14);
+                lv_obj_set_pos(pill, m.x, 2);
+                lv_obj_set_style_radius(pill, 3, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(pill, lv_color_hex(active ? 0xF7A600 : 0x303030), LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_opa(pill, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_border_width(pill, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_pad_all(pill, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_t *lbl = lv_label_create(pill);
+                lv_label_set_text(lbl, m.label);
+                lv_obj_set_style_text_color(lbl, lv_color_hex(active ? 0x000000 : 0x909090), LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_font(lbl, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_center(lbl);
+            }
+        }
+        create_text(summary, 152, 4, to_compact(endpoint.label, 22).c_str(), 0x00D2FF, 11);
+        create_text(summary, 152, 18, connection.detail.empty() ? "Tab:mode  OK:scan" : to_compact(connection.detail, 22).c_str(), 0xA8A8A8, 11);
 
         lv_obj_t *actions = create_panel(parent, 0, 38, 116, 82, 0x101010);
         create_text(actions, 6, 6, "Read Flow", 0xFFFFFF, 12);
-        create_text(actions, 6, 24, "Tab: USB/UART", 0xD8D8D8, 11);
+        create_text(actions, 6, 24, "Tab:MOCK/USB/UART", 0xD8D8D8, 11);
         create_text(actions, 6, 38, "Auto detect", 0xD8D8D8, 11);
         create_text(actions, 6, 52, "OK: scan card", 0xF7A600, 11);
         create_text(actions, 6, 66, connection.connected ? "Connected" : "Ready", 0x8DB6FF, 11);
@@ -424,7 +445,7 @@ private:
         create_text(detail, 6, 47, (std::string("Proto: ") + (scan.has_result ? nfc_app::to_string(record.tag.protocol) : "-")).c_str(), 0xD8D8D8, 11);
         create_text(detail, 6, 61, (std::string("Source: ") + (scan.has_result ? record.meta.source : scan.error)).c_str(), 0x8DB6FF, 11);
 
-        create_footer(parent, std::string("Tab transport  OK scan  S save  L/R page  ESC back  ") + ui_message_);
+        create_footer(parent, std::string("Tab:mode  OK:scan  S:save  L/R:page  ESC:back  ") + ui_message_);
     }
 
     void render_saved_tab(lv_obj_t *parent)
