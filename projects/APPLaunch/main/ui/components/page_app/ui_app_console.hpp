@@ -1,4 +1,5 @@
 #pragma once
+#ifndef HAL_PLATFORM_SDL
 #include "../ui_app_page.hpp"
 #include <stdio.h>
 #include <string.h>
@@ -1215,3 +1216,14 @@ private:
     }
 
 };
+
+#else  // HAL_PLATFORM_SDL stub
+#include "../ui_app_page.hpp"
+#include <string>
+class UIConsolePage : public app_base {
+public:
+    bool terminal_sysplause = true;
+    UIConsolePage() : app_base() {}
+    void exec(std::string /*cmd*/) {}
+};
+#endif  // HAL_PLATFORM_SDL

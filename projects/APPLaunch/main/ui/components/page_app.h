@@ -18,6 +18,7 @@
 #include "page_app/ui_app_mesh.hpp"
 #include "page_app/ui_app_midi.hpp"
 #include "page_app/ui_app_music.hpp"
+#include "page_app/ui_app_nfc.hpp"
 #include "page_app/ui_app_rec.hpp"
 #include "page_app/ui_app_setup.hpp"
 #include "page_app/ui_app_ssh.hpp"

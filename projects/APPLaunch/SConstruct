@@ -36,6 +36,23 @@ if "cross" in os.environ.get("CONFIG_DEFAULT_FILE", ''):
 os.environ["SDK_PATH"] = str(sdk_path)
 os.environ["EXT_COMPONENTS_PATH"] = str(sdk_path.parent / "ext_components")
 
+# Inject build version info via a generated header (build/config/ is in CPPPATH).
+_app_version = "v1.0.0"
+try:
+    _git_hash = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=str(local_path.parent.parent),
+        stderr=subprocess.DEVNULL,
+    ).decode().strip()
+except Exception:
+    _git_hash = "unknown"
+
+os.makedirs("build/config", exist_ok=True)
+with open("build/config/version_info.h", "w") as _vf:
+    _vf.write('#pragma once\n')
+    _vf.write('#define APP_VERSION "{}"\n'.format(_app_version))
+    _vf.write('#define APP_GIT_HASH "{}"\n'.format(_git_hash))
+
 env = SConscript(
     str(sdk_path / "tools" / "scons" / "project.py"),
     variant_dir=os.getcwd(),

@@ -2,6 +2,8 @@
 
 #include "../ui_app_page.hpp"
 
+#ifndef HAL_PLATFORM_SDL
+
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -980,3 +982,12 @@ private:
         }
     }
 };
+
+#else  // HAL_PLATFORM_SDL — stub so emulator compiles without libcamera
+
+class UICameraPage : public app_base {
+public:
+    UICameraPage() : app_base() { set_page_title("Camera"); }
+};
+
+#endif  // HAL_PLATFORM_SDL

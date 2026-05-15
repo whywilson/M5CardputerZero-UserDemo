@@ -4,7 +4,7 @@
 
 extern threadpool g_launch_thread_pool;
 
-static void _battery_timer_cb(int *workingp)
+static void _battery_timer_cb(void *workingp)
 {
     lv_battery_event_data_t data;
     memset(&data, 0, sizeof(data));
@@ -16,7 +16,7 @@ static void _battery_timer_cb(int *workingp)
         lv_obj_send_event(root, (lv_event_code_t)LV_EVENT_BATTERY, &data);
     }
     lv_unlock();
-    *workingp = 0;
+    *(int*)workingp = 0;
 }
 
 

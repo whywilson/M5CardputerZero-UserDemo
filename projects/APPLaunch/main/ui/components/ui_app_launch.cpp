@@ -99,10 +99,12 @@ public:
     app_launch_S()
     {
         // 固定图标，不允许用户修改
-        app_list.emplace_back("Python",
-                              img_path("PYTHON_logo.png"), "python3", true, false);
+        app_list.emplace_back("RFID",
+                              img_path("rfid.png"), page_v<UINfcPage>);
         app_list.emplace_back("STORE",
                               img_path("Store_logo.png"), page_v<UIStorePage>);
+        app_list.emplace_back("Python",
+                              img_path("PYTHON_logo.png"), "python3", true, false);
         app_list.emplace_back("CLI",
                               img_path("CLI_logo.png"), "bash", true, false);
         app_list.emplace_back("CLAW",
@@ -172,8 +174,10 @@ public:
                               img_path("mesh.png"), page_v<UIMeshPage>);
         app_list.emplace_back("REC",
                               img_path("rec.png"), page_v<UIRecPage>);
+#ifndef HAL_PLATFORM_SDL
         app_list.emplace_back("CAMERA",
                               img_path("camera.png"), page_v<UICameraPage>);
+#endif
         app_list.emplace_back("GAME",
                               img_path("gmae.png"), page_v<UIGamePage>);
         app_list.emplace_back("UnitEnv",
@@ -184,7 +188,9 @@ public:
         app_list.emplace_back("Gpio",
                               img_path("Gpio.png"), page_v<UIGpioPage>);
         
+#ifndef HAL_PLATFORM_SDL
         app_list.emplace_back("LORA", img_path("mesh.png"), page_v<UILoraPage>);
+#endif
 
         app_list.emplace_back("GALLERY", img_path("camera.png"), page_v<UIGalleryPage>);
 

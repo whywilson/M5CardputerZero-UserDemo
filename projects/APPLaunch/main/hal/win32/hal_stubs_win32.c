@@ -16,6 +16,7 @@ const char *hal_path_font_mono(void)        { return "/font/mono.ttf"; }
 const char *hal_path_keyboard_device(void)  { return 0; }
 const char *hal_path_keyboard_map(void)     { return 0; }
 const char *hal_path_store_sync_cmd(void)   { return ""; }
+const char *hal_path_nfc_dumps_dir(void)    { return "/nfc_data/records"; }
 
 /* Process */
 int  hal_process_exec_blocking(const char *p, volatile int *f) { (void)p; (void)f; return -1; }

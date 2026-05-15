@@ -77,16 +77,17 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
     (void)result;
 }
 
-void play_audio(char* argv) {
+void play_audio(void* argv) {
     if (keep_running)
         return;
 
     keep_running = 1;
 
+    const char* path = (const char*)argv;
     ma_decoder decoder;
-    ma_result result = ma_decoder_init_file(argv, NULL, &decoder);
+    ma_result result = ma_decoder_init_file(path, NULL, &decoder);
     if (result != MA_SUCCESS) {
-        fprintf(stderr, "Failed to open %s, error %d\n", argv, result);
+        fprintf(stderr, "Failed to open %s, error %d\n", path, result);
         keep_running = 0;
         return;
     }
@@ -486,13 +487,13 @@ void main_key_switch(lv_event_t *e)
             break;
         case KEY_LEFT:
         {
-            thpool_add_work(g_launch_thread_pool, play_audio, caudio_path("switch.wav"));
+            thpool_add_work(g_launch_thread_pool, play_audio, (void*)caudio_path("switch.wav"));
             switchyou(NULL);
         }
             break;
         case KEY_RIGHT:
         {
-            thpool_add_work(g_launch_thread_pool, play_audio, caudio_path("switch.wav"));
+            thpool_add_work(g_launch_thread_pool, play_audio, (void*)caudio_path("switch.wav"));
             switchzuo(NULL);
         }
             break;
@@ -502,7 +503,7 @@ void main_key_switch(lv_event_t *e)
     }
     else if (code == KEY_ENTER)
     {
-        thpool_add_work(g_launch_thread_pool, play_audio, caudio_path("enter.wav"));
+        thpool_add_work(g_launch_thread_pool, play_audio, (void*)caudio_path("enter.wav"));
         app_launch(NULL);
     }
 }

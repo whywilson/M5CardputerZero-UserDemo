@@ -17,6 +17,10 @@ const char *hal_path_keyboard_map(void);
 const char *hal_path_store_sync_cmd(void);
 const char *hal_path_images_dir(void);
 const char *hal_path_audio_dir(void);
+const char *hal_path_nfc_dumps_dir(void);
+const char *hal_path_nfc_keys_dir(void);
+const char *hal_path_mfkey_bin_dir(void);
+const char *hal_path_nfc_log_dir(void);
 #ifdef __cplusplus
 }
 #endif

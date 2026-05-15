@@ -42,6 +42,10 @@ REQUIREMENTS += ['lvgl_component', 'pthread']
 
 # add miniaudio
 REQUIREMENTS += ['Miniaudio']
+# Ensure miniaudio.h is findable on all platforms (ext_components/Miniaudio/include)
+_miniaudio_include = os.path.join(os.environ.get("EXT_COMPONENTS_PATH", ""), "Miniaudio", "include")
+if os.path.isdir(_miniaudio_include):
+    INCLUDE += [_miniaudio_include]
 
 # add 
 if 'CONFIG_BACKWARD_CPP_ENABLED' in os.environ:
@@ -76,6 +80,16 @@ if 'linux_x86_cross_cp0_config_defaults.mk' in os.environ.get("CONFIG_DEFAULT_FI
     REQUIREMENTS += ['camera', 'camera-base', 'jpeg']
     LDFLAGS += [f'{os.environ.get("CONFIG_TOOLCHAIN_SYSROOT", "")}/usr/lib/aarch64-linux-gnu/libstdc++.so.6']
 
+# native aarch64
+if 'native_aarch64_cp0_config_defaults.mk' in os.environ.get("CONFIG_DEFAULT_FILE", ''):
+    lvgl_component['DEFINITIONS'] += ['-D_REENTRANT']
+    lvgl_component['INCLUDE'] += ['/usr/include/freetype2', '/usr/include/libpng16', '/usr/include/libcamera']
+
+    SRCS += Glob('hal/linux/*.c*')
+    REQUIREMENTS += ['input', 'xkbcommon', 'udev', 'freetype']
+    # add libcamera
+    REQUIREMENTS += ['camera', 'camera-base', 'jpeg']
+
 # macOS
 if 'darwin_config_defaults.mk' in os.environ.get("CONFIG_DEFAULT_FILE", ''):
     # macOS 使用 SDL 后端
@@ -103,8 +117,8 @@ SRCS += [
     os.path.join(RadioLib, 'src', 'Hal.cpp'),
     os.path.join(RadioLib, 'src', 'Module.cpp'),
     os.path.join(RadioLib, 'src', 'utils', 'CRC.cpp'),
-    os.path.join(RadioLib, 'src', 'utils', 'FEC.cpp'),
     os.path.join(RadioLib, 'src', 'utils', 'Utils.cpp'),
+    os.path.join(RadioLib, 'src', 'utils', 'FEC.cpp'),
     os.path.join(RadioLib, 'src', 'protocols', 'PhysicalLayer', 'PhysicalLayer.cpp'),
     os.path.join(RadioLib, 'src', 'modules', 'SX126x', 'SX126x.cpp'),
     os.path.join(RadioLib, 'src', 'modules', 'SX126x', 'SX126x_commands.cpp'),

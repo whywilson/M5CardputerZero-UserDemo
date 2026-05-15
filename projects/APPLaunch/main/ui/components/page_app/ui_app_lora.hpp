@@ -1,4 +1,5 @@
 #pragma once
+#ifndef HAL_PLATFORM_SDL
 #include "ui_app_lora.hpp"
 #include "lvgl/lvgl.h"
 #include <unistd.h>
@@ -1920,3 +1921,11 @@ public:
     }
 
 };
+
+#else  // HAL_PLATFORM_SDL stub
+#include "../ui_app_page.hpp"
+class UILoraPage : public app_base {
+public:
+    UILoraPage() : app_base() {}
+};
+#endif  // HAL_PLATFORM_SDL

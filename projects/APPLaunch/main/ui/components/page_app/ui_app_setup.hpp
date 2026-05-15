@@ -1,4 +1,17 @@
 #pragma once
+// Build version info — injected via build/config/version_info.h when available.
+#ifdef __has_include
+#  if __has_include(<version_info.h>)
+#    include <version_info.h>
+#  endif
+#endif
+#ifndef APP_VERSION
+#  define APP_VERSION "v1.0.0"
+#endif
+#ifndef APP_GIT_HASH
+#  define APP_GIT_HASH "unknown"
+#endif
+#ifndef HAL_PLATFORM_SDL
 #include "../ui_app_page.hpp"
 #include <unordered_map>
 #include <string>
@@ -262,9 +275,9 @@ private:
             [](lv_obj_t *c) {
                 const char *lines[] = {
                     "Device  : M5Cardputer Zero",
-                    "FW Ver  : v1.0.0",
+                    "Version : " APP_VERSION " (" APP_GIT_HASH ")",
                     "LVGL    : 9.x",
-                    "Build   : " __DATE__,
+                    "Build   : " __DATE__ " " __TIME__,
                 };
                 for (int i = 0; i < 4; ++i) {
                     lv_obj_t *lbl = lv_label_create(c);
@@ -1447,3 +1460,10 @@ private:
         }
     }
 };
+
+#else  // HAL_PLATFORM_SDL stub
+class UISetupPage : public app_base {
+public:
+    UISetupPage() : app_base() {}
+};
+#endif  // HAL_PLATFORM_SDL

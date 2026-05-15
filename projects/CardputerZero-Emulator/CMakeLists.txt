@@ -114,7 +114,7 @@ option(EMU_SKIP_APPLAUNCH "Skip APPLaunch (Unix-only deps)" OFF)
 
 file(GLOB_RECURSE APPLAUNCH_UI_C   ${APPLAUNCH}/ui/*.c)
 file(GLOB_RECURSE APPLAUNCH_UI_CPP ${APPLAUNCH}/ui/*.cpp)
-file(GLOB         APPLAUNCH_KBD    ${APPLAUNCH}/src/keyboard_input.c)
+file(GLOB         APPLAUNCH_KBD    ${APPLAUNCH}/hal/keyboard_input.c)
 file(GLOB APPLAUNCH_HAL_SDL_C   ${APPLAUNCH}/hal/sdl/*.c)
 file(GLOB APPLAUNCH_HAL_SDL_CPP ${APPLAUNCH}/hal/sdl/*.cpp)
 
@@ -138,6 +138,7 @@ target_include_directories(APPLaunch PRIVATE
     ${APPLAUNCH}/include
     ${APPLAUNCH}
     ${APPLAUNCH}/hal
+    ${REPO_ROOT}/ext_components/Miniaudio/include
 )
 target_compile_definitions(APPLaunch PRIVATE HAL_PLATFORM_SDL=1)
 if(SDL2_MIXER_FOUND)
@@ -154,7 +155,8 @@ if(WIN32)
 else()
     target_compile_options(APPLaunch PRIVATE
         "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/emu_compat.h"
-        -Wno-c++11-narrowing)
+        -Wno-c++11-narrowing
+        -Wno-incompatible-function-pointer-types)
 endif()
 if(APPLE)
     target_link_options(APPLaunch PRIVATE -undefined dynamic_lookup)
@@ -306,19 +308,46 @@ endif()
 add_custom_command(TARGET cardputer-zero-emu POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/apps
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:UserDemo> $<TARGET_FILE_DIR:cardputer-zero-emu>/apps/
+    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/APPLaunch
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${REPO_ROOT}/projects/APPLaunch/APPLaunch/share $<TARGET_FILE_DIR:cardputer-zero-emu>/APPLaunch/share
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/applications
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/images
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${APPLAUNCH}/ui/images $<TARGET_FILE_DIR:cardputer-zero-emu>/images
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${REPO_ROOT}/projects/APPLaunch/dist/images $<TARGET_FILE_DIR:cardputer-zero-emu>/images
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/assets
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/assets/device_skin.png $<TARGET_FILE_DIR:cardputer-zero-emu>/assets/device_skin.png
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/assets/startup.mp3 $<TARGET_FILE_DIR:cardputer-zero-emu>/assets/startup.mp3
     COMMENT "Copying apps and resources"
 )
 if(TARGET APPLaunch)
-    add_custom_command(TARGET cardputer-zero-emu POST_BUILD
+    add_custom_command(TARGET APPLaunch POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/apps
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:APPLaunch> $<TARGET_FILE_DIR:cardputer-zero-emu>/apps/
-        COMMENT "Copying APPLaunch"
+        COMMENT "Syncing libAPPLaunch.dylib -> apps/"
     )
+endif()
+
+# ---------------------------------------------------------------------------
+# NFC USB automated test  (no LVGL / SDL dependencies)
+# Usage: ./nfc-usb-test [/dev/cu.wchusbserial000000011]
+# ---------------------------------------------------------------------------
+if(NOT WIN32 AND NOT EMSCRIPTEN)
+add_executable(nfc-usb-test src/nfc_usb_test.cpp)
+target_compile_features(nfc-usb-test PRIVATE cxx_std_17)
+target_include_directories(nfc-usb-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor          # nlohmann/json.hpp
+    ${APPLAUNCH}                                # ui/components/nfc/...
+    ${APPLAUNCH}/ui
+    ${APPLAUNCH}/include
+)
+# nfc_models.hpp needs nlohmann but no LVGL; define a minimal stub for map
+target_compile_definitions(nfc-usb-test PRIVATE
+    NFC_TEST_STANDALONE=1
+)
+find_package(Threads REQUIRED)
+target_link_libraries(nfc-usb-test PRIVATE Threads::Threads)
+if(APPLE)
+    target_compile_options(nfc-usb-test PRIVATE -Wno-c++11-narrowing)
+endif()
 endif()
 
 endif() # NOT EMSCRIPTEN
@@ -329,7 +358,7 @@ endif() # NOT EMSCRIPTEN
 if(EMSCRIPTEN)
     file(GLOB_RECURSE APPLAUNCH_UI_C_WEB   ${APPLAUNCH}/ui/*.c)
     file(GLOB_RECURSE APPLAUNCH_UI_CPP_WEB ${APPLAUNCH}/ui/*.cpp)
-    file(GLOB         APPLAUNCH_KBD_WEB    ${APPLAUNCH}/src/keyboard_input.c)
+    file(GLOB         APPLAUNCH_KBD_WEB    ${APPLAUNCH}/hal/keyboard_input.c)
     file(GLOB         APPLAUNCH_HAL_SDL_C_WEB   ${APPLAUNCH}/hal/sdl/*.c)
     file(GLOB         APPLAUNCH_HAL_SDL_CPP_WEB ${APPLAUNCH}/hal/sdl/*.cpp)
 
