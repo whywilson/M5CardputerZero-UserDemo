@@ -49,6 +49,22 @@ public:
                 ep.baud_rate = uart_config_.baud_rate;
             }
         }
+        // Restore last-used transport kind so the UI starts on the right mode
+        const TransportKind saved_kind = storage_.load_last_transport_kind();
+        if (saved_kind != TransportKind::Mock) {
+            intended_kind_ = saved_kind;
+            // Select the first endpoint matching the saved kind
+            for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
+                if (endpoints_[i].kind == saved_kind) {
+                    // Prefer the configured UART path if UART
+                    if (saved_kind == TransportKind::UartSerial &&
+                        !uart_config_.device_path.empty() &&
+                        endpoints_[i].path != uart_config_.device_path) continue;
+                    selected_endpoint_ = i;
+                    break;
+                }
+            }
+        }
     }
 
     ~NfcDeviceService()
@@ -622,6 +638,7 @@ public:
         }
 
         selected_endpoint_ = target_index;
+        storage_.save_last_transport_kind(target_kind);
         if (status) *status = std::string("Mode: ") + to_string(target_kind);
         return true;
     }

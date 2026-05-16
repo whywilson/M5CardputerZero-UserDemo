@@ -44,6 +44,35 @@ public:
         return root_dir() + "/uart_config.json";
     }
 
+    std::string last_transport_kind_path() const
+    {
+        return root_dir() + "/last_transport.json";
+    }
+
+    bool save_last_transport_kind(TransportKind kind) const
+    {
+        if (!ensure_layout()) return false;
+        std::ofstream out(last_transport_kind_path().c_str(), std::ios::out | std::ios::trunc);
+        if (!out.is_open()) return false;
+        nlohmann::json j;
+        j["kind"] = to_string(kind);
+        out << j.dump(2);
+        return out.good();
+    }
+
+    TransportKind load_last_transport_kind() const
+    {
+        std::ifstream in(last_transport_kind_path().c_str());
+        if (!in.is_open()) return TransportKind::UsbSerial; // default
+        try {
+            nlohmann::json j;
+            in >> j;
+            if (j.contains("kind") && j["kind"].is_string())
+                return transport_from_string(j["kind"].get<std::string>());
+        } catch (...) {}
+        return TransportKind::UsbSerial;
+    }
+
     bool save_uart_config(const UartConfig &cfg) const
     {
         if (!ensure_layout()) return false;
