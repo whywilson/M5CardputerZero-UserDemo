@@ -192,24 +192,23 @@ private:
     static std::string format_hex_line(const char *tag, const char *arrow,
                                         const uint8_t *data, size_t len)
     {
-        // [HH:MM:SS.mmm] tag => xx xx xx ...
+        // [HH:MM:SS.mmm] tag => xxyyzz...
         std::string out;
-        out.reserve(32 + len * 3);
+        out.reserve(32 + len * 2);
         char hdr[48];
         if (tag && tag[0])
             std::snprintf(hdr, sizeof(hdr), "[%s] %s %s ", timestamp().c_str(), tag, arrow);
         else
             std::snprintf(hdr, sizeof(hdr), "[%s] %s ", timestamp().c_str(), arrow);
         out = hdr;
-        char h[4];
+        char h[3];
         constexpr size_t MAX_BYTES = 64; // cap per line to keep it readable
         const size_t show = len > MAX_BYTES ? MAX_BYTES : len;
         for (size_t i = 0; i < show; ++i) {
-            std::snprintf(h, sizeof(h), "%02x ", data[i]);
+            std::snprintf(h, sizeof(h), "%02x", data[i]);
             out += h;
         }
         if (len > MAX_BYTES) out += "...";
-        else if (!out.empty() && out.back() == ' ') out.pop_back();
         return out;
     }
 

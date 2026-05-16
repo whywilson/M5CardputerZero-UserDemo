@@ -39,6 +39,47 @@ public:
         return root_dir() + "/mifare_keys.json";
     }
 
+    std::string uart_config_path() const
+    {
+        return root_dir() + "/uart_config.json";
+    }
+
+    bool save_uart_config(const UartConfig &cfg) const
+    {
+        if (!ensure_layout()) return false;
+        const std::string path = uart_config_path();
+        std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc);
+        if (!out.is_open()) return false;
+        nlohmann::json j;
+        j["device_path"] = cfg.device_path;
+        j["baud_rate"]   = cfg.baud_rate;
+        j["tx_pin"]      = cfg.tx_pin;
+        j["rx_pin"]      = cfg.rx_pin;
+        out << j.dump(2);
+        return out.good();
+    }
+
+    UartConfig load_uart_config() const
+    {
+        UartConfig cfg;
+        const std::string path = uart_config_path();
+        std::ifstream in(path.c_str());
+        if (!in.is_open()) return cfg;
+        try {
+            nlohmann::json j;
+            in >> j;
+            if (j.contains("device_path") && j["device_path"].is_string())
+                cfg.device_path = j["device_path"].get<std::string>();
+            if (j.contains("baud_rate") && j["baud_rate"].is_number())
+                cfg.baud_rate = j["baud_rate"].get<int>();
+            if (j.contains("tx_pin") && j["tx_pin"].is_number())
+                cfg.tx_pin = j["tx_pin"].get<int>();
+            if (j.contains("rx_pin") && j["rx_pin"].is_number())
+                cfg.rx_pin = j["rx_pin"].get<int>();
+        } catch (...) {}
+        return cfg;
+    }
+
     bool ensure_layout() const
     {
         return ensure_dir(root_dir()) && ensure_dir_recursive(records_dir());

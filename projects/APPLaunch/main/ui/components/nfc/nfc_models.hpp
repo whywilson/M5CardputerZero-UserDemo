@@ -31,6 +31,8 @@ enum class DeviceKind {
     PN532,         // standard NXP PN532 chip confirmed
     PN532Killer,   // PN532Killer firmware detected (vendor command responded)
     OtherSerial,   // port opened, non-PN532 data received
+    GroveNFC,      // Grove NFC 2 at I2C 0x48 (register-based, emulation supported)
+    NFCUnit,       // M5Stack NFC Unit at I2C 0x50 (read-only on Linux)
 };
 
 inline const char *to_string(DeviceKind value)
@@ -41,6 +43,8 @@ inline const char *to_string(DeviceKind value)
     case DeviceKind::Unknown:     return "No Response";
     case DeviceKind::NotConnected: return "Not Connected";
     case DeviceKind::OtherSerial: return "Unknown Device";
+    case DeviceKind::GroveNFC:    return "GroveNFC";
+    case DeviceKind::NFCUnit:     return "NFC Unit";
     default:                      return "?";
     }
 }

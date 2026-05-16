@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nfc_hex_logger.hpp"
+#include "nfc_i2c_device.hpp"
 #include "nfc_protocol.hpp"
 #include "nfc_storage.hpp"
 
@@ -40,12 +41,21 @@ public:
     {
         refresh_endpoints();
         emulator_slots_by_protocol_ = storage_.load_emulator_slots_by_protocol();
+        uart_config_ = storage_.load_uart_config();
+        // Apply saved baud rate to any already-enumerated UART endpoint
+        for (auto &ep : endpoints_) {
+            if (ep.kind == TransportKind::UartSerial &&
+                ep.path == uart_config_.device_path) {
+                ep.baud_rate = uart_config_.baud_rate;
+            }
+        }
     }
 
     ~NfcDeviceService()
     {
         cancel_hw_upload_.store(true);
         cancel_hw_mfkey_.store(true);
+        if (uart_test_thread_.joinable()) uart_test_thread_.join();
         if (hw_upload_thread_.joinable()) hw_upload_thread_.join();
         if (scan_thread_.joinable()) scan_thread_.join();
         if (probe_thread_.joinable()) probe_thread_.join();
@@ -272,6 +282,7 @@ public:
                 ep.baud_rate = cfg.baud_rate;
             }
         }
+        storage_.save_uart_config(cfg);
     }
 
     // Returns UART endpoints only (no mock, no USB)
@@ -283,6 +294,156 @@ public:
             if (ep.kind == TransportKind::UartSerial) out.push_back(ep);
         }
         return out;
+    }
+
+    // ── Async UART connection test ───────────────────────────────────────────
+    // Launches a background thread that:
+    //   1. Opens the UART port and sends wakeup + SAMConfig + FWVersion frames
+    //   2. Logs every TX/RX byte (hex) to both a file and uart_test_log_lines_
+    //   3. Sets uart_test_result_ when done.
+    // Call uart_test_running() to poll; drain_uart_test_logs() to collect lines.
+    void start_uart_test()
+    {
+        {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            if (uart_test_running_) return; // already running
+            uart_test_running_ = true;
+            uart_test_log_lines_.clear();
+            uart_test_result_.clear();
+        }
+        if (uart_test_thread_.joinable()) uart_test_thread_.join();
+        uart_test_thread_ = std::thread([this]() {
+            // Resolve config
+            UartConfig cfg;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                cfg = uart_config_;
+                if (cfg.device_path.empty()) {
+                    for (const auto &ep : endpoints_) {
+                        if (ep.kind == TransportKind::UartSerial) {
+                            cfg.device_path = ep.path;
+                            if (cfg.baud_rate <= 0) cfg.baud_rate = ep.baud_rate;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (cfg.device_path.empty()) {
+                finish_uart_test("No UART port found (/dev/ttyAMA*)");
+                return;
+            }
+            const int baud = cfg.baud_rate > 0 ? cfg.baud_rate : 115200;
+
+            // Open log file
+            const std::string log_dir = storage_.root_dir() + "/logs";
+            ::mkdir(log_dir.c_str(), 0755);
+            const std::string log_path = log_dir + "/uart_test_latest.log";
+            FILE *fp = fopen(log_path.c_str(), "w");
+            auto log_line = [&](const std::string &s) {
+                {
+                    std::lock_guard<std::mutex> lk(pending_log_mutex_);
+                    uart_test_log_lines_.push_back(s);
+                }
+                if (fp) { fputs(s.c_str(), fp); fputc('\n', fp); fflush(fp); }
+            };
+
+            log_line("=== UART test " + cfg.device_path + " @" + std::to_string(baud) + " baud ===");
+
+            // Build endpoint and open transport
+            TransportEndpoint ep;
+            ep.kind      = TransportKind::UartSerial;
+            ep.path      = cfg.device_path;
+            ep.baud_rate = baud;
+
+            SerialTransport raw_transport;
+            std::string open_error;
+            if (!raw_transport.open(ep, &open_error)) {
+                log_line("Open failed: " + open_error);
+                if (fp) fclose(fp);
+                finish_uart_test("Open failed: " + open_error);
+                return;
+            }
+
+            // Wrap with a logging shim
+            class LogTransport : public INfcTransport {
+            public:
+                INfcTransport *inner;
+                std::function<void(const std::string&)> log;
+                ssize_t write_bytes(const uint8_t *b, size_t n, std::string *err) override {
+                    std::string hex = "TX[" + std::to_string(n) + "] ";
+                    for (size_t i = 0; i < n && i < 64; ++i) {
+                        char buf[3]; std::snprintf(buf, sizeof(buf), "%02X", b[i]);
+                        hex += buf;
+                    }
+                    if (n > 64) hex += "...";
+                    log(hex);
+                    return inner->write_bytes(b, n, err);
+                }
+                ssize_t read_bytes(uint8_t *b, size_t n, int timeout_ms, std::string *err) override {
+                    ssize_t got = inner->read_bytes(b, n, timeout_ms, err);
+                    if (got <= 0) return got;
+                    // After the first bytes arrive, drain any immediately available
+                    // continuation bytes (0 ms timeout) so the whole response frame
+                    // lands in a single log line instead of one-byte-per-line.
+                    while ((size_t)got < n) {
+                        ssize_t more = inner->read_bytes(b + got, n - (size_t)got, 0, nullptr);
+                        if (more <= 0) break;
+                        got += more;
+                    }
+                    std::string hex = "RX[" + std::to_string(got) + "] ";
+                    constexpr ssize_t MAX_LOG = 64;
+                    for (ssize_t i = 0; i < got && i < MAX_LOG; ++i) {
+                        char buf[3]; std::snprintf(buf, sizeof(buf), "%02X", b[i]);
+                        hex += buf;
+                    }
+                    if (got > MAX_LOG) hex += "...";
+                    log(hex);
+                    return got;
+                }
+                bool is_open() const override { return inner->is_open(); }
+                void close() override { inner->close(); }
+                bool open(const TransportEndpoint &ep, std::string *err) override { return inner->open(ep, err); }
+                TransportEndpoint endpoint() const override { return inner->endpoint(); }
+            };
+            LogTransport logging_transport;
+            logging_transport.inner = &raw_transport;
+            logging_transport.log   = log_line;
+
+            Pn532KillerClient client(&logging_transport);
+            std::string probe_error, firmware;
+            const DeviceKind kind = client.detect_device(&firmware, &probe_error);
+            raw_transport.close();
+
+            std::string result;
+            if (kind == DeviceKind::PN532Killer || kind == DeviceKind::PN532) {
+                result = std::string("OK: ") + to_string(kind);
+                if (!firmware.empty()) result += " " + firmware;
+            } else {
+                result = "No device: " + probe_error;
+            }
+            log_line("=== Result: " + result + " ===");
+            if (fp) fclose(fp);
+            finish_uart_test(result);
+        });
+    }
+
+    bool uart_test_running() const
+    {
+        std::lock_guard<std::mutex> lk(pending_log_mutex_);
+        return uart_test_running_;
+    }
+
+    // Drain pending log lines into out (appends). Returns true if test finished.
+    bool drain_uart_test_logs(std::vector<std::string> &out, std::string &result_out)
+    {
+        std::lock_guard<std::mutex> lk(pending_log_mutex_);
+        out.insert(out.end(), uart_test_log_lines_.begin(), uart_test_log_lines_.end());
+        uart_test_log_lines_.clear();
+        if (!uart_test_running_ && !uart_test_result_.empty()) {
+            result_out = uart_test_result_;
+            return true; // finished
+        }
+        return false;
     }
 
     // Returns USB serial endpoints only (no mock, no UART)
@@ -310,6 +471,34 @@ public:
             }
         }
         return false;
+    }
+
+    // Probe I2C buses on-demand. Returns only devices that responded to the probe.
+    std::vector<TransportEndpoint> scan_i2c_devices()
+    {
+        return NfcTransportFactory::probe_i2c_devices();
+    }
+
+    // Select a specific I2C endpoint for connection. If the endpoint is not
+    // already in the cached list (e.g. from an on-demand scan), it is appended.
+    void select_i2c_endpoint(const TransportEndpoint &ep)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Disconnect current transport first
+        if (transport_) { transport_->close(); transport_.reset(); }
+        connection_ = ConnectionState{};
+        intended_kind_ = TransportKind::I2cBus;
+        // Reuse existing slot if the path is already known
+        for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
+            if (endpoints_[i].kind == TransportKind::I2cBus &&
+                endpoints_[i].path == ep.path) {
+                selected_endpoint_ = i;
+                return;
+            }
+        }
+        // Not yet in list — append it
+        endpoints_.push_back(ep);
+        selected_endpoint_ = static_cast<int>(endpoints_.size()) - 1;
     }
 
     // Pin reference table for common M5CardputerZero UART ports
@@ -562,9 +751,34 @@ public:
             } else {
                 connection_.detail = std::string("Raw serial only: ") + probe_error;
             }
-        } else {
-            // I2C: not yet implemented
-            connection_.detail = "I2C: not yet implemented";
+        } else if (connection_.endpoint.kind == TransportKind::I2cBus) {
+            // Parse "/dev/i2c-1:0x48" → bus + addr
+            const std::string &path = connection_.endpoint.path;
+            const auto colon_pos = path.rfind(':');
+            if (colon_pos == std::string::npos) {
+                connection_.detail = "I2C: invalid endpoint path (missing ':' separator)";
+            } else {
+                const std::string bus = path.substr(0, colon_pos);
+                const uint8_t addr = (uint8_t)std::stoul(path.substr(colon_pos + 1), nullptr, 16);
+                i2c_device_ = std::make_unique<I2cGroveNfcDevice>();
+                std::string i2c_error;
+                if (!i2c_device_->open(bus, addr, &i2c_error)) {
+                    connection_.connected = false;
+                    connection_.device_kind = DeviceKind::NotConnected;
+                    connection_.detail = "I2C open failed: " + i2c_error;
+                    i2c_device_.reset();
+                } else {
+                    connection_.device_kind = i2c_device_->device_kind();
+                    connection_.pn532_ready = true;
+                    connection_.status = std::string("Connected ") + to_string(connection_.device_kind);
+                    const uint16_t hw = i2c_device_->readSysReg(0x0000);
+                    const uint16_t fw = i2c_device_->readSysReg(0x0002);
+                    char ver[128];
+                    std::snprintf(ver, sizeof(ver), "%s @%s HW:%04X FW:%04X",
+                        to_string(connection_.device_kind), path.c_str(), hw, fw);
+                    connection_.detail = ver;
+                }
+            }
         }
         return true;
     }
@@ -574,6 +788,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (transport_) transport_->close();
         transport_.reset();
+        i2c_device_.reset();
         connection_ = ConnectionState{};
     }
 
@@ -932,11 +1147,45 @@ public:
     bool emulation_allowed(std::string *reason = nullptr) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!connection_.connected || connection_.device_kind != DeviceKind::PN532Killer) {
-            if (reason) *reason = "PN532Killer required for EMU";
+        if (connection_.connected && (connection_.device_kind == DeviceKind::PN532Killer ||
+                                      connection_.device_kind == DeviceKind::GroveNFC)) {
+            return true;
+        }
+        if (reason) {
+            if (connection_.device_kind == DeviceKind::NFCUnit)
+                *reason = "NFC Unit: emulation\nnot supported on Linux";
+            else
+                *reason = "PN532Killer or GroveNFC\nrequired for EMU";
+        }
+        return false;
+    }
+
+    // Activate GroveNFC emulation for the given protocol/slot (GroveNFC 0x48 only).
+    bool grovenfc_activate(ProtocolKind protocol, int slot_index, std::string *error = nullptr)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!i2c_device_ || !i2c_device_->is_open() ||
+            i2c_device_->device_kind() != DeviceKind::GroveNFC) {
+            if (error) *error = "GroveNFC not connected";
             return false;
         }
-        return true;
+        i2c_device_->setSlot((uint8_t)(slot_index < 0 ? 0 : slot_index > 7 ? 7 : slot_index));
+        bool ok = false;
+        switch (protocol) {
+        case ProtocolKind::MifareClassic: ok = i2c_device_->startEmulationMifare1K(); break;
+        case ProtocolKind::Iso14443B:     ok = i2c_device_->startEmulationChinaII(); break;
+        case ProtocolKind::Iso15693:      ok = i2c_device_->startEmulationISO15();   break;
+        default:                          ok = i2c_device_->startEmulationNtag213(); break;
+        }
+        if (!ok && error) *error = "GroveNFC activate failed";
+        return ok;
+    }
+
+    bool grovenfc_deactivate()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!i2c_device_ || !i2c_device_->is_open()) return false;
+        return i2c_device_->stopEmulation();
     }
 
     void set_default_slot()
@@ -1051,6 +1300,46 @@ private:
         SavedRecord record;
         std::string error;
         bool success = false;
+
+        if (endpoint.kind == TransportKind::I2cBus) {
+            I2cGroveNfcDevice *dev = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                dev = i2c_device_.get();
+            }
+            if (!dev || !dev->is_open()) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                scan_.running = false;
+                scan_.status = "I2C device not open";
+                scan_.error = "No I2C device";
+                return;
+            }
+            push_log("> Scanning I2C NFC...");
+            I2cCardInfo card;
+            const bool card_ok = dev->readCard(card);
+            if (card_ok && card.valid) {
+                push_log(std::string("OK ") + card.protocol + " " + card.uid);
+                TagInfo tag;
+                tag.uid = card.uid;
+                tag.protocol = i2c_protocol_to_kind(card.protocol);
+                tag.tag_type = i2c_protocol_to_tag_type(card.protocol);
+                tag.raw_data.push_back("UID: " + card.uid);
+                if (!card.detail.empty()) tag.raw_data.push_back(card.detail);
+                const std::string src = dev->is_nfc_unit() ? "nfc_unit" : "grovenfc";
+                record = make_record_from_tag(tag, endpoint, false, src);
+                success = true;
+            } else {
+                push_log("No card detected");
+                error = card_ok ? "no card present" : card.detail;
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            scan_.running = false;
+            scan_.last_record = record;
+            scan_.has_result = success;
+            scan_.status = success ? "Card found" : "No card";
+            scan_.error = error;
+            return;
+        }
 
         if (endpoint.kind == TransportKind::Mock) {
             record = build_mock_record(endpoint);
@@ -1328,6 +1617,7 @@ private:
     int selected_endpoint_ = 0;
     TransportKind intended_kind_ = TransportKind::UsbSerial; // tracks user intent even when no device
     std::unique_ptr<INfcTransport> transport_;
+    std::unique_ptr<I2cGroveNfcDevice> i2c_device_;
     ConnectionState connection_;
     ScanState scan_;
     ProtocolKind selected_emulator_protocol_ = ProtocolKind::MifareClassic;
@@ -1357,6 +1647,18 @@ private:
     std::vector<DeviceProbeResult> probe_results_;
     bool probe_running_ = false;
     UartConfig uart_config_;
+    // Async UART test
+    std::thread uart_test_thread_;
+    bool uart_test_running_ = false;          // guarded by pending_log_mutex_
+    std::string uart_test_result_;            // guarded by pending_log_mutex_
+    std::vector<std::string> uart_test_log_lines_; // guarded by pending_log_mutex_
+
+    void finish_uart_test(const std::string &result)
+    {
+        std::lock_guard<std::mutex> lk(pending_log_mutex_);
+        uart_test_result_ = result;
+        uart_test_running_ = false;
+    }
 
     void perform_emu_slot_probe(ProtocolKind protocol, int slot)
     {

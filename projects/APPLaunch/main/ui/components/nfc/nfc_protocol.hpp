@@ -432,9 +432,9 @@ public:
         // writes the SAMConfig frame immediately after — this is exactly what Python does:
         //   communication.write(wakeup_bytes)   ← no sleep
         //   send_cmd_sync(SAMConfiguration)     ← waits for D5 15 response
-        // On a cold USB connect the PN532 may need multiple attempts; retry up to 3×.
+        // On a cold USB connect the PN532 may need multiple attempts; retry up to 2×.
         bool sam_ok = false;
-        for (int sam_try = 0; sam_try < 3 && !sam_ok; ++sam_try) {
+        for (int sam_try = 0; sam_try < 2 && !sam_ok; ++sam_try) {
             if (sam_try > 0) {
                 // Drain any late bytes from the previous timed-out SAMConfig attempt.
                 uint8_t drain[256];

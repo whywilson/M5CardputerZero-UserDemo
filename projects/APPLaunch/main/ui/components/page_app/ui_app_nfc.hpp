@@ -39,6 +39,7 @@ class UINfcPage : public app_base
         ReadMenu,      // Read-mode OK menu: [Scan Card / Port Settings (UART) or Reconnect (USB)]
         PortSettings,  // TX / RX / BAUD config popup
         UsbSelect,     // Multiple USB ports: choose which to connect
+        I2cSelect,     // I2C bus scan: choose which device to connect
         HexLog,        // Ctrl+L full-screen hex TX/RX log overlay
     };
 
@@ -82,8 +83,10 @@ private:
     bool mifare_key_creating_ = false;
     nfc_app::MifareKeyRecord mifare_key_edit_;
     // UART config edit state
-    int   uart_field_idx_ = 0;  // 0=device 1=baud 2=tx 3=rx
+    int   uart_field_idx_ = 0;  // 0=device 1=baud 2=Test
     nfc_app::UartConfig uart_edit_buf_;
+    std::string uart_test_result_;  // result from last Test Connection
+    bool last_uart_test_running_ = false;  // for detecting async completion
     int active_tool_idx_ = 0;
     // Read tab scan log
     std::vector<std::string> scan_log_lines_;
@@ -126,6 +129,10 @@ private:
     int usb_select_idx_ = 0;
     // Cached USB endpoint list for UsbSelect modal
     std::vector<nfc_app::TransportEndpoint> usb_select_list_;
+    // I2C device selection (index into i2c_select_list_)
+    int i2c_select_idx_ = 0;
+    // Cached I2C endpoint list for I2cSelect modal
+    std::vector<nfc_app::TransportEndpoint> i2c_select_list_;
     // Hex log overlay scroll offset (line index from top)
     int hex_log_scroll_ = 0;
 
@@ -263,6 +270,35 @@ private:
             self->show_toast(self->mfkey_results_.empty() ? "No results" : "Cracking done");
         }
         self->last_hw_mfkey_running_ = mfkey_running_now;
+        // Detect UART test completion → drain logs to scan_log_lines_ and update result
+        {
+            const bool test_running_now = self->service_.uart_test_running();
+            if (self->last_uart_test_running_ || test_running_now) {
+                std::string result;
+                std::vector<std::string> new_lines;
+                const bool done = self->service_.drain_uart_test_logs(new_lines, result);
+                // Split lines that are too wide for the display (~52 chars)
+                constexpr size_t WRAP_COLS = 52;
+                for (auto &l : new_lines) {
+                    if (l.size() <= WRAP_COLS) {
+                        self->scan_log_lines_.push_back(std::move(l));
+                    } else {
+                        self->scan_log_lines_.push_back(l.substr(0, WRAP_COLS));
+                        size_t pos = WRAP_COLS;
+                        while (pos < l.size()) {
+                            self->scan_log_lines_.push_back("  " + l.substr(pos, WRAP_COLS - 2));
+                            pos += WRAP_COLS - 2;
+                        }
+                    }
+                }
+                if (self->scan_log_lines_.size() > 200)
+                    self->scan_log_lines_.erase(self->scan_log_lines_.begin(),
+                        self->scan_log_lines_.begin() + (int)self->scan_log_lines_.size() - 200);
+                self->log_scroll_offset_ = std::max(0, (int)self->scan_log_lines_.size() - LOG_VISIBLE_LINES);
+                if (done) self->uart_test_result_ = result;
+            }
+            self->last_uart_test_running_ = test_running_now;
+        }
         self->render_all();
     }
 
@@ -404,7 +440,7 @@ private:
                     log_scroll_offset_ = 0;
                     const auto conn = service_.connection_state();
                     const auto ep   = service_.current_endpoint();
-                    if (!conn.connected && ep.kind != nfc_app::TransportKind::I2cBus) {
+                    if (!conn.connected) {
                         scan_log_lines_.push_back("> Connect " + ep.label.substr(0, 22) + "...");
                         render_all();
                         const bool ok = service_.connect_current();
@@ -564,8 +600,18 @@ private:
                             }
                         }
                     } else if (ep.kind == nfc_app::TransportKind::I2cBus) {
-                        // I2C placeholder: not implemented yet
-                        ui_message_ = "I2C: not yet implemented";
+                        // Scan I2C buses on-demand, then let user pick a device
+                        scan_log_lines_.push_back("> Scanning I2C buses...");
+                        render_all();
+                        i2c_select_list_ = service_.scan_i2c_devices();
+                        if (i2c_select_list_.empty()) {
+                            scan_log_lines_.push_back("No I2C device found");
+                            ui_message_ = "No I2C device";
+                        } else {
+                            i2c_select_idx_ = 0;
+                            modal_ = Modal::I2cSelect;
+                            modal_idx_ = 0;
+                        }
                     }
                 }
             }
@@ -712,6 +758,7 @@ private:
             else if (modal_ == Modal::ReadMenu) render_read_menu_modal(content);
             else if (modal_ == Modal::PortSettings) render_port_settings_modal(content);
             else if (modal_ == Modal::UsbSelect) render_usb_select_modal(content);
+            else if (modal_ == Modal::I2cSelect) render_i2c_select_modal(content);
             break;
         case Tab::Saved:
             render_saved_tab(content);
@@ -935,7 +982,7 @@ private:
                     else if (line.size() >= 3 && line[0] == 'E' && line[1] == 'R' && line[2] == 'R') color = 0xFF6060;
                     else if (!line.empty() && line[0] == '>') color = 0xF7A600;
                     else if (line.size() >= 6 && line.substr(0, 6) == "MAGIC:") color = 0xFFD700;
-                    create_text(detail, 4, y, to_compact(line, 40).c_str(), color, 10);
+                    create_text(detail, 4, y, to_compact(line, 52).c_str(), color, 10);
                 }
             }
         }
@@ -1467,7 +1514,83 @@ private:
         }
     }
 
-    // ── PortSettings modal (TX / RX GPIO / BAUD) ─────────────────────────────
+    // ── I2cSelect modal (scan I2C buses, choose which device to connect) ──────
+    void render_i2c_select_modal(lv_obj_t *parent)
+    {
+        lv_obj_t *overlay = lv_obj_create(parent);
+        lv_obj_remove_style_all(overlay);
+        lv_obj_set_size(overlay, 320, CONTENT_H);
+        lv_obj_set_pos(overlay, 0, 0);
+        lv_obj_set_style_radius(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(overlay, 160, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+        const int n = static_cast<int>(i2c_select_list_.size());
+        const int card_h = 42 + std::max(1, n) * 20;
+        lv_obj_t *card = make_modal_card(overlay, 220, card_h, 0x00FF88);
+        create_text(card, 8, 5, "Select I2C Device", 0x00FF88, 12);
+
+        for (int i = 0; i < n; ++i) {
+            const bool sel = (i2c_select_idx_ == i);
+            const std::string &lbl = i2c_select_list_[i].label;
+            lv_obj_t *row = lv_obj_create(card);
+            lv_obj_remove_style_all(row);
+            lv_obj_set_size(row, 204, 18);
+            lv_obj_set_pos(row, 8, 22 + i * 20);
+            lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0x00FF88 : 0x242424), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            create_text(row, 6, 3, to_compact(lbl, 24).c_str(), sel ? 0x000000 : 0xD0D0D0, 11);
+        }
+        if (n == 0) {
+            create_text(card, 8, 26, "No I2C device found", 0xFF4444, 11);
+        }
+    }
+
+    void handle_i2c_select_key(uint32_t key)
+    {
+        const int n = static_cast<int>(i2c_select_list_.size());
+        switch (key) {
+        case KEY_UP:
+        case KEY_F:
+            if (n > 0) i2c_select_idx_ = (i2c_select_idx_ - 1 + n) % n;
+            break;
+        case KEY_DOWN:
+        case KEY_X:
+            if (n > 0) i2c_select_idx_ = (i2c_select_idx_ + 1) % n;
+            break;
+        case KEY_ENTER:
+            if (n > 0 && i2c_select_idx_ < n) {
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                const auto &selected_ep = i2c_select_list_[i2c_select_idx_];
+                service_.select_i2c_endpoint(selected_ep);
+                scan_log_lines_.clear();
+                log_scroll_offset_ = 0;
+                scan_log_lines_.push_back("> Connect " + selected_ep.label.substr(0, 22) + "...");
+                render_all();
+                const bool ok = service_.connect_current();
+                const auto conn2 = service_.connection_state();
+                if (!ok) {
+                    scan_log_lines_.push_back("ERR " + conn2.detail.substr(0, 28));
+                    ui_message_ = "Connect failed";
+                } else {
+                    scan_log_lines_.push_back("OK  " + conn2.detail.substr(0, 28));
+                    ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
+                }
+            }
+            break;
+        case KEY_ESC:
+            modal_     = Modal::None;
+            modal_idx_ = 0;
+            break;
+        default: break;
+        }
+    }
+
+    // ── PortSettings modal (TX / RX GPIO / BAUD / Test) ──────────────────────
     void render_port_settings_modal(lv_obj_t *parent)
     {
         lv_obj_t *overlay = lv_obj_create(parent);
@@ -1480,8 +1603,21 @@ private:
         lv_obj_set_style_border_width(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *card = make_modal_card(overlay, 240, 100, 0xF7A600);
+        lv_obj_t *card = make_modal_card(overlay, 260, 118, 0xF7A600);
         create_text(card, 8, 4, "Port Settings", 0xF7A600, 12);
+
+        // Device path (read-only, shows which port will be tested)
+        {
+            std::string dev = uart_edit_buf_.device_path;
+            if (dev.empty()) {
+                // Mirror the auto-discovery in test_uart_connection()
+                auto uart_eps = service_.uart_endpoints();
+                dev = uart_eps.empty() ? "(no UART port)" : uart_eps[0].path;
+            }
+            // Trim /dev/ prefix for brevity
+            if (dev.rfind("/dev/", 0) == 0) dev = dev.substr(5);
+            create_text(card, 8, 20, (std::string("Dev: ") + dev).c_str(), 0x888888, 10);
+        }
 
         const char *field_labels[] = {"TX GPIO:", "RX GPIO:", "Baud:"};
         const int field_vals[] = { uart_edit_buf_.tx_pin, uart_edit_buf_.rx_pin, uart_edit_buf_.baud_rate };
@@ -1493,14 +1629,24 @@ private:
             std::string line = std::string(field_labels[i]) + " " + vbuf;
             if (sel && !edit_buf_.empty()) line = std::string(field_labels[i]) + " " + edit_buf_ + "_";
             uint32_t col = sel ? 0xFFFF00 : 0xD8D8D8;
-            create_text(card, 8, 20 + i * 20, line.c_str(), col, 11);
+            create_text(card, 8, 32 + i * 16, line.c_str(), col, 11);
         }
-        create_text(card, 8, 85, "F/X field  type digits  Enter apply  ESC save", 0x666666, 10);
+        // Test Connection action row
+        {
+            const bool sel = (port_settings_field_ == 3);
+            uint32_t col = sel ? 0x00FF88 : 0x44BB77;
+            create_text(card, 8, 82, sel ? "[ Test Connection ]" : "  Test Connection", col, 11);
+        }
+        // Test result
+        if (!uart_test_result_.empty()) {
+            const bool ok = uart_test_result_.rfind("OK:", 0) == 0;
+            create_text(card, 8, 96, uart_test_result_.c_str(), ok ? 0x00FF88 : 0xFF6060, 10);
+        }
     }
 
     void handle_port_settings_key(uint32_t key)
     {
-        const int FIELDS = 3;
+        const int FIELDS = 4;  // 0=TX  1=RX  2=Baud  3=Test
         if (key == KEY_ESC) {
             // Apply any pending edit and save
             apply_port_settings_field();
@@ -1513,6 +1659,7 @@ private:
             modal_ = Modal::ReadMenu;
             modal_idx_ = 0;
             edit_buf_.clear();
+            uart_test_result_.clear();
             return;
         }
         if (key == KEY_UP || key == KEY_F) {
@@ -1526,14 +1673,26 @@ private:
             return;
         }
         if (key == KEY_ENTER) {
-            apply_port_settings_field();
+            if (port_settings_field_ == 3) {
+                // Test Connection: save current settings then start async probe
+                apply_port_settings_field();
+                nfc_app::UartConfig cfg = service_.uart_config();
+                cfg.tx_pin    = uart_edit_buf_.tx_pin;
+                cfg.rx_pin    = uart_edit_buf_.rx_pin;
+                cfg.baud_rate = uart_edit_buf_.baud_rate;
+                service_.set_uart_config(cfg);
+                uart_test_result_ = "Testing...";
+                service_.start_uart_test();
+            } else {
+                apply_port_settings_field();
+            }
             return;
         }
         if (key == KEY_BACKSPACE) {
             if (!edit_buf_.empty()) edit_buf_.pop_back();
             return;
         }
-        // Accept digits only
+        // Accept digits only (TX/RX/Baud are all numeric)
         char c = keycode_to_char(key);
         if (c >= '0' && c <= '9' && edit_buf_.size() < 7) edit_buf_ += c;
     }
@@ -1579,7 +1738,6 @@ private:
         for (int i = 0; i < 3; ++i) {
             create_text(card, 8, 24 + i * 18, d.lines[i], 0xD8D8D8, 11);
         }
-        create_text(card, 8, 88, "ESC: close", 0x555555, 10);
     }
 
     // ── Global RFID App intro popup ('i' key, any tab) ───────────────────────
@@ -1753,7 +1911,6 @@ private:
                 break;
             default: break;
             }
-            create_text(parent, 6, 92, "ESC back to tool list", 0x7A7A7A, 10);
         } else if (modal_ == Modal::DeviceProbe) {
             render_device_probe_modal(parent);
         } else if (modal_ == Modal::UartConfig) {
@@ -1905,7 +2062,6 @@ private:
             create_text(row, 4, 1, col, sel ? 0x000000 : 0xFFFFFF, 10);
             create_text(row, 80, 1, val, sel ? 0x2F2F2F : 0x8DB6FF, 10);
         }
-        create_text(parent, 8, 90, "U/D select  Enter:save  R:retry  ESC:back", 0x7A7A7A, 10);
     }
 
     void render_mifare_keys_tool(lv_obj_t *parent)
@@ -2061,8 +2217,6 @@ private:
             }
             if (running) create_text(card, 6, 88, "Scanning...", 0x8DB6FF, 11);
         }
-
-        if (!running) create_text(card, 6, 92, "OK re-probe  ESC back", 0x7A7A7A, 10);
     }
 
     void render_uart_config_modal(lv_obj_t *parent)
@@ -2101,21 +2255,17 @@ private:
             std::string disp = "> " + edit_buf_;
             create_text(card, 6, 68, disp.c_str(), 0xFFFF88, 11);
         }
-        // UART endpoint list hint
-        const auto uart_eps = service_.uart_endpoints();
-        if (!uart_eps.empty()) {
-            int y = 80;
-            create_text(card, 6, y, "Detected:", 0x7A7A7A, 10);
-            for (size_t i = 0; i < uart_eps.size() && y < 96; ++i) {
-                const auto &ep = uart_eps[i];
-                std::string p = ep.path;
-                const auto s = p.rfind('/'); if (s != std::string::npos) p = p.substr(s+1);
-                char line[32]; std::snprintf(line, sizeof(line), "  %s", p.c_str());
-                create_text(card, 6, y + 8*(int(i)+1), line, 0x7A7A7A, 10);
-                y += 2;
-            }
+        // Test Connection row (field 2)
+        {
+            const bool sel = (uart_field_idx_ == 2);
+            uint32_t col = sel ? 0x00FF88 : 0x44BB77;
+            create_text(card, 6, 70, sel ? "[ Test Connection ]" : "  Test Connection", col, 11);
         }
-        create_text(card, 6, 92, "U/D field Enter edit ESC save", 0x7A7A7A, 10);
+        // Test result line
+        if (!uart_test_result_.empty()) {
+            const bool ok = uart_test_result_.rfind("OK:", 0) == 0;
+            create_text(card, 6, 82, uart_test_result_.c_str(), ok ? 0x00FF88 : 0xFF6060, 10);
+        }
     }
 
     lv_obj_t *make_modal_card(lv_obj_t *parent)
@@ -2147,7 +2297,7 @@ private:
 
     void handle_uart_config_key(uint32_t key)
     {
-        const int FIELDS = 2;  // device path, baud rate (pins are read-only)
+        const int FIELDS = 3;  // 0=device path  1=baud rate  2=Test Connection
         if (key == KEY_ESC) {
             // Save current values
             if (!uart_edit_buf_.device_path.empty()) {
@@ -2159,18 +2309,28 @@ private:
             ui_message_ = "UART saved";
             modal_ = Modal::None;
             edit_buf_.clear();
+            uart_test_result_.clear();
             return;
         }
         if (key == KEY_UP)   { uart_field_idx_ = (uart_field_idx_ - 1 + FIELDS) % FIELDS; return; }
         if (key == KEY_DOWN) { uart_field_idx_ = (uart_field_idx_ + 1) % FIELDS; return; }
         if (key == KEY_ENTER) {
-            // Commit typed edit_buf to the current field
             if (uart_field_idx_ == 0 && !edit_buf_.empty()) {
                 uart_edit_buf_.device_path = edit_buf_;
                 edit_buf_.clear();
             } else if (uart_field_idx_ == 1 && !edit_buf_.empty()) {
                 try { uart_edit_buf_.baud_rate = std::stoi(edit_buf_); } catch (...) {}
                 edit_buf_.clear();
+            } else if (uart_field_idx_ == 2) {
+                // Save current config first, then test
+                if (!uart_edit_buf_.device_path.empty()) {
+                    auto pins = nfc_app::NfcDeviceService::uart_pin_hint(uart_edit_buf_.device_path);
+                    uart_edit_buf_.tx_pin = pins.first;
+                    uart_edit_buf_.rx_pin = pins.second;
+                }
+                service_.set_uart_config(uart_edit_buf_);
+                uart_test_result_ = "Testing...";
+                service_.start_uart_test();
             }
             return;
         }
@@ -2353,7 +2513,6 @@ private:
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
             create_text(row, 6, 4, options[i], sel ? 0x000000 : (is_delete ? 0xFF8888 : 0xD0D0D0), 11);
         }
-        create_text(card, 8, 102, "U/D sel  Enter confirm  ESC cancel", 0x666666, 10);
     }
 
     void render_slot_select_modal_card(lv_obj_t *parent)
@@ -2387,7 +2546,6 @@ private:
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
             create_text(row, 4, 2, to_compact(label, 34).c_str(), sel ? 0x000000 : 0xCCCCCC, 10);
         }
-        create_text(card, 8, 100, "U/D select  Enter upload  ESC back", 0x666666, 10);
     }
 
     void render_edit_name_modal_card(lv_obj_t *parent)
@@ -2401,8 +2559,6 @@ private:
         lv_obj_set_style_border_width(box, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
         const std::string cursor_text = to_compact(edit_buf_, 36) + "_";
         create_text(box, 4, 6, cursor_text.c_str(), 0x00D2FF, 11);
-
-        create_text(card, 8, 52, "Type name  Enter save  Bsp delete  ESC cancel", 0x666666, 10);
     }
 
     // Strip a raw_data line to pure uppercase hex (no prefixes, no spaces)
@@ -2551,6 +2707,9 @@ private:
         case Modal::UsbSelect:
             handle_usb_select_key(key);
             break;
+        case Modal::I2cSelect:
+            handle_i2c_select_key(key);
+            break;
         case Modal::HexLog:
             handle_hex_log_key(key);
             break;
@@ -2643,16 +2802,26 @@ private:
             }
             if (modal_idx_ == 0) {
                 // Download Data: pull full block dump from HW slot into cache
-                if (service_.hw_start_emu_dump_async(service_.current_emulator_protocol(), hw_emu_slot_)) {
+                const bool is_grove = (service_.connection_state().device_kind == nfc_app::DeviceKind::GroveNFC);
+                if (is_grove) {
+                    ui_message_ = "Download not supported\n(GroveNFC EEPROM is self-managed)";
+                } else if (service_.hw_start_emu_dump_async(service_.current_emulator_protocol(), hw_emu_slot_)) {
                     ui_message_ = "Downloading slot data...";
                 } else {
                     ui_message_ = "Download failed (scan running?)";
                 }
             } else if (modal_idx_ == 1) {
-                // Upload Data: for PN532Killer send data to HW via setEmulatorData (hfmfeload protocol).
-                if (saved_records_.empty()) {
+                // Upload Data / Activate Emulation
+                const auto dev_kind = service_.connection_state().device_kind;
+                if (dev_kind == nfc_app::DeviceKind::GroveNFC) {
+                    // For GroveNFC: activate emulation on the selected protocol/slot
+                    std::string emu_err;
+                    const bool ok = service_.grovenfc_activate(
+                        service_.current_emulator_protocol(), hw_emu_slot_, &emu_err);
+                    ui_message_ = ok ? "GroveNFC emulating..." : ("EMU failed: " + emu_err);
+                } else if (saved_records_.empty()) {
                     ui_message_ = "Upload failed: no saved data";
-                } else if (service_.connection_state().device_kind == nfc_app::DeviceKind::PN532Killer
+                } else if (dev_kind == nfc_app::DeviceKind::PN532Killer
                            && saved_records_[saved_idx_].tag.raw_data.size() == 64) {
                     if (service_.hw_start_upload_async(hw_emu_slot_, saved_records_[saved_idx_])) {
                         ui_message_ = "Uploading to HW slot " + std::to_string(hw_emu_slot_ + 1) + "...";

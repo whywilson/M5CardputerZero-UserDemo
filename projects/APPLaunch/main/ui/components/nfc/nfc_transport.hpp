@@ -24,6 +24,14 @@
 #include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <linux/i2c-dev.h>
+#include <cstdio>   // fopen / fwrite
+#include <cstring>  // strerror
+#endif
+#ifndef I2C_SLAVE
+#define I2C_SLAVE 0x0703
+#endif
 #endif
 
 namespace nfc_app {
@@ -334,7 +342,6 @@ public:
 #ifndef _WIN32
         DIR *dir = opendir("/dev");
         if (!dir) {
-            endpoints.push_back({TransportKind::I2cBus, "i2c://1", "I2C (dev/i2c-1)", 0});
             return endpoints;
         }
 
@@ -400,9 +407,182 @@ public:
             }
         }
 #endif
-        // I2C placeholder (not yet implemented)
-        endpoints.push_back({TransportKind::I2cBus, "i2c://1", "I2C (dev/i2c-1)", 0});
+
+#if defined(__linux__)
+        for (auto &ep : probe_i2c_devices())
+            endpoints.push_back(ep);
+#endif
         return endpoints;
+    }
+
+    // Probe all /dev/i2c-* buses for known NFC devices (NFCUnit @0x50, GroveNFC @0x48).
+    // Returns only devices that actually responded to the register read.
+    // Safe to call any time (on-demand scan, not only at startup).
+    static std::vector<TransportEndpoint> probe_i2c_devices()
+    {
+        std::vector<TransportEndpoint> result;
+#if defined(__linux__)
+        // ── Enable Grove 5V power via GROVE_EN (BCM17 = FSW7227 load switch) ──
+        // The CardputerZero silkscreen: GROVE_EN:G17 (BCM17).
+        // On this SoC the kernel gpiochip base is not 0; e.g. pinctrl-bcm2835
+        // registers with base=512, so sysfs GPIO for BCM17 = 512+17 = 529.
+        // grove_gpio_enable_bcm() looks up the correct base at runtime.
+        grove_gpio_enable_bcm(17, true);
+        // Allow the load switch and the NFC module to power up.
+        // GroveNFC M090 / PN532-based modules need ≥200 ms after supply rise
+        // before they respond to I2C traffic.
+        {
+            struct timespec ts = {0, 250 * 1000 * 1000}; // 250 ms
+            nanosleep(&ts, nullptr);
+        }
+
+        std::vector<std::string> i2c_buses;
+        DIR *i2c_scan = opendir("/dev");
+        if (i2c_scan) {
+            struct dirent *ie = nullptr;
+            while ((ie = readdir(i2c_scan)) != nullptr) {
+                // Only include character devices (DT_CHR) or unknown type entries
+                // named i2c-* — skip directories to avoid EISDIR on open()
+                if (ie->d_type != DT_DIR && starts_with(ie->d_name, "i2c-"))
+                    i2c_buses.push_back(std::string("/dev/") + ie->d_name);
+            }
+            closedir(i2c_scan);
+        }
+        std::sort(i2c_buses.begin(), i2c_buses.end());
+
+        // (addr, label_prefix) — probe all known Grove NFC module variants
+        // PN532 standard I2C address: 0x24
+        // GroveNFC (MJS M090): 0x48; M5NFC Unit (ST25R3916/PN532 via I2C): 0x50
+        // 0x6a is the onboard IMU — NOT an NFC device, intentionally excluded.
+        static const std::pair<uint8_t, const char*> probe_addrs[] = {
+            {0x24, "PN532"},
+            {0x50, "NFC Unit"},
+            {0x48, "GroveNFC"},
+        };
+        for (const auto &bus : i2c_buses) {
+            const std::string bus_name = bus.substr(bus.rfind('/') + 1); // "i2c-1"
+            // Open the bus once; skip if not accessible
+            int probe_fd = ::open(bus.c_str(), O_RDWR);
+            if (probe_fd < 0) continue;
+            for (auto &ap : probe_addrs) {
+                const uint8_t addr  = ap.first;
+                const char   *label = ap.second;
+                bool present = false;
+                if (::ioctl(probe_fd, I2C_SLAVE, (long)addr) >= 0) {
+                    // Match i2cdetect behavior:
+                    // EEPROM address range (0x50-0x5F): byte-read probe
+                    //   — write probe would advance the internal pointer.
+                    // All other addresses (incl. 0x48 GroveNFC M090):
+                    //   SMBus quick-write probe (START + ADDR/W + STOP)
+                    //   == Arduino Wire beginTransmission()+endTransmission().
+                    //   A bare read() without a prior register-address write
+                    //   causes M090 to NACK, yielding false-negative.
+                    if (addr >= 0x50 && addr <= 0x5F) {
+                        uint8_t rbuf = 0;
+                        present = (::read(probe_fd, &rbuf, 1) == 1);
+                    } else {
+                        struct i2c_smbus_ioctl_data args{};
+                        args.read_write = I2C_SMBUS_WRITE;
+                        args.command    = 0;
+                        args.size       = I2C_SMBUS_QUICK;
+                        args.data       = nullptr;
+                        present = (::ioctl(probe_fd, I2C_SMBUS, &args) >= 0);
+                    }
+                }
+                if (present) {
+                    char path_str[64];
+                    std::snprintf(path_str, sizeof(path_str), "%s:0x%02x", bus.c_str(), (unsigned)addr);
+                    TransportEndpoint ep;
+                    ep.kind      = TransportKind::I2cBus;
+                    ep.path      = path_str;
+                    ep.label     = std::string(label) + " @" + bus_name;
+                    ep.baud_rate = 0;
+                    result.push_back(ep);
+                }
+            }
+            ::close(probe_fd);
+        }
+#endif
+        return result;
+    }
+
+    // ── Grove GPIO helpers ────────────────────────────────────────────────────
+    // Find the sysfs base of the gpiochip whose label matches `chip_label`.
+    // Returns -1 if not found.
+    static int grove_find_chip_base(const char *chip_label)
+    {
+#if defined(__linux__)
+        DIR *d = opendir("/sys/class/gpio");
+        if (!d) return -1;
+        int found_base = -1;
+        struct dirent *de;
+        while ((de = readdir(d)) != nullptr) {
+            if (!starts_with(de->d_name, "gpiochip")) continue;
+            char lpath[128], bpath[128];
+            std::snprintf(lpath, sizeof(lpath), "/sys/class/gpio/%s/label",  de->d_name);
+            std::snprintf(bpath, sizeof(bpath), "/sys/class/gpio/%s/base",   de->d_name);
+            FILE *lf = fopen(lpath, "r");
+            if (!lf) continue;
+            char label[64] = {};
+            (void)fgets(label, sizeof(label), lf);
+            fclose(lf);
+            // strip trailing newline
+            for (int i = (int)std::strlen(label)-1; i >= 0 && (label[i]=='\n'||label[i]=='\r'); --i)
+                label[i] = '\0';
+            if (std::strcmp(label, chip_label) == 0) {
+                FILE *bf = fopen(bpath, "r");
+                if (bf) { fscanf(bf, "%d", &found_base); fclose(bf); }
+                break;
+            }
+        }
+        closedir(d);
+        return found_base;
+#else
+        (void)chip_label; return -1;
+#endif
+    }
+
+    // Drive a BCM GPIO pin via sysfs, auto-detecting the gpiochip base.
+    // CardputerZero: GROVE_EN=BCM17, active-HIGH (FSW7227 load switch).
+    // Silently ignores errors so probe_i2c_devices() never throws.
+    static void grove_gpio_enable_bcm(int bcm_pin, bool high)
+    {
+#if defined(__linux__)
+        // Find the base of the BCM/pinctrl chip (label = "pinctrl-bcm2835")
+        int base = grove_find_chip_base("pinctrl-bcm2835");
+        if (base < 0) base = 0; // fallback: no offset (bare sysfs numbering)
+        grove_gpio_enable(base + bcm_pin, high);
+#else
+        (void)bcm_pin; (void)high;
+#endif
+    }
+
+    // Drive an absolute sysfs GPIO number.
+    static void grove_gpio_enable(int gpio_num, bool high)
+    {
+#if defined(__linux__)
+        char path[64];
+
+        // 1. Export the pin (ignore error if already exported)
+        {
+            FILE *f = fopen("/sys/class/gpio/export", "w");
+            if (f) { std::fprintf(f, "%d", gpio_num); fclose(f); }
+        }
+        // 2. Set direction = out
+        std::snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/direction", gpio_num);
+        {
+            FILE *f = fopen(path, "w");
+            if (f) { std::fputs("out", f); fclose(f); }
+        }
+        // 3. Set value
+        std::snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", gpio_num);
+        {
+            FILE *f = fopen(path, "w");
+            if (f) { std::fprintf(f, "%d", high ? 1 : 0); fclose(f); }
+        }
+#else
+        (void)gpio_num; (void)high;
+#endif
     }
 
     static std::unique_ptr<INfcTransport> create(const TransportEndpoint &endpoint)
