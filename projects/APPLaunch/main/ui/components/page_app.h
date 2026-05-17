@@ -3,7 +3,9 @@
 #include "page_app/ui_app_AiCli.hpp"
 #include "page_app/ui_app_IpPanel.hpp"
 #include "page_app/ui_app_UnitEnv.hpp"
+#ifndef HAL_PLATFORM_SDL
 #include "page_app/ui_app_camera.hpp"
+#endif
 #include "page_app/ui_app_chat.hpp"
 #include "page_app/ui_app_console.hpp"
 #include "page_app/ui_app_email.hpp"
@@ -13,7 +15,9 @@
 #include "page_app/ui_app_gpio.hpp"
 #include "page_app/ui_app_hack.hpp"
 #include "page_app/ui_app_hikepod.hpp"
+#ifndef HAL_PLATFORM_SDL
 #include "page_app/ui_app_lora.hpp"
+#endif
 #include "page_app/ui_app_lovyan.hpp"
 #include "page_app/ui_app_mesh.hpp"
 #include "page_app/ui_app_midi.hpp"

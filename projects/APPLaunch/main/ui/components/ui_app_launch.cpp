@@ -194,6 +194,8 @@ public:
 
         app_list.emplace_back("GALLERY", img_path("camera.png"), page_v<UIGalleryPage>);
 
+        app_list.emplace_back("RFID", img_path("rfid.png"), page_v<UINfcPage>);
+
         app_list.emplace_back("HIKEPOD", img_path("hack.png"), page_v<UIHikePodPage>);
 
         app_list.emplace_back("AICli", img_path("hack.png"), page_v<UIAICliPage>);
