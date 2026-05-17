@@ -386,12 +386,13 @@ public:
             return false;
         }
 
-        // Drain any stale bytes (e.g. postamble from the preceding GetFirmwareVersion)
-        // before sending 0xAA so the first read in the loop is clean.
+        // Drain any stale bytes (e.g. postamble from the preceding GetFirmwareVersion).
+        // UART kernel buffers are slower to drain than USB-CDC; use 5×50ms (250ms total)
+        // to ensure any late-arriving bytes from GetFirmwareVersion are fully flushed.
         {
-            uint8_t flush[64];
-            for (int i = 0; i < 3; ++i)
-                transport_->read_bytes(flush, sizeof(flush), 20, nullptr);
+            uint8_t flush[128];
+            for (int i = 0; i < 5; ++i)
+                transport_->read_bytes(flush, sizeof(flush), 50, nullptr);
         }
         // Pn532KillerCommand.checkPn532Killer = 0xAA
         const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0xAA, {});
@@ -399,20 +400,40 @@ public:
             return false;
         }
 
+        // Read up to 8×200ms = 1600ms total.  UART PN532Killer can be slower than
+        // USB-CDC to process the vendor command, especially right after GetFirmwareVersion.
+        // We skip any D4-TFI frames (command echoes) and ACK frames (len=0, already
+        // skipped by parse_first_frame) and keep accumulating until we see a D5 response.
         std::vector<uint8_t> rx;
-        uint8_t buf[64];
-        rx.clear();
-        for (int i = 0; i < 5; ++i) {
-            ssize_t got = transport_->read_bytes(buf, sizeof(buf), 100, error);
+        uint8_t buf[128];
+        for (int i = 0; i < 8; ++i) {
+            ssize_t got = transport_->read_bytes(buf, sizeof(buf), 200, error);
             if (got > 0) rx.insert(rx.end(), buf, buf + got);
-            if (Pn532FrameCodec::parse_first_frame(rx, nullptr)) break;
+            std::vector<uint8_t> tmp;
+            if (Pn532FrameCodec::parse_first_frame(rx, &tmp)) {
+                // Skip command-echo frames (TFI=0xD4); keep reading for the response.
+                if (tmp.size() >= 1 && tmp[0] == 0xD5) break;
+            }
         }
         if (rx.empty()) return false;
 
         std::vector<uint8_t> data;
         if (!Pn532FrameCodec::parse_first_frame(rx, &data)) return false;
         if (data.size() < 2) return false;
-        if (data[0] != 0xD5) return false;
+        // If we still landed on an echo frame, try finding the next D5 frame.
+        if (data[0] == 0xD4) {
+            // Brute-force: scan for the D5 AB response anywhere in rx.
+            for (size_t off = 1; off + 9 < rx.size(); ++off) {
+                std::vector<uint8_t> sub(rx.begin() + static_cast<long>(off), rx.end());
+                std::vector<uint8_t> d2;
+                if (Pn532FrameCodec::parse_first_frame(sub, &d2) &&
+                    d2.size() >= 2 && d2[0] == 0xD5) {
+                    data = d2;
+                    break;
+                }
+            }
+        }
+        if (data.size() < 2 || data[0] != 0xD5) return false;
         // Error frame from plain PN532: cmd byte 0x7F
         if (data[1] == 0x7F) return false;
         // PN532Killer responds with cmd = 0xAB (0xAA + 1)
