@@ -207,7 +207,7 @@ private:
     {
         UINfcPage *self = static_cast<UINfcPage *>(lv_timer_get_user_data(timer));
         if (!self) return;
-        // Long-press scroll: after holding key for 400ms scroll, after 1500ms scroll 3x fast
+        // Long-press scroll: hold 400ms→scroll, hold 1500ms→fast scroll, hold 2000ms→jump to top/bottom
         // Works for Read tab scan log AND for HexLog modal
         if (self->held_scroll_key_ != 0) {
             const bool is_read_scroll = self->modal_ == Modal::None && self->current_tab_ == Tab::Read;
@@ -215,21 +215,36 @@ private:
             if (is_read_scroll || is_hexlog_scroll) {
                 const uint32_t now = lv_tick_get();
                 const uint32_t held_ms = now - self->held_scroll_start_ms_;
-                const uint32_t interval = (held_ms > 1500) ? 50 : 150;
-                if (held_ms > 400 && now - self->held_scroll_last_ms_ > interval) {
-                    const int dir   = (self->held_scroll_key_ == KEY_DOWN) ? 1 : -1;
-                    const int step  = (held_ms > 1500) ? 3 : 1;
-                    const int delta = dir * step;
+                if (held_ms > 2000 && now - self->held_scroll_last_ms_ > 200) {
+                    // Jump directly to top or bottom
+                    const bool to_bottom = (self->held_scroll_key_ == KEY_DOWN);
                     if (is_read_scroll) {
                         const int max_scroll = std::max(0, (int)self->scan_log_lines_.size() - LOG_VISIBLE_LINES);
-                        self->log_scroll_offset_ = std::max(0, std::min(max_scroll, self->log_scroll_offset_ + delta));
+                        self->log_scroll_offset_ = to_bottom ? max_scroll : 0;
                     } else {
                         const int total = nfc_app::NfcHexLog::get().total_lines();
                         const int max_scroll = std::max(0, total - LOG_VISIBLE_HEX_LINES);
-                        self->hex_log_scroll_ = std::max(0, std::min(max_scroll, self->hex_log_scroll_ + delta));
+                        self->hex_log_scroll_ = to_bottom ? max_scroll : 0;
                         self->render_all();
                     }
                     self->held_scroll_last_ms_ = now;
+                } else {
+                    const uint32_t interval = (held_ms > 1500) ? 50 : 150;
+                    if (held_ms > 400 && now - self->held_scroll_last_ms_ > interval) {
+                        const int dir   = (self->held_scroll_key_ == KEY_DOWN) ? 1 : -1;
+                        const int step  = (held_ms > 1500) ? 3 : 1;
+                        const int delta = dir * step;
+                        if (is_read_scroll) {
+                            const int max_scroll = std::max(0, (int)self->scan_log_lines_.size() - LOG_VISIBLE_LINES);
+                            self->log_scroll_offset_ = std::max(0, std::min(max_scroll, self->log_scroll_offset_ + delta));
+                        } else {
+                            const int total = nfc_app::NfcHexLog::get().total_lines();
+                            const int max_scroll = std::max(0, total - LOG_VISIBLE_HEX_LINES);
+                            self->hex_log_scroll_ = std::max(0, std::min(max_scroll, self->hex_log_scroll_ + delta));
+                            self->render_all();
+                        }
+                        self->held_scroll_last_ms_ = now;
+                    }
                 }
             }
         }
@@ -278,8 +293,11 @@ private:
                 std::vector<std::string> new_lines;
                 const bool done = self->service_.drain_uart_test_logs(new_lines, result);
                 // Split lines that are too wide for the display (~52 chars)
+                // TX[]/RX[] byte-dump lines go to the log file only, not the on-screen log
                 constexpr size_t WRAP_COLS = 52;
                 for (auto &l : new_lines) {
+                    if (l.size() >= 2 && ((l[0] == 'T' && l[1] == 'X') || (l[0] == 'R' && l[1] == 'X')))
+                        continue;
                     if (l.size() <= WRAP_COLS) {
                         self->scan_log_lines_.push_back(std::move(l));
                     } else {
@@ -485,6 +503,20 @@ private:
         int tab_index = static_cast<int>(current_tab_);
         tab_index = (tab_index + delta + 4) % 4;
         current_tab_ = static_cast<Tab>(tab_index);
+        // Unified auto-connect for USB, UART, and I2C.
+        // Reconnect if not yet connected, or if entering Emulator tab with unidentified device.
+        {
+            const auto conn0 = service_.connection_state();
+            const bool device_unidentified =
+                (conn0.device_kind == nfc_app::DeviceKind::Unknown ||
+                 conn0.device_kind == nfc_app::DeviceKind::NotConnected);
+            const bool should_reconnect = !conn0.connected ||
+                (current_tab_ == Tab::Emulator && device_unidentified);
+            if (should_reconnect && !service_.endpoints().empty()) {
+                if (conn0.connected) service_.disconnect();
+                service_.connect_current();
+            }
+        }
         const auto conn = service_.connection_state();
         if (current_tab_ == Tab::Emulator) {
             // When entering EMU tab with PN532Killer: auto-enter emulator mode for current slot.
@@ -620,9 +652,20 @@ private:
             activate_saved_action();
             break;
         case Tab::Emulator:
-            if (service_.emulation_allowed(&ui_message_)) {
-                modal_ = Modal::EmulatorAction;
-                modal_idx_ = 0;
+            {
+                // Unified connect/reconnect for all transports before EMU action
+                const auto conn0 = service_.connection_state();
+                const bool ep0_unidentified =
+                    (conn0.device_kind == nfc_app::DeviceKind::Unknown ||
+                     conn0.device_kind == nfc_app::DeviceKind::NotConnected);
+                if ((!conn0.connected || ep0_unidentified) && !service_.endpoints().empty()) {
+                    if (conn0.connected) service_.disconnect();
+                    service_.connect_current();
+                }
+                if (service_.emulation_allowed(&ui_message_)) {
+                    modal_ = Modal::EmulatorAction;
+                    modal_idx_ = 0;
+                }
             }
             break;
         case Tab::Tools:
@@ -1149,17 +1192,50 @@ private:
             create_text(right, 6, 20, "PN532Killer", 0xFFD700, 12);
             create_text(right, 6, 38, "for HW emulation", 0x8E8E8E, 10);
             create_text(right, 6, 60, (std::string("Connected: ") + nfc_app::to_string(connection.device_kind)).c_str(), 0x555555, 10);
+        } else if (connection.device_kind == nfc_app::DeviceKind::GroveNFC) {
+            // ── GroveNFC: software-side emulation, 8 slots, no block dump ────
+            const std::string proto_name =
+                (protocol == nfc_app::ProtocolKind::MifareClassic) ? "MFC-1K" :
+                (protocol == nfc_app::ProtocolKind::Iso14443B)     ? "ISO14B"  :
+                (protocol == nfc_app::ProtocolKind::Iso15693)      ? "ISO15693" : "NTAG";
+            create_text(left, 6, 4,  "SW EMU", 0x00FF88, 12);
+            const std::string slot_str = "Slot " + std::to_string(hw_emu_slot_ + 1) + "/8";
+            create_text(left, 6, 18, slot_str.c_str(), 0xFFFFFF, 12);
+            create_text(left, 6, 38, "Tab:proto", 0xD8D8D8, 10);
+            create_text(left, 6, 50, "F/X:slot", 0xD8D8D8, 10);
+            create_text(left, 6, 62, "OK:activate", 0xF7A600, 10);
+            create_text(left, 6, 80, "GroveNFC I2C", 0x00FF88, 10);
+
+            create_text(right, 6, 4,  proto_name.c_str(), 0x00D2FF, 12);
+            create_text(right, 6, 20, "OK to activate", 0xD8D8D8, 10);
+            create_text(right, 6, 34, "emulation on slot", 0xD8D8D8, 10);
+            create_text(right, 6, 52, "Protocols:", 0x9E9E9E, 10);
+            create_text(right, 6, 64, "MFC/NTAG/ISO14B", 0x9E9E9E, 10);
+            create_text(right, 6, 76, "ISO15693", 0x9E9E9E, 10);
+            create_text(right, 6, 92, "No dump/upload", 0x444444, 10);
+        } else if (connection.device_kind == nfc_app::DeviceKind::NFCUnit) {
+            // ── NFCUnit: read-only on Linux, no emulation support ────────────
+            create_text(left, 6, 4,  "EMU", 0xFF8844, 12);
+            create_text(left, 6, 22, "Not supported", 0xFF8888, 11);
+            create_text(left, 6, 40, "NFC Unit:", 0x9E9E9E, 10);
+            create_text(left, 6, 54, "read-only on Linux", 0x9E9E9E, 10);
+
+            create_text(right, 6, 4,  "NFC Unit", 0x8E8E8E, 12);
+            create_text(right, 6, 20, "Read-only device", 0xD8D8D8, 10);
+            create_text(right, 6, 36, "Emulation requires", 0x8E8E8E, 10);
+            create_text(right, 6, 50, "PN532Killer or", 0x8E8E8E, 10);
+            create_text(right, 6, 64, "GroveNFC (I2C)", 0xFFD700, 11);
         } else {
-            // ── No PN532Killer connected ─────────────────────────────────────
+            // ── No device / unknown ───────────────────────────────────────────
             create_text(left, 6, 4,  "EMU", 0x888888, 12);
             create_text(left, 6, 22, "No device", 0xAAAAAA, 11);
-            create_text(left, 6, 40, "Connect a", 0x9E9E9E, 10);
-            create_text(left, 6, 54, "PN532Killer", 0x9E9E9E, 10);
+            create_text(left, 6, 40, "Connect a device", 0x9E9E9E, 10);
 
-            create_text(right, 6, 4,  "Hardware EMU", 0x8E8E8E, 11);
-            create_text(right, 6, 20, "requires", 0x8E8E8E, 10);
-            create_text(right, 6, 34, "PN532Killer", 0xFFD700, 12);
-            create_text(right, 6, 56, (std::string("Status: ") + nfc_app::to_string(connection.device_kind)).c_str(), 0x555555, 10);
+            create_text(right, 6, 4,  "Hardware EMU:", 0x8E8E8E, 11);
+            create_text(right, 6, 18, "PN532Killer", 0xFFD700, 11);
+            create_text(right, 6, 30, "Software EMU:", 0x8E8E8E, 11);
+            create_text(right, 6, 44, "GroveNFC (I2C)", 0x00FF88, 11);
+            create_text(right, 6, 66, (std::string("Status: ") + nfc_app::to_string(connection.device_kind)).c_str(), 0x555555, 10);
         }
 
         create_footer(parent, ui_message_);
@@ -1619,9 +1695,9 @@ private:
             create_text(card, 8, 20, (std::string("Dev: ") + dev).c_str(), 0x888888, 10);
         }
 
-        const char *field_labels[] = {"TX GPIO:", "RX GPIO:", "Baud:"};
-        const int field_vals[] = { uart_edit_buf_.tx_pin, uart_edit_buf_.rx_pin, uart_edit_buf_.baud_rate };
-        for (int i = 0; i < 3; ++i) {
+        const char *field_labels[] = {"TX GPIO:", "RX GPIO:"};
+        const int field_vals[] = { uart_edit_buf_.tx_pin, uart_edit_buf_.rx_pin };
+        for (int i = 0; i < 2; ++i) {
             const bool sel = (port_settings_field_ == i);
             char vbuf[16];
             if (field_vals[i] < 0) std::snprintf(vbuf, sizeof(vbuf), "(unknown)");
@@ -1631,29 +1707,29 @@ private:
             uint32_t col = sel ? 0xFFFF00 : 0xD8D8D8;
             create_text(card, 8, 32 + i * 16, line.c_str(), col, 11);
         }
-        // Test Connection action row
+        // Test Connection action row (field 2)
         {
-            const bool sel = (port_settings_field_ == 3);
+            const bool sel = (port_settings_field_ == 2);
             uint32_t col = sel ? 0x00FF88 : 0x44BB77;
-            create_text(card, 8, 82, sel ? "[ Test Connection ]" : "  Test Connection", col, 11);
+            create_text(card, 8, 66, sel ? "[ Test Connection ]" : "  Test Connection", col, 11);
         }
         // Test result
         if (!uart_test_result_.empty()) {
             const bool ok = uart_test_result_.rfind("OK:", 0) == 0;
-            create_text(card, 8, 96, uart_test_result_.c_str(), ok ? 0x00FF88 : 0xFF6060, 10);
+            create_text(card, 8, 82, uart_test_result_.c_str(), ok ? 0x00FF88 : 0xFF6060, 10);
         }
     }
 
     void handle_port_settings_key(uint32_t key)
     {
-        const int FIELDS = 4;  // 0=TX  1=RX  2=Baud  3=Test
+        const int FIELDS = 3;  // 0=TX  1=RX  2=Test
         if (key == KEY_ESC) {
             // Apply any pending edit and save
             apply_port_settings_field();
             nfc_app::UartConfig cfg = service_.uart_config();
             cfg.tx_pin    = uart_edit_buf_.tx_pin;
             cfg.rx_pin    = uart_edit_buf_.rx_pin;
-            cfg.baud_rate = uart_edit_buf_.baud_rate;
+            cfg.baud_rate = 115200;
             service_.set_uart_config(cfg);
             ui_message_ = "Port settings saved";
             modal_ = Modal::ReadMenu;
@@ -1673,13 +1749,13 @@ private:
             return;
         }
         if (key == KEY_ENTER) {
-            if (port_settings_field_ == 3) {
+            if (port_settings_field_ == 2) {
                 // Test Connection: save current settings then start async probe
                 apply_port_settings_field();
                 nfc_app::UartConfig cfg = service_.uart_config();
                 cfg.tx_pin    = uart_edit_buf_.tx_pin;
                 cfg.rx_pin    = uart_edit_buf_.rx_pin;
-                cfg.baud_rate = uart_edit_buf_.baud_rate;
+                cfg.baud_rate = 115200;
                 service_.set_uart_config(cfg);
                 uart_test_result_ = "Testing...";
                 service_.start_uart_test();
@@ -1702,9 +1778,8 @@ private:
         if (edit_buf_.empty()) return;
         try {
             int v = std::stoi(edit_buf_);
-            if (port_settings_field_ == 0) uart_edit_buf_.tx_pin    = v;
+            if (port_settings_field_ == 0) uart_edit_buf_.tx_pin = v;
             else if (port_settings_field_ == 1) uart_edit_buf_.rx_pin = v;
-            else                                uart_edit_buf_.baud_rate = v;
         } catch (...) {}
         edit_buf_.clear();
     }
@@ -2232,15 +2307,11 @@ private:
             uint32_t col = (uart_field_idx_ == 0) ? 0xFFFF00 : 0xD8D8D8;
             create_text(card, 6, 22, buf, col, 11);
         }
-        // Baud rate
-        {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "Baud: %d", uart_edit_buf_.baud_rate);
-            uint32_t col = (uart_field_idx_ == 1) ? 0xFFFF00 : 0xD8D8D8;
-            create_text(card, 6, 38, buf, col, 11);
-        }
-        // Pins (informational)
-        {
+        // Pins (informational) / edit buffer when typing device path
+        if (uart_field_idx_ == 0 && !edit_buf_.empty()) {
+            std::string disp = "> " + edit_buf_;
+            create_text(card, 6, 38, disp.c_str(), 0xFFFF88, 11);
+        } else {
             char buf[40];
             const auto pins = nfc_app::NfcDeviceService::uart_pin_hint(uart_edit_buf_.device_path);
             if (pins.first >= 0) {
@@ -2248,23 +2319,18 @@ private:
             } else {
                 std::snprintf(buf, sizeof(buf), "TX/RX: unknown");
             }
-            create_text(card, 6, 54, buf, 0x8DB6FF, 11);
+            create_text(card, 6, 38, buf, 0x8DB6FF, 11);
         }
-        // Current input when editing device path
-        if (uart_field_idx_ == 0 && !edit_buf_.empty()) {
-            std::string disp = "> " + edit_buf_;
-            create_text(card, 6, 68, disp.c_str(), 0xFFFF88, 11);
-        }
-        // Test Connection row (field 2)
+        // Test Connection row (field 1)
         {
-            const bool sel = (uart_field_idx_ == 2);
+            const bool sel = (uart_field_idx_ == 1);
             uint32_t col = sel ? 0x00FF88 : 0x44BB77;
-            create_text(card, 6, 70, sel ? "[ Test Connection ]" : "  Test Connection", col, 11);
+            create_text(card, 6, 54, sel ? "[ Test Connection ]" : "  Test Connection", col, 11);
         }
         // Test result line
         if (!uart_test_result_.empty()) {
             const bool ok = uart_test_result_.rfind("OK:", 0) == 0;
-            create_text(card, 6, 82, uart_test_result_.c_str(), ok ? 0x00FF88 : 0xFF6060, 10);
+            create_text(card, 6, 68, uart_test_result_.c_str(), ok ? 0x00FF88 : 0xFF6060, 10);
         }
     }
 
@@ -2297,7 +2363,7 @@ private:
 
     void handle_uart_config_key(uint32_t key)
     {
-        const int FIELDS = 3;  // 0=device path  1=baud rate  2=Test Connection
+        const int FIELDS = 2;  // 0=device path  1=Test Connection
         if (key == KEY_ESC) {
             // Save current values
             if (!uart_edit_buf_.device_path.empty()) {
@@ -2318,10 +2384,7 @@ private:
             if (uart_field_idx_ == 0 && !edit_buf_.empty()) {
                 uart_edit_buf_.device_path = edit_buf_;
                 edit_buf_.clear();
-            } else if (uart_field_idx_ == 1 && !edit_buf_.empty()) {
-                try { uart_edit_buf_.baud_rate = std::stoi(edit_buf_); } catch (...) {}
-                edit_buf_.clear();
-            } else if (uart_field_idx_ == 2) {
+            } else if (uart_field_idx_ == 1) {
                 // Save current config first, then test
                 if (!uart_edit_buf_.device_path.empty()) {
                     auto pins = nfc_app::NfcDeviceService::uart_pin_hint(uart_edit_buf_.device_path);
@@ -2338,13 +2401,10 @@ private:
             if (!edit_buf_.empty()) edit_buf_.pop_back();
             return;
         }
-        // Typed character — device path accepts printable, baud accepts digits
+        // Typed character — device path only
         if (uart_field_idx_ == 0) {
             char c = keycode_to_char(key);
             if (c >= 32 && c < 127) edit_buf_ += c;
-        } else if (uart_field_idx_ == 1) {
-            char c = keycode_to_char(key);
-            if (c >= '0' && c <= '9') edit_buf_ += c;
         }
     }
 

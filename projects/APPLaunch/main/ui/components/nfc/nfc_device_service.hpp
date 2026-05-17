@@ -348,7 +348,7 @@ public:
                 finish_uart_test("No UART port found (/dev/ttyAMA*)");
                 return;
             }
-            const int baud = cfg.baud_rate > 0 ? cfg.baud_rate : 115200;
+            const int baud = 115200; // fixed baud rate
 
             // Open log file
             const std::string log_dir = storage_.root_dir() + "/logs";
@@ -432,8 +432,8 @@ public:
 
             std::string result;
             if (kind == DeviceKind::PN532Killer || kind == DeviceKind::PN532) {
-                result = std::string("OK: ") + to_string(kind);
-                if (!firmware.empty()) result += " " + firmware;
+                result = std::string("OK: ");
+                result += firmware.empty() ? to_string(kind) : firmware;
             } else {
                 result = "No device: " + probe_error;
             }
@@ -1399,7 +1399,8 @@ private:
                     tag.magic_type = "Gen1A";
                     push_log("> Reading Gen1A blocks...");
                     client.read_gen1a_full(nullptr, &tag.block_log, &magic_err,
-                        [this](const std::string &line) { push_log(line); });
+                        [this](const std::string &line) { push_log(line); },
+                        (device_kind == DeviceKind::PN532Killer) ? 5 : 0);
                 } else if (client.is_gen3(&magic_err)) {
                     tag.magic_type = "Gen3";
                 } else if (client.is_gen4("00000000", &magic_err)) {

@@ -4,9 +4,11 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <optional>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -384,6 +386,13 @@ public:
             return false;
         }
 
+        // Drain any stale bytes (e.g. postamble from the preceding GetFirmwareVersion)
+        // before sending 0xAA so the first read in the loop is clean.
+        {
+            uint8_t flush[64];
+            for (int i = 0; i < 3; ++i)
+                transport_->read_bytes(flush, sizeof(flush), 20, nullptr);
+        }
         // Pn532KillerCommand.checkPn532Killer = 0xAA
         const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0xAA, {});
         if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) {
@@ -709,7 +718,8 @@ public:
     // on_line: optional callback invoked immediately for each output line (real-time streaming).
     bool read_gen1a_full(std::vector<std::vector<uint8_t>> *blocks,
                          std::vector<std::string> *log, std::string *error,
-                         std::function<void(const std::string &)> on_line = nullptr)
+                         std::function<void(const std::string &)> on_line = nullptr,
+                         int inter_block_delay_ms = 0)
     {
         auto emit = [&](const std::string &s) {
             if (log) log->push_back(s);
@@ -724,6 +734,8 @@ public:
         if (blocks) blocks->assign(64, {});
         int ok_count = 0;
         for (uint8_t blk = 0; blk < 64; ++blk) {
+            if (inter_block_delay_ms > 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(inter_block_delay_ms));
             std::vector<uint8_t> bdata;
             std::string berr;
             if (read_gen1a_block(blk, &bdata, &berr)) {
