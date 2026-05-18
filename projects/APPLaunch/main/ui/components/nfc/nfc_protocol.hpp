@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <chrono>
 #include <functional>
 #include <optional>
@@ -336,6 +337,70 @@ public:
         return result;
     }
 
+    // ── PN532 target emulation commands (Type 4 Tag style) ─────────────────
+
+    // TgInitAsTarget (0x8C): enter target mode with caller-provided config.
+    // Returns true once PN532 accepts target init (D5 8D ...).
+    bool tg_init_as_target(const std::vector<uint8_t> &config,
+                           std::vector<uint8_t> *resp_data,
+                           std::string *error)
+    {
+        const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0x8C, config);
+        if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) return false;
+        std::vector<uint8_t> rx;
+        if (!collect_response(&rx, error)) return false;
+        std::vector<uint8_t> fd;
+        if (!Pn532FrameCodec::parse_first_frame(rx, &fd) ||
+            fd.size() < 2 || fd[0] != 0xD5 || fd[1] != 0x8D) {
+            if (error) *error = "unexpected TgInitAsTarget response";
+            return false;
+        }
+        if (resp_data) resp_data->assign(fd.begin() + 2, fd.end());
+        return true;
+    }
+
+    // TgGetData (0x86): receive one APDU/data packet from initiator.
+    // Output includes the PN532 target status byte at out[0].
+    bool tg_get_data(std::vector<uint8_t> *out, std::string *error)
+    {
+        const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0x86, {});
+        if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) return false;
+        std::vector<uint8_t> rx;
+        if (!collect_response(&rx, error)) return false;
+        std::vector<uint8_t> fd;
+        if (!Pn532FrameCodec::parse_first_frame(rx, &fd) ||
+            fd.size() < 3 || fd[0] != 0xD5 || fd[1] != 0x87) {
+            if (error) *error = "unexpected TgGetData response";
+            return false;
+        }
+        if (out) out->assign(fd.begin() + 2, fd.end());
+        return true;
+    }
+
+    // TgSetData (0x8E): send response APDU/data packet to initiator.
+    bool tg_set_data(const std::vector<uint8_t> &data, std::string *error)
+    {
+        const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0x8E, data);
+        if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) return false;
+        std::vector<uint8_t> rx;
+        if (!collect_response(&rx, error)) return false;
+        std::vector<uint8_t> fd;
+        if (!Pn532FrameCodec::parse_first_frame(rx, &fd) ||
+            fd.size() < 3 || fd[0] != 0xD5 || fd[1] != 0x8F) {
+            if (error) *error = "unexpected TgSetData response";
+            return false;
+        }
+        if (fd[2] != 0x00) {
+            if (error) {
+                char b[32];
+                std::snprintf(b, sizeof(b), "tg status 0x%02X", fd[2]);
+                *error = b;
+            }
+            return false;
+        }
+        return true;
+    }
+
     std::optional<Pn532FirmwareInfo> query_firmware(std::string *error)
     {
         if (!transport_ || !transport_->is_open()) {
@@ -511,7 +576,15 @@ public:
 
         // Step 3: checkPn532Killer (0xAA) to distinguish PN532Killer from plain PN532.
         // Must be done AFTER GetFirmwareVersion so the PN532 is in a known good state.
-        const bool is_killer = probe_pn532killer(nullptr);
+        // Fallback: PN532Killer encodes the build date as vYEAR.MONTH (e.g. v26.03), while
+        // plain PN532 always reports v1.xx (NXP silicon revision). If the 0xAA vendor probe
+        // fails (e.g. UART timing differences), use the version major number as a heuristic.
+        bool version_looks_like_killer = false;
+        if (!fw->version.empty() && fw->version[0] == 'v') {
+            int ver = std::atoi(fw->version.c_str() + 1);
+            version_looks_like_killer = (ver >= 10);
+        }
+        const bool is_killer = probe_pn532killer(nullptr) || version_looks_like_killer;
 
         // Step 4: drain any bytes left over from the 0xAA probe before next commands.
         {
@@ -552,6 +625,12 @@ public:
         std::vector<uint8_t> rx;
         collect_response(&rx, nullptr); // expect D5 33
         return true;
+    }
+
+    // Release currently listed target (if any) to keep subsequent scans responsive.
+    void release_target_if_listed()
+    {
+        in_release_all();
     }
 
     // InRelease (0x52): release all listed targets from the PN532.
@@ -840,6 +919,144 @@ public:
         return resp.size() >= 15;
     }
 
+    // Write Mifare Classic block 0 on a Gen1A magic card.
+    // Requires unlocked Gen1A state and a full 16-byte block payload.
+    bool write_gen1a_block0(const std::vector<uint8_t> &block0, std::string *error)
+    {
+        if (block0.size() != 16) {
+            if (error) *error = "block0 must be 16 bytes";
+            return false;
+        }
+
+        TagInfo tag;
+        if (!in_list_passive_target_iso14443a(&tag, error)) return false;
+        if (!is_gen1a(error)) {
+            if (error && error->empty()) *error = "not Gen1A";
+            return false;
+        }
+
+        std::vector<uint8_t> resp;
+        if (!in_communicate_thru_checked({0xA0, 0x00}, true, &resp, error)) return false;
+        if (resp.size() < 2 || resp[1] != 0x0A) {
+            if (error) *error = "write command not acknowledged";
+            return false;
+        }
+        if (!in_communicate_thru_checked(block0, true, &resp, error)) return false;
+        if (resp.size() < 2 || resp[1] != 0x0A) {
+            if (error) *error = "write data not acknowledged";
+            return false;
+        }
+        return true;
+    }
+
+    // Write Mifare Classic block 0 using authenticated write (CUID/Gen2 style).
+    bool write_gen2_block0(const std::vector<uint8_t> &block0, std::string *error)
+    {
+        if (block0.size() != 16) {
+            if (error) *error = "block0 must be 16 bytes";
+            return false;
+        }
+
+        TagInfo tag;
+        if (!in_list_passive_target_iso14443a(&tag, error)) return false;
+
+        std::vector<uint8_t> uid_bytes;
+        for (size_t i = 0; i + 1 < tag.uid.size(); i += 2) {
+            uid_bytes.push_back(static_cast<uint8_t>(std::strtoul(tag.uid.substr(i, 2).c_str(), nullptr, 16)));
+        }
+        if (uid_bytes.size() < 4) {
+            if (error) *error = "invalid card UID";
+            return false;
+        }
+        uint8_t uid4[4] = {
+            uid_bytes[uid_bytes.size() - 4],
+            uid_bytes[uid_bytes.size() - 3],
+            uid_bytes[uid_bytes.size() - 2],
+            uid_bytes[uid_bytes.size() - 1],
+        };
+        const uint8_t ff_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+        std::string auth_err;
+        bool authed = mf_authenticate(0, false, ff_key, uid4, &auth_err);
+        if (!authed) {
+            reselect_card_lightweight(nullptr);
+            authed = mf_authenticate(0, true, ff_key, uid4, &auth_err);
+        }
+        if (!authed) {
+            if (error) *error = auth_err.empty() ? "auth sector0 failed" : auth_err;
+            return false;
+        }
+
+        return mf_write_block_auth(0, block0, error);
+    }
+
+    // Set UID for Gen3 Mifare Classic magic cards.
+    bool set_classic_gen3_uid(const std::vector<uint8_t> &uid,
+                              const std::vector<uint8_t> &block0,
+                              std::string *error)
+    {
+        if (uid.size() != 4 && uid.size() != 7) {
+            if (error) *error = "UID must be 4 or 7 bytes";
+            return false;
+        }
+        if (block0.size() != 16) {
+            if (error) *error = "block0 must be 16 bytes";
+            return false;
+        }
+
+        TagInfo tag;
+        if (!in_list_passive_target_iso14443a(&tag, error)) return false;
+
+        std::vector<uint8_t> cmd_uid = {0x90, 0xFB, 0xCC, 0xCC, 0x07};
+        cmd_uid.insert(cmd_uid.end(), uid.begin(), uid.end());
+        if (!in_communicate_thru_checked(cmd_uid, true, nullptr, error)) return false;
+
+        std::vector<uint8_t> cmd_blk0 = {0x90, 0xF0, 0xCC, 0xCC, 0x10};
+        cmd_blk0.insert(cmd_blk0.end(), block0.begin(), block0.end());
+        return in_communicate_thru_checked(cmd_blk0, true, nullptr, error);
+    }
+
+    // Set UID for Gen4 magic cards (GDM family).
+    // password: 8-char hex string, defaults to "00000000" in caller.
+    bool set_gen4_uid(const std::vector<uint8_t> &uid,
+                      const std::vector<uint8_t> &block0,
+                      const std::string &password,
+                      std::string *error)
+    {
+        if (uid.size() != 4 && uid.size() != 7) {
+            if (error) *error = "UID must be 4 or 7 bytes";
+            return false;
+        }
+        if (block0.size() != 16) {
+            if (error) *error = "block0 must be 16 bytes";
+            return false;
+        }
+
+        uint8_t pw[4] = {0, 0, 0, 0};
+        auto hexval = [](char c) -> uint8_t {
+            if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+            if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+            if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+            return 0;
+        };
+        for (int i = 0; i < 4 && (i * 2 + 1) < static_cast<int>(password.size()); ++i) {
+            pw[i] = static_cast<uint8_t>((hexval(password[i * 2]) << 4) | hexval(password[i * 2 + 1]));
+        }
+
+        if (!is_gen4(password, error)) {
+            if (error && error->empty()) *error = "not Gen4";
+            return false;
+        }
+
+        const uint8_t uid_mode = (uid.size() == 4) ? 0x00 : 0x01;
+        std::vector<uint8_t> cmd_len = {0xCF, pw[0], pw[1], pw[2], pw[3], 0x68, uid_mode};
+        if (!in_communicate_thru_checked(cmd_len, true, nullptr, error)) return false;
+
+        std::vector<uint8_t> cmd_write = {0xCF, pw[0], pw[1], pw[2], pw[3], 0xCD, 0x00};
+        cmd_write.insert(cmd_write.end(), block0.begin(), block0.end());
+        return in_communicate_thru_checked(cmd_write, true, nullptr, error);
+    }
+
     bool in_list_passive_target_iso14443a(TagInfo *tag, std::string *error)
     {
         if (!tag) {
@@ -975,6 +1192,62 @@ public:
         return true;
     }
 
+    // Mifare Classic write block (0xA0) via InDataExchange.
+    // Target sector must be authenticated before calling this.
+    bool mf_write_block_auth(uint8_t block, const std::vector<uint8_t> &block_data, std::string *error)
+    {
+        if (block_data.size() != 16) {
+            if (error) *error = "write data must be 16 bytes";
+            return false;
+        }
+
+        std::vector<uint8_t> ack;
+        if (!in_data_exchange(0x01, {0xA0, block}, &ack, error)) return false;
+        if (!ack.empty() && ack[0] != 0x0A) {
+            if (error) *error = "write command not acknowledged";
+            return false;
+        }
+
+        std::vector<uint8_t> resp;
+        if (!in_data_exchange(0x01, block_data, &resp, error)) return false;
+        if (!resp.empty() && resp[0] != 0x0A) {
+            if (error) *error = "write data not acknowledged";
+            return false;
+        }
+        return true;
+    }
+
+    bool in_communicate_thru_checked(const std::vector<uint8_t> &command,
+                                     bool append_crc,
+                                     std::vector<uint8_t> *resp_data,
+                                     std::string *error)
+    {
+        std::vector<uint8_t> tx = command;
+        if (append_crc) {
+            uint8_t crc_lo = 0, crc_hi = 0;
+            compute_crc_a(tx.data(), tx.size(), &crc_lo, &crc_hi);
+            tx.push_back(crc_lo);
+            tx.push_back(crc_hi);
+        }
+
+        std::vector<uint8_t> resp;
+        if (!in_communicate_thru_raw(tx.data(), tx.size(), &resp, error)) return false;
+        if (resp.empty()) {
+            if (error) *error = "empty response";
+            return false;
+        }
+        if (resp[0] != 0x00) {
+            if (error) {
+                char b[32];
+                std::snprintf(b, sizeof(b), "status 0x%02X", resp[0]);
+                *error = b;
+            }
+            return false;
+        }
+        if (resp_data) *resp_data = resp;
+        return true;
+    }
+
     // Lightweight re-select: release current target then InListPassiveTarget,
     // WITHOUT wakeup+SAMConfig overhead.  Used after a failed auth attempt
     // to restore the card to a selectable state quickly.
@@ -1103,6 +1376,220 @@ public:
         return ok_count > 0;
     }
 
+    // InListPassiveTarget for ISO15693 (brTy=0x05): scan for ISO 15693 tags.
+    // On success, populates tag->uid (reversed display, E0... format), protocol = Iso15693.
+    bool in_list_passive_target_iso15693(TagInfo *tag, std::string *error)
+    {
+        if (!tag) return false;
+        send_wakeup();
+        sam_configuration(nullptr);
+        in_release_all();
+
+        const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0x4A, {0x01, 0x05});
+        if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) return false;
+        std::vector<uint8_t> rx;
+        if (!collect_response(&rx, error)) return false;
+        std::vector<uint8_t> data;
+        if (!Pn532FrameCodec::parse_first_frame(rx, &data)) {
+            if (error) *error = "no 15693 response frame";
+            return false;
+        }
+        // Expected: D5 4B NbTg [Tg UID[8]]
+        if (data.size() < 3 || data[0] != 0xD5 || data[1] != 0x4B) {
+            if (error) *error = "unexpected 15693 response";
+            return false;
+        }
+        if (data[2] == 0x00) {
+            if (error) *error = "no ISO15693 tag found";
+            return false;
+        }
+        // Minimum: D5(1) 4B(1) NbTg(1) Tg(1) UID[8] = 12 bytes
+        if (data.size() < 12) {
+            if (error) *error = "truncated 15693 response";
+            return false;
+        }
+        // data[3] = Tg (target number), data[4..11] = UID (8 bytes, device sends MSB first)
+        // pn532-python reverses byte order for display (so E0 prefix appears last):
+        const uint8_t *uid = data.data() + 4;
+        char uid_buf[17] = {};
+        for (int i = 7; i >= 0; --i)
+            std::snprintf(uid_buf + (7 - i) * 2, 3, "%02X", uid[i]);
+        tag->protocol = ProtocolKind::Iso15693;
+        tag->tag_type = "ISO 15693";
+        tag->uid = uid_buf;
+        tag->raw_data.clear();
+        tag->raw_data.push_back("UID: " + tag->uid);
+        tag->identity_fields["dsfid"] = "00";
+        tag->identity_fields["afi"]   = "00";
+        if (error) error->clear();
+        target_listed_ = true;
+        return true;
+    }
+
+    // ── NTAG / Mifare Ultralight dump ────────────────────────────────────────
+
+    // GET_VERSION (0x60) for NTAG/Ultralight chips (NXP-specific command).
+    // Returns the version payload bytes on success, empty vector on failure.
+    // Mifare Ultralight (original / C) will NAK → empty returned.
+    std::vector<uint8_t> ntag_get_version()
+    {
+        std::vector<uint8_t> resp;
+        if (in_data_exchange(0x01, {0x60}, &resp, nullptr)) {
+            return resp;
+        }
+
+        // pn532-python falls back to raw 14A transceive on some PN532Killer firmware.
+        // InCommunicateThru expects a full 14A frame (with CRC-A appended).
+        uint8_t cmd[3] = {0x60, 0x00, 0x00};
+        compute_crc_a(cmd, 1, &cmd[1], &cmd[2]);
+        std::vector<uint8_t> raw;
+        if (in_communicate_thru_raw(cmd, sizeof(cmd), &raw, nullptr) &&
+            raw.size() >= 2 && raw[0] == 0x00) {
+            return std::vector<uint8_t>(raw.begin() + 1, raw.end());
+        }
+        return {};
+    }
+
+    // Identify NTAG variant from GET_VERSION response bytes (NXP AN10609).
+    // ver[5] = storage size indicator:
+    //   0x0F → NTAG213 (45 pages), 0x11 → NTAG215 (135 pages), 0x13 → NTAG216 (231 pages)
+    static std::string ntag_type_from_version(const std::vector<uint8_t> &ver)
+    {
+        if (ver.size() < 7) return "";
+        switch (ver[5]) {
+        case 0x0F: return "NTAG213";
+        case 0x11: return "NTAG215";
+        case 0x13: return "NTAG216";
+        default:   return "";
+        }
+    }
+
+    // Total page count for known NTAG types (4 bytes per page).
+    static int ntag_page_count_for_type(const std::string &type)
+    {
+        if (type == "NTAG213") return 45;
+        if (type == "NTAG215") return 135;
+        if (type == "NTAG216") return 231;
+        return 16; // Mifare Ultralight: 16 pages minimum
+    }
+
+    // Read all pages of a NTAG/Mifare Ultralight card via InDataExchange.
+    // Target must already be selected (in_list_passive_target_iso14443a returned true).
+    // pages_out: optional per-page 4-byte vectors (may be nullptr).
+    // type_out:  optional chip type string ("NTAG213", "Ultralight", etc.).
+    bool ntag_read_all_pages(std::vector<std::vector<uint8_t>> *pages_out,
+                             std::string *type_out,
+                             std::string *error,
+                             std::function<void(const std::string &)> on_line = nullptr)
+    {
+        auto emit = [&](const std::string &s) { if (on_line) on_line(s); };
+
+        auto read_four_pages = [&](uint8_t start_page, std::vector<uint8_t> *out16) -> bool {
+            std::vector<uint8_t> resp;
+            if (in_data_exchange(0x01, {0x30, start_page}, &resp, nullptr) && resp.size() >= 16) {
+                out16->assign(resp.begin(), resp.begin() + 16);
+                return true;
+            }
+
+            // Compatibility fallback for PN532Killer firmware variants that reject
+            // InDataExchange for MFU/NTAG read but accept raw 14A transceive.
+            uint8_t raw_cmd[4] = {0x30, start_page, 0x00, 0x00};
+            compute_crc_a(raw_cmd, 2, &raw_cmd[2], &raw_cmd[3]);
+            std::vector<uint8_t> raw_resp;
+            if (!in_communicate_thru_raw(raw_cmd, sizeof(raw_cmd), &raw_resp, nullptr)) return false;
+            if (raw_resp.size() < 17 || raw_resp[0] != 0x00) return false;
+            out16->assign(raw_resp.begin() + 1, raw_resp.begin() + 17);
+            return true;
+        };
+
+        // Identify chip via GET_VERSION; fall back to generic Ultralight on failure.
+        auto ver = ntag_get_version();
+        std::string type = ntag_type_from_version(ver);
+        if (type.empty()) type = "Ultralight";
+        if (type_out) *type_out = type;
+
+        const int total_pages = ntag_page_count_for_type(type);
+        {
+            char buf[48];
+            std::snprintf(buf, sizeof(buf), "> %s (%d pages)", type.c_str(), total_pages);
+            emit(buf);
+        }
+
+        if (pages_out) pages_out->assign(total_pages, {});
+        int ok = 0;
+
+        for (int p = 0; p < total_pages; p += 4) {
+            std::vector<uint8_t> chunk16;
+            if (!read_four_pages(static_cast<uint8_t>(p), &chunk16)) {
+                char buf[24];
+                std::snprintf(buf, sizeof(buf), "ERR page%02d", p);
+                emit(buf);
+                break;
+            }
+            for (int i = 0; i < 4 && p + i < total_pages; ++i) {
+                std::vector<uint8_t> pg(chunk16.begin() + i * 4, chunk16.begin() + i * 4 + 4);
+                if (pages_out && p + i < static_cast<int>(pages_out->size()))
+                    (*pages_out)[p + i] = pg;
+                ++ok;
+                char buf[24];
+                std::snprintf(buf, sizeof(buf), "%02d: %02X%02X%02X%02X",
+                    p + i, pg[0], pg[1], pg[2], pg[3]);
+                emit(buf);
+            }
+        }
+
+        char result[40];
+        std::snprintf(result, sizeof(result), "OK %d/%d pages read", ok, total_pages);
+        emit(result);
+        if (error && ok == 0) *error = "no pages readable";
+        return ok > 0;
+    }
+
+    // ── ISO15693 data dump ───────────────────────────────────────────────────
+
+    // Read all ISO15693 blocks via InDataExchange.
+    // Target must already be selected (in_list_passive_target_iso15693 returned true).
+    // Reads single blocks until failure (end of memory or command error).
+    // blocks_out: optional per-block byte vectors (may be nullptr).
+    bool iso15693_read_all_blocks(std::vector<std::vector<uint8_t>> *blocks_out,
+                                  std::string *error,
+                                  std::function<void(const std::string &)> on_line = nullptr)
+    {
+        auto emit = [&](const std::string &s) { if (on_line) on_line(s); };
+        auto read_block = [&](uint8_t block, std::vector<uint8_t> *out) -> bool {
+            // Match pn532-python: InDataExchange payload starts with cmd=0x20 (no explicit flags byte).
+            // Some firmware variants still expect explicit flags=0x02, so keep it as fallback.
+            if (in_data_exchange(0x01, {0x20, block}, out, nullptr) && !out->empty()) return true;
+            if (in_data_exchange(0x01, {0x02, 0x20, block}, out, nullptr) && !out->empty()) return true;
+            return false;
+        };
+
+        if (blocks_out) blocks_out->clear();
+        int ok = 0;
+
+        for (int b = 0; b < 256; ++b) {
+            std::vector<uint8_t> resp;
+            if (!read_block(static_cast<uint8_t>(b), &resp)) {
+                break;
+            }
+            if (blocks_out) blocks_out->push_back(resp);
+            ++ok;
+            char buf[40];
+            int pos = std::snprintf(buf, sizeof(buf), "%02d: ", b);
+            for (uint8_t byte : resp) {
+                if (pos < static_cast<int>(sizeof(buf)) - 3)
+                    pos += std::snprintf(buf + pos, sizeof(buf) - pos, "%02X", byte);
+            }
+            emit(buf);
+        }
+
+        char result[32];
+        std::snprintf(result, sizeof(result), "OK %d blocks", ok);
+        emit(result);
+        if (error && ok == 0) *error = "no blocks readable";
+        return ok > 0;
+    }
+
 private:
     static std::string byte_hex(uint8_t value)
     {
@@ -1125,12 +1612,15 @@ private:
 
     static std::string detect_mifare_classic(uint8_t sak, uint8_t uid_len)
     {
-        (void)uid_len;
         switch (sak) {
         case 0x09: return "Mifare Classic Mini";
         case 0x08: return "Mifare Classic 1K";
         case 0x18: return "Mifare Classic 4K";
-        default: return "ISO14443A Tag";
+        case 0x28: return "Mifare Classic 1K (7-byte UID)";
+        case 0x38: return "Mifare Classic 4K (7-byte UID)";
+        case 0x00: return (uid_len == 7) ? "NTAG/Ultralight (7B)" : "ISO14443A Tag (SAK=00)";
+        case 0x20: return "ISO14443-4 (DESFire)";
+        default:   return "ISO14443A Tag";
         }
     }
 

@@ -35,6 +35,20 @@ struct ScanState {
     std::string error;
 };
 
+struct Pn532NdefState {
+    bool running = false;
+    std::string uri = "https://m5stack.com";
+    std::string status = "Idle";
+    std::string error;
+};
+
+enum class UidMagicGeneration {
+    Gen1A = 0,
+    Gen2,
+    Gen3,
+    Gen4,
+};
+
 class NfcDeviceService {
 public:
     NfcDeviceService()
@@ -71,6 +85,7 @@ public:
     {
         cancel_hw_upload_.store(true);
         cancel_hw_mfkey_.store(true);
+        stop_pn532_ndef_emulation();
         if (uart_test_thread_.joinable()) uart_test_thread_.join();
         if (hw_upload_thread_.joinable()) hw_upload_thread_.join();
         if (scan_thread_.joinable()) scan_thread_.join();
@@ -753,6 +768,12 @@ public:
         connection_.pn532_ready = false;
         connection_.device_kind = DeviceKind::Unknown;
 
+        // Set log file mode prefix based on transport type.
+        if (connection_.endpoint.kind == TransportKind::I2cBus)
+            NfcHexLog::get().set_mode("iic");
+        else
+            NfcHexLog::get().set_mode("uart");
+
         if (connection_.endpoint.kind == TransportKind::UsbSerial ||
             connection_.endpoint.kind == TransportKind::UartSerial) {
             Pn532KillerClient client(transport_.get());
@@ -821,6 +842,100 @@ public:
         return scan_;
     }
 
+    Pn532NdefState pn532_ndef_state() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pn532_ndef_;
+    }
+
+    bool start_pn532_ndef_emulation(const std::string &uri, std::string *error = nullptr)
+    {
+        std::string target_uri = uri.empty() ? "https://m5stack.com" : uri;
+        stop_pn532_ndef_emulation();
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!connection_.connected || connection_.device_kind != DeviceKind::PN532) {
+                if (error) *error = "PN532 required for NDEF emulation";
+                return false;
+            }
+            pn532_ndef_.running = true;
+            pn532_ndef_.uri = target_uri;
+            pn532_ndef_.status = "Starting";
+            pn532_ndef_.error.clear();
+        }
+
+        cancel_pn532_ndef_.store(false);
+        pn532_ndef_thread_ = std::thread([this, target_uri]() {
+            perform_pn532_ndef_emulation(target_uri);
+        });
+        if (error) error->clear();
+        return true;
+    }
+
+    void stop_pn532_ndef_emulation()
+    {
+        cancel_pn532_ndef_.store(true);
+        if (pn532_ndef_thread_.joinable()) pn532_ndef_thread_.join();
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (pn532_ndef_.running) {
+            pn532_ndef_.running = false;
+            pn532_ndef_.status = "Stopped";
+        }
+    }
+
+    bool clear_last_scan_result(std::string *error = nullptr)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (scan_.running) {
+                if (error) *error = "Operation already running";
+                return false;
+            }
+            scan_.has_result = false;
+            scan_.last_record = SavedRecord{};
+            scan_.status = connection_.connected ? "Ready" : "Idle";
+            scan_.error.clear();
+            last_dump_success_ = false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            pending_log_lines_.clear();
+        }
+        if (error) error->clear();
+        return true;
+    }
+
+    std::vector<ProtocolKind> supported_protocols_for_current_device() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const bool connected = connection_.connected;
+        const DeviceKind kind = connection_.device_kind;
+        const TransportKind transport = connected ? connection_.endpoint.kind : intended_kind_;
+
+        if (kind == DeviceKind::PN532) {
+            return {ProtocolKind::Iso14443A};
+        }
+        if (kind == DeviceKind::PN532Killer) {
+            return {ProtocolKind::Iso14443A, ProtocolKind::Iso14443B, ProtocolKind::Iso15693};
+        }
+        if (kind == DeviceKind::GroveNFC) {
+            return {ProtocolKind::Iso14443A, ProtocolKind::Iso14443B,
+                    ProtocolKind::Iso15693, ProtocolKind::Felica};
+        }
+        if (kind == DeviceKind::NFCUnit) {
+            return {ProtocolKind::Iso14443A, ProtocolKind::Iso14443B,
+                    ProtocolKind::Iso15693, ProtocolKind::Felica};
+        }
+
+        if (transport == TransportKind::I2cBus) {
+            return {ProtocolKind::Iso14443A, ProtocolKind::Iso14443B,
+                    ProtocolKind::Iso15693, ProtocolKind::Felica};
+        }
+        return {ProtocolKind::Iso14443A, ProtocolKind::Iso14443B, ProtocolKind::Iso15693};
+    }
+
     // Drain lines pushed in real-time during a Gen1A dump (called by UI each frame).
     std::vector<std::string> drain_pending_log()
     {
@@ -856,8 +971,83 @@ public:
         }
     }
 
+    // Write UID/block0 to classic magic cards (Gen1A/Gen2/Gen3/Gen4).
+    // uid_hex must be 8 or 14 hex chars, block0_hex must be 32 hex chars.
+    bool write_magic_uid(UidMagicGeneration generation,
+                         const std::string &uid_hex,
+                         const std::string &block0_hex,
+                         std::string *error = nullptr)
+    {
+        INfcTransport *transport_raw = nullptr;
+        DeviceKind kind = DeviceKind::Unknown;
+        bool busy = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            busy = scan_.running;
+            transport_raw = transport_.get();
+            kind = connection_.device_kind;
+        }
+
+        if (busy) {
+            if (error) *error = "Scan/dump running";
+            return false;
+        }
+        if (!transport_raw || !transport_raw->is_open()) {
+            if (error) *error = "Device not connected";
+            return false;
+        }
+        if (kind != DeviceKind::PN532 && kind != DeviceKind::PN532Killer) {
+            if (error) *error = "PN532/PN532Killer required";
+            return false;
+        }
+
+        std::vector<uint8_t> uid;
+        std::vector<uint8_t> block0;
+        if (!parse_hex_bytes(uid_hex, &uid)) {
+            if (error) *error = "Invalid UID hex";
+            return false;
+        }
+        if (!parse_hex_bytes(block0_hex, &block0) || block0.size() != 16) {
+            if (error) *error = "Invalid block0 hex";
+            return false;
+        }
+        if (uid.size() != 4 && uid.size() != 7) {
+            if (error) *error = "UID must be 4B or 7B";
+            return false;
+        }
+
+        Pn532KillerClient client(transport_raw);
+        client.send_wakeup();
+        client.sam_configuration(nullptr);
+
+        std::string op_err;
+        bool ok = false;
+        switch (generation) {
+        case UidMagicGeneration::Gen1A:
+            ok = client.write_gen1a_block0(block0, &op_err);
+            break;
+        case UidMagicGeneration::Gen2:
+            ok = client.write_gen2_block0(block0, &op_err);
+            break;
+        case UidMagicGeneration::Gen3:
+            ok = client.set_classic_gen3_uid(uid, block0, &op_err);
+            break;
+        case UidMagicGeneration::Gen4:
+            ok = client.set_gen4_uid(uid, block0, "00000000", &op_err);
+            break;
+        }
+
+        if (!ok) {
+            if (error) *error = op_err.empty() ? "UID write failed" : op_err;
+            return false;
+        }
+        if (error) error->clear();
+        return true;
+    }
+
     bool start_scan()
     {
+        stop_pn532_ndef_emulation();
         if (scan_thread_.joinable()) scan_thread_.join();
         // Cancel any running EMU probe/dump threads to avoid racing set_work_mode calls
         cancel_emu_probe_.store(true);
@@ -880,6 +1070,7 @@ public:
         scan_.has_result = false;
         scan_.status = "Scanning";
         scan_.error.clear();
+        last_dump_success_ = false;
         {
             std::lock_guard<std::mutex> lk(pending_log_mutex_);
             pending_log_lines_.clear();
@@ -909,11 +1100,105 @@ public:
         return true;
     }
 
+    bool can_dump_last_scan(std::string *error = nullptr) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (scan_.running) {
+            if (error) *error = "Operation already running";
+            return false;
+        }
+        if (!scan_.has_result) {
+            if (error) *error = "Scan card first";
+            return false;
+        }
+        if (!transport_ || !transport_->is_open()) {
+            if (error) *error = "Connect device first";
+            return false;
+        }
+        if (connection_.endpoint.kind == TransportKind::I2cBus) {
+            if (connection_.device_kind == DeviceKind::NFCUnit) {
+                if (error) *error = "NFC Unit dump not supported yet";
+            } else {
+                if (error) *error = "I2C dump not supported yet";
+            }
+            return false;
+        }
+        if (connection_.device_kind == DeviceKind::PN532 &&
+            scan_.last_record.tag.protocol == ProtocolKind::Iso15693) {
+            if (error) *error = "PN532 ISO15693 read not supported";
+            return false;
+        }
+        return true;
+    }
+
+    bool start_dump_last_scan()
+    {
+        stop_pn532_ndef_emulation();
+        if (scan_thread_.joinable()) scan_thread_.join();
+        // Cancel any running EMU probe/dump threads to avoid racing set_work_mode calls
+        cancel_emu_probe_.store(true);
+        if (emu_probe_thread_.joinable()) emu_probe_thread_.join();
+        cancel_emu_probe_.store(false);
+        cancel_emu_dump_.store(true);
+        if (emu_dump_thread_.joinable()) emu_dump_thread_.join();
+        cancel_emu_dump_.store(false);
+
+        std::string precheck_error;
+        if (!can_dump_last_scan(&precheck_error)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            scan_.running = false;
+            scan_.status = "Dump unavailable";
+            scan_.error = precheck_error;
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            scan_.running = true;
+            scan_.status = "Dumping";
+            scan_.error.clear();
+            last_dump_success_ = false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            pending_log_lines_.clear();
+        }
+
+        scan_thread_ = std::thread([this]() { perform_dump_from_last_scan(); });
+        return true;
+    }
+
+    bool can_save_last_dump(std::string *error = nullptr) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!scan_.has_result) {
+            if (error) *error = "No scan result to save";
+            return false;
+        }
+        if (!last_dump_success_) {
+            if (error) *error = "Dump card first";
+            return false;
+        }
+        if (scan_.last_record.tag.raw_data.empty()) {
+            if (error) *error = "No dump data to save";
+            return false;
+        }
+        return true;
+    }
+
     bool save_last_scan(std::string *error = nullptr)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!scan_.has_result) {
             if (error) *error = "No scan result to save";
+            return false;
+        }
+        if (!last_dump_success_) {
+            if (error) *error = "Dump card first";
+            return false;
+        }
+        if (scan_.last_record.tag.raw_data.empty()) {
+            if (error) *error = "No dump data to save";
             return false;
         }
         return storage_.save_record(scan_.last_record, error);
@@ -1165,14 +1450,13 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (connection_.connected && (connection_.device_kind == DeviceKind::PN532Killer ||
-                                      connection_.device_kind == DeviceKind::GroveNFC)) {
+                                      connection_.device_kind == DeviceKind::PN532 ||
+                                      connection_.device_kind == DeviceKind::GroveNFC ||
+                                      connection_.device_kind == DeviceKind::NFCUnit)) {
             return true;
         }
         if (reason) {
-            if (connection_.device_kind == DeviceKind::NFCUnit)
-                *reason = "NFC Unit: emulation\nnot supported on Linux";
-            else
-                *reason = "PN532Killer or GroveNFC\nrequired for EMU";
+            *reason = "PN532/PN532Killer/GroveNFC/NFCUnit\nrequired for EMU";
         }
         return false;
     }
@@ -1182,8 +1466,9 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!i2c_device_ || !i2c_device_->is_open() ||
-            i2c_device_->device_kind() != DeviceKind::GroveNFC) {
-            if (error) *error = "GroveNFC not connected";
+            (i2c_device_->device_kind() != DeviceKind::GroveNFC &&
+             i2c_device_->device_kind() != DeviceKind::NFCUnit)) {
+            if (error) *error = "I2C emulation device not connected";
             return false;
         }
         i2c_device_->setSlot((uint8_t)(slot_index < 0 ? 0 : slot_index > 7 ? 7 : slot_index));
@@ -1287,7 +1572,128 @@ public:
         return storage_.save_record(record, nullptr);
     }
 
+    // Returns true when a full dump for the given (protocol, slot) is cached in memory.
+    bool emu_dump_loaded(ProtocolKind protocol, int slot) const
+    {
+        std::lock_guard<std::mutex> lk(pending_log_mutex_);
+        auto it = emu_slot_cache_.find({protocol, slot});
+        return it != emu_slot_cache_.end() && it->second.dump_loaded;
+    }
+
+    // Save the most recently downloaded EMU dump (from memory cache) to permanent storage.
+    // Called explicitly by the user via "Save Dump" in the EMU modal.
+    bool save_emu_dump_cached(ProtocolKind protocol, int slot, std::string *err = nullptr)
+    {
+        std::vector<std::string> dump_lines;
+        std::string uid;
+        {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            auto it = emu_slot_cache_.find({protocol, slot});
+            if (it == emu_slot_cache_.end() || !it->second.dump_loaded) {
+                if (err) *err = "No cached dump for this slot";
+                return false;
+            }
+            dump_lines = it->second.dump_lines;
+            uid = it->second.uid;
+        }
+        TagInfo tag;
+        tag.protocol = protocol;
+        tag.uid = uid;
+        for (const auto &line : dump_lines) {
+            if (line.size() > 4)
+                tag.raw_data.push_back(line.substr(4));
+            else
+                tag.raw_data.push_back(line);
+        }
+        TransportEndpoint ep;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ep = connection_.endpoint;
+        }
+        SavedRecord record;
+        record.meta.created_at     = iso8601_now();
+        record.meta.record_id      = std::string("emu_dump_") + to_string(protocol)
+                                     + "_" + std::to_string(slot)
+                                     + "_" + record.meta.created_at;
+        record.meta.display_name   = std::string("EMU ") + to_string(protocol)
+                                     + " Slot" + std::to_string(slot);
+        record.meta.source         = "emu_download";
+        record.meta.transport      = ep.kind;
+        record.meta.transport_path = ep.path;
+        record.tag = tag;
+        return storage_.save_record(record, err);
+    }
+
+    // For I2C emulation devices (GroveNFC / NFC Unit):
+    // build an on-screen dump cache from the selected local slot payload,
+    // so UI can keep the same Download -> Save Dump flow as PN532Killer.
+    bool cache_i2c_slot_dump(ProtocolKind protocol, int slot, std::string *err = nullptr)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!connection_.connected || connection_.endpoint.kind != TransportKind::I2cBus) {
+            if (err) *err = "I2C device not connected";
+            return false;
+        }
+        const auto slots = protocol_slots_padded_locked(protocol);
+        if (slot < 0 || slot >= static_cast<int>(slots.size())) {
+            if (err) *err = "Invalid slot";
+            return false;
+        }
+        const auto &slot_data = slots[slot].raw_data;
+        if (slot_data.empty()) {
+            if (err) *err = "Selected slot has no payload";
+            return false;
+        }
+
+        std::vector<std::string> dump_lines;
+        dump_lines.reserve(slot_data.size());
+
+        for (size_t i = 0; i < slot_data.size(); ++i) {
+            const std::string &line = slot_data[i];
+            if (line.size() >= 3 && line[2] == ':') {
+                dump_lines.push_back(line);
+                continue;
+            }
+            char prefix[8];
+            std::snprintf(prefix, sizeof(prefix), "%02d:", static_cast<int>(i));
+            dump_lines.push_back(std::string(prefix) + line);
+        }
+
+        auto &cache = emu_slot_cache_[{protocol, slot}];
+        cache.probed = true;
+        cache.dump_lines = std::move(dump_lines);
+        cache.dump_loaded = true;
+
+        if (cache.uid.empty() && !cache.dump_lines.empty()) {
+            const std::string first = cache.dump_lines.front();
+            if (first.size() > 3) cache.uid = first.substr(3, std::min<size_t>(14, first.size() - 3));
+        }
+        if (err) err->clear();
+        return true;
+    }
+
 private:
+    static bool parse_hex_bytes(const std::string &value, std::vector<uint8_t> *out)
+    {
+        if (!out) return false;
+        std::string hex;
+        hex.reserve(value.size());
+        for (char ch : value) {
+            if (std::isxdigit(static_cast<unsigned char>(ch))) {
+                hex.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+            }
+        }
+        if (hex.empty() || (hex.size() % 2) != 0) return false;
+
+        out->clear();
+        out->reserve(hex.size() / 2);
+        for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+            const std::string byte_str = hex.substr(i, 2);
+            out->push_back(static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16)));
+        }
+        return true;
+    }
+
     static std::string normalize_mifare_key_hex(const std::string &value)
     {
         std::string out;
@@ -1335,13 +1741,26 @@ private:
             I2cCardInfo card;
             const bool card_ok = dev->readCard(card);
             if (card_ok && card.valid) {
-                push_log(std::string("OK ") + card.protocol + " " + card.uid);
                 TagInfo tag;
-                tag.uid = card.uid;
+                std::string uid_norm;
+                uid_norm.reserve(card.uid.size());
+                for (char ch : card.uid) {
+                    if (std::isxdigit(static_cast<unsigned char>(ch))) {
+                        uid_norm.push_back(static_cast<char>(
+                            std::toupper(static_cast<unsigned char>(ch))));
+                    }
+                }
+                tag.uid = uid_norm.empty() ? card.uid : uid_norm;
                 tag.protocol = i2c_protocol_to_kind(card.protocol);
                 tag.tag_type = i2c_protocol_to_tag_type(card.protocol);
-                tag.raw_data.push_back("UID: " + card.uid);
-                if (!card.detail.empty()) tag.raw_data.push_back(card.detail);
+                tag.raw_data.clear();
+
+                push_log("Result: Tag Found");
+                push_log(std::string("Protocol: ") + to_string(tag.protocol));
+                push_log("UID: " + tag.uid);
+                if (!tag.tag_type.empty()) push_log("Type: " + tag.tag_type);
+                if (!card.detail.empty()) push_log("  detail: " + card.detail);
+
                 const std::string src = dev->is_nfc_unit() ? "nfc_unit" : "grovenfc";
                 record = make_record_from_tag(tag, endpoint, false, src);
                 success = true;
@@ -1392,41 +1811,25 @@ private:
                         std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 }
             }
+            // For PN532Killer: also try ISO15693 if 14A found nothing.
+            if (!real_ok && device_kind == DeviceKind::PN532Killer) {
+                push_log("> Trying ISO15693...");
+                std::string err15;
+                tag = TagInfo{};
+                real_ok = client.in_list_passive_target_iso15693(&tag, &err15);
+                if (!real_ok) error = err15;
+            }
             if (real_ok) {
-                push_log(std::string("OK ") + to_string(tag.protocol) + " " + tag.uid);
-                std::string magic_err;
-                if (client.is_gen1a(&magic_err)) {
-                    tag.magic_type = "Gen1A";
-                    push_log("> Reading Gen1A blocks...");
-                    client.read_gen1a_full(nullptr, &tag.block_log, &magic_err,
-                        [this](const std::string &line) { push_log(line); },
-                        (device_kind == DeviceKind::PN532Killer) ? 5 : 0);
-                } else if (client.is_gen3(&magic_err)) {
-                    tag.magic_type = "Gen3";
-                } else if (client.is_gen4("00000000", &magic_err)) {
-                    tag.magic_type = "Gen4";
-                }
+                push_log("Result: Tag Found");
+                push_log(std::string("Protocol: ") + to_string(tag.protocol));
+                push_log("UID: " + tag.uid);
+                if (!tag.tag_type.empty())
+                    push_log("Type: " + tag.tag_type);
+                for (const auto &kv : tag.identity_fields)
+                    push_log("  " + kv.first + ": " + kv.second);
+                client.release_target_if_listed();
             } else {
                 push_log(std::string("ERR ") + (error.empty() ? "no card" : error.substr(0, 22)));
-            }
-
-            // For standard (non-magic) Mifare Classic, read blocks via default keys.
-            std::vector<std::string> mfc_blocks;
-            bool mfc_read_ok = false;
-            if (real_ok && tag.protocol == ProtocolKind::MifareClassic && tag.magic_type.empty()) {
-                push_log("> Reading MFC blocks (default keys)...");
-                // Parse UID hex string to bytes (e.g. "15223F3E" → {0x15,0x22,0x3F,0x3E})
-                std::vector<uint8_t> uid_bytes;
-                for (size_t i = 0; i + 1 < tag.uid.size(); i += 2) {
-                    uid_bytes.push_back(static_cast<uint8_t>(
-                        std::stoi(tag.uid.substr(i, 2), nullptr, 16)));
-                }
-                const int sc = (tag.tag_type.find("4K") != std::string::npos) ? 40 : 16;
-                // Re-select the card after magic detection attempts may have disturbed it.
-                client.reselect_card_lightweight(nullptr);
-                std::string mfc_err;
-                mfc_read_ok = client.read_mifare_standard(uid_bytes, sc, &mfc_blocks, &mfc_err,
-                    [this](const std::string &line) { push_log(line); });
             }
 
             if (real_ok) {
@@ -1434,40 +1837,6 @@ private:
                     (device_kind == DeviceKind::PN532Killer) ? "pn532killer" :
                     (device_kind == DeviceKind::PN532)       ? "pn532"       : "nfc";
                 record = make_record_from_tag(tag, endpoint, false, scan_source);
-                if (record.tag.protocol == ProtocolKind::MifareClassic) {
-                    const int sc = (record.tag.tag_type.find("4K") != std::string::npos) ? 40 : 16;
-                    record.mifare_dump = MifareClassicDump{};
-                    record.mifare_dump->sector_count = sc;
-                    record.mifare_dump->block_count = (sc <= 32) ? sc * 4 : 32 * 4 + (sc - 32) * 16;
-                    if (mfc_read_ok) {
-                        record.mifare_dump->blocks_hex = mfc_blocks;
-                        record.mifare_dump->attack.method = AttackMethod::DefaultKeys;
-                        record.mifare_dump->attack.status = AttackStatus::Success;
-                        record.mifare_dump->attack.dump_obtained = true;
-                        // Populate raw_data so the Hex Editor shows all 64 blocks.
-                        // Each entry is a 32-char uppercase hex string (16 bytes).
-                        record.tag.raw_data = mfc_blocks;
-                    } else if (!tag.magic_type.empty()) {
-                        // Gen1A blocks are in tag.block_log; convert to hex entries
-                        record.mifare_dump->blocks_hex.assign(record.mifare_dump->block_count, "");
-                        for (const auto &line : tag.block_log) {
-                            // Format: "NN:HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH"
-                            if (line.size() >= 4 && line[2] == ':') {
-                                int blk = std::stoi(line.substr(0, 2), nullptr, 10);
-                                if (blk >= 0 && blk < record.mifare_dump->block_count)
-                                    record.mifare_dump->blocks_hex[blk] = line.substr(3);
-                            }
-                        }
-                        record.mifare_dump->attack.method = AttackMethod::None;
-                        record.mifare_dump->attack.status = AttackStatus::Success;
-                        record.mifare_dump->attack.dump_obtained = !tag.block_log.empty();
-                        // Populate raw_data so the Hex Editor shows all blocks.
-                        record.tag.raw_data = record.mifare_dump->blocks_hex;
-                    } else {
-                        record.mifare_dump->attack.status = AttackStatus::Failed;
-                        record.mifare_dump->attack.reason = "no matching default key";
-                    }
-                }
                 success = true;
             }
         }
@@ -1478,6 +1847,455 @@ private:
         scan_.last_record = record;
         scan_.status = success ? "Scan ready" : "Scan failed";
         scan_.error = success ? record.meta.notes : error;
+    }
+
+    void perform_dump_from_last_scan()
+    {
+        NfcHexLog::get().log_event("dump", "start dump from last scan");
+
+        TransportEndpoint endpoint;
+        DeviceKind device_kind = DeviceKind::Unknown;
+        INfcTransport *transport_raw = nullptr;
+        SavedRecord base_record;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            endpoint = connection_.endpoint;
+            device_kind = connection_.device_kind;
+            transport_raw = transport_.get();
+            base_record = scan_.last_record;
+        }
+
+        SavedRecord record = base_record;
+        record.tag.raw_data.clear();
+        record.tag.block_log.clear();
+        record.mifare_dump.reset();
+
+        std::string error;
+        bool success = false;
+
+        if (endpoint.kind == TransportKind::I2cBus) {
+            if (device_kind == DeviceKind::NFCUnit) {
+                error = "NFC Unit dump not supported yet";
+            } else {
+                error = "I2C dump not supported yet";
+            }
+            push_log(std::string("ERR ") + error);
+        } else if (endpoint.kind == TransportKind::Mock) {
+            record = build_mock_record(endpoint);
+            success = true;
+        } else {
+            if (!transport_raw) {
+                error = "Transport lost during dump";
+                push_log(std::string("ERR ") + error);
+            } else {
+                Pn532KillerClient client(transport_raw);
+                TagInfo live_tag;
+                bool card_ok = false;
+
+                push_log("> Detecting card for dump...");
+                if (base_record.tag.protocol == ProtocolKind::Iso15693) {
+                    card_ok = client.in_list_passive_target_iso15693(&live_tag, &error);
+                } else {
+                    card_ok = client.in_list_passive_target_iso14443a(&live_tag, &error);
+                }
+
+                auto emit_compact_lines = [this](const std::vector<std::string> &lines,
+                                                 int head, int tail) {
+                    const int total = static_cast<int>(lines.size());
+                    if (total <= head + tail + 1) {
+                        for (const auto &line : lines) push_log(line);
+                        return;
+                    }
+                    for (int i = 0; i < head && i < total; ++i) push_log(lines[i]);
+                    push_log(".....");
+                    const int start_tail = std::max(head, total - tail);
+                    for (int i = start_tail; i < total; ++i) push_log(lines[i]);
+                };
+
+                auto bytes_to_hex = [](const std::vector<uint8_t> &bytes) {
+                    std::string out;
+                    out.reserve(bytes.size() * 2);
+                    char hb[3];
+                    for (uint8_t byte : bytes) {
+                        std::snprintf(hb, sizeof(hb), "%02X", byte);
+                        out += hb;
+                    }
+                    return out;
+                };
+
+                if (!card_ok) {
+                    push_log(std::string("ERR ") + (error.empty() ? "no card" : error));
+                } else {
+                    if (live_tag.protocol != base_record.tag.protocol) {
+                        error = "Card type mismatch, rescan card";
+                        push_log(std::string("ERR ") + error);
+                    } else {
+                        record.tag.uid = live_tag.uid;
+                        if (!live_tag.tag_type.empty()) record.tag.tag_type = live_tag.tag_type;
+                        if (!live_tag.identity_fields.empty())
+                            record.tag.identity_fields = live_tag.identity_fields;
+
+                        if (record.tag.protocol == ProtocolKind::Iso15693) {
+                            if (device_kind == DeviceKind::PN532) {
+                                error = "PN532 ISO15693 read not supported";
+                                push_log(std::string("ERR ") + error);
+                            } else {
+                            push_log("> Dumping ISO15693 blocks...");
+                            std::vector<std::vector<uint8_t>> blocks;
+                            std::string dump_err;
+                            if (client.iso15693_read_all_blocks(&blocks, &dump_err, nullptr)) {
+                                std::vector<std::string> dump_lines;
+                                dump_lines.reserve(blocks.size());
+                                for (size_t i = 0; i < blocks.size(); ++i) {
+                                    char prefix[8];
+                                    std::snprintf(prefix, sizeof(prefix), "%02d:", static_cast<int>(i));
+                                    const std::string line = std::string(prefix) + bytes_to_hex(blocks[i]);
+                                    dump_lines.push_back(line);
+                                    record.tag.raw_data.push_back(line);
+                                }
+                                emit_compact_lines(dump_lines, 12, 8);
+                                push_log("Tip: Save this dump, full data is in Saved.");
+                                success = !record.tag.raw_data.empty();
+                            } else {
+                                error = dump_err.empty() ? "ISO15693 dump failed" : dump_err;
+                                push_log(std::string("ERR ") + error);
+                            }
+                            }
+                        } else if (record.tag.protocol == ProtocolKind::Iso14443A) {
+                            push_log("> Dumping NTAG/Ultralight pages...");
+                            std::vector<std::vector<uint8_t>> pages;
+                            std::string ntag_type;
+                            std::string dump_err;
+                            if (client.ntag_read_all_pages(&pages, &ntag_type, &dump_err, nullptr)) {
+                                if (!ntag_type.empty()) record.tag.tag_type = ntag_type;
+                                std::vector<std::string> dump_lines;
+                                dump_lines.reserve(pages.size());
+                                for (size_t i = 0; i < pages.size(); ++i) {
+                                    char prefix[8];
+                                    std::snprintf(prefix, sizeof(prefix), "%02d:", static_cast<int>(i));
+                                    const std::string line = std::string(prefix) + bytes_to_hex(pages[i]);
+                                    dump_lines.push_back(line);
+                                    record.tag.raw_data.push_back(line);
+                                }
+                                emit_compact_lines(dump_lines, 16, 8);
+                                if (static_cast<int>(dump_lines.size()) > 24)
+                                    push_log("Tip: Save this dump, full data is in Saved.");
+                                success = !record.tag.raw_data.empty();
+                            } else {
+                                error = dump_err.empty() ? "NTAG dump failed" : dump_err;
+                                push_log(std::string("ERR ") + error);
+                            }
+                        } else if (record.tag.protocol == ProtocolKind::MifareClassic) {
+                            std::vector<std::string> mfc_blocks;
+                            bool mfc_read_ok = false;
+                            const int sc = (record.tag.tag_type.find("4K") != std::string::npos) ? 40 : 16;
+
+                            if (device_kind == DeviceKind::PN532 ||
+                                device_kind == DeviceKind::PN532Killer) {
+                                std::string magic_err;
+                                if (client.is_gen1a(&magic_err)) {
+                                    record.tag.magic_type = "Gen1A";
+                                    push_log("MAGIC:Gen1A");
+                                    push_log("> Reading Gen1A blocks...");
+                                    client.read_gen1a_full(nullptr, &record.tag.block_log, &magic_err,
+                                        [this](const std::string &line) { push_log(line); },
+                                        (device_kind == DeviceKind::PN532Killer) ? 5 : 0);
+                                } else if (client.is_gen3(&magic_err)) {
+                                    record.tag.magic_type = "Gen3";
+                                    push_log("MAGIC:Gen3");
+                                } else if (client.is_gen4("00000000", &magic_err)) {
+                                    record.tag.magic_type = "Gen4";
+                                    push_log("MAGIC:Gen4");
+                                }
+                            }
+
+                            if (record.tag.magic_type.empty() || record.tag.magic_type == "Gen3" ||
+                                record.tag.magic_type == "Gen4") {
+                                push_log("> Reading MFC blocks (default keys)...");
+                                std::vector<uint8_t> uid_bytes;
+                                for (size_t i = 0; i + 1 < live_tag.uid.size(); i += 2) {
+                                    uid_bytes.push_back(static_cast<uint8_t>(
+                                        std::stoi(live_tag.uid.substr(i, 2), nullptr, 16)));
+                                }
+                                std::string mfc_err;
+                                mfc_read_ok = client.read_mifare_standard(uid_bytes, sc, &mfc_blocks, &mfc_err,
+                                    [this](const std::string &line) { push_log(line); });
+                                if (!mfc_read_ok && !mfc_err.empty()) error = mfc_err;
+                            }
+
+                            record.mifare_dump = MifareClassicDump{};
+                            record.mifare_dump->sector_count = sc;
+                            record.mifare_dump->block_count = (sc <= 32) ? sc * 4 : 32 * 4 + (sc - 32) * 16;
+
+                            if (mfc_read_ok) {
+                                record.mifare_dump->blocks_hex = mfc_blocks;
+                                record.mifare_dump->attack.method = AttackMethod::DefaultKeys;
+                                record.mifare_dump->attack.status = AttackStatus::Success;
+                                record.mifare_dump->attack.dump_obtained = true;
+                                record.tag.raw_data = mfc_blocks;
+                                success = true;
+                            } else if (!record.tag.block_log.empty()) {
+                                record.mifare_dump->blocks_hex.assign(record.mifare_dump->block_count, "");
+                                for (const auto &line : record.tag.block_log) {
+                                    if (line.size() >= 4 && line[2] == ':') {
+                                        const int blk = std::stoi(line.substr(0, 2), nullptr, 10);
+                                        if (blk >= 0 && blk < record.mifare_dump->block_count)
+                                            record.mifare_dump->blocks_hex[blk] = line.substr(3);
+                                    }
+                                }
+                                record.mifare_dump->attack.method = AttackMethod::None;
+                                record.mifare_dump->attack.status = AttackStatus::Success;
+                                record.mifare_dump->attack.dump_obtained = true;
+                                record.tag.raw_data = record.mifare_dump->blocks_hex;
+                                success = true;
+                            } else {
+                                if (error.empty()) error = "Mifare dump failed";
+                                record.mifare_dump->attack.status = AttackStatus::Failed;
+                                record.mifare_dump->attack.reason = error;
+                                push_log(std::string("ERR ") + error);
+                            }
+                        } else {
+                            error = "Unsupported protocol for dump";
+                            push_log(std::string("ERR ") + error);
+                        }
+                    }
+                }
+
+                client.release_target_if_listed();
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            scan_.running = false;
+            scan_.has_result = true;
+            if (success) {
+                scan_.last_record = record;
+                scan_.status = "Dump ready";
+                scan_.error.clear();
+                last_dump_success_ = true;
+            } else {
+                scan_.last_record = base_record;
+                scan_.status = "Dump failed";
+                scan_.error = error.empty() ? "dump failed" : error;
+                last_dump_success_ = false;
+            }
+        }
+    }
+
+    static std::vector<uint8_t> build_ndef_message_from_uri(const std::string &uri)
+    {
+        auto starts_with = [](const std::string &s, const char *prefix) {
+            return s.rfind(prefix, 0) == 0;
+        };
+
+        std::vector<uint8_t> record;
+        if (starts_with(uri, "https://") || starts_with(uri, "http://") ||
+            starts_with(uri, "tel:") || starts_with(uri, "mailto:")) {
+            uint8_t prefix = 0x00;
+            std::string rest = uri;
+            if (starts_with(uri, "http://www.")) {
+                prefix = 0x01;
+                rest = uri.substr(11);
+            } else if (starts_with(uri, "https://www.")) {
+                prefix = 0x02;
+                rest = uri.substr(12);
+            } else if (starts_with(uri, "http://")) {
+                prefix = 0x03;
+                rest = uri.substr(7);
+            } else if (starts_with(uri, "https://")) {
+                prefix = 0x04;
+                rest = uri.substr(8);
+            } else if (starts_with(uri, "tel:")) {
+                prefix = 0x05;
+                rest = uri.substr(4);
+            } else if (starts_with(uri, "mailto:")) {
+                prefix = 0x06;
+                rest = uri.substr(7);
+            }
+
+            std::vector<uint8_t> payload;
+            payload.reserve(rest.size() + 1);
+            payload.push_back(prefix);
+            payload.insert(payload.end(), rest.begin(), rest.end());
+
+            record = {0xD1, 0x01, static_cast<uint8_t>(payload.size()), 0x55};
+            record.insert(record.end(), payload.begin(), payload.end());
+        } else {
+            std::vector<uint8_t> payload = {0x02, 0x65, 0x6E};
+            payload.insert(payload.end(), uri.begin(), uri.end());
+            record = {0xD1, 0x01, static_cast<uint8_t>(payload.size()), 0x54};
+            record.insert(record.end(), payload.begin(), payload.end());
+        }
+
+        std::vector<uint8_t> out;
+        const uint16_t ndef_len = static_cast<uint16_t>(record.size());
+        out.push_back(static_cast<uint8_t>((ndef_len >> 8) & 0xFF));
+        out.push_back(static_cast<uint8_t>(ndef_len & 0xFF));
+        out.insert(out.end(), record.begin(), record.end());
+        return out;
+    }
+
+    void perform_pn532_ndef_emulation(const std::string &uri)
+    {
+        INfcTransport *transport_raw = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            transport_raw = transport_.get();
+            pn532_ndef_.status = "Initializing";
+            pn532_ndef_.error.clear();
+        }
+        if (!transport_raw || !transport_raw->is_open()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pn532_ndef_.running = false;
+            pn532_ndef_.status = "Init failed";
+            pn532_ndef_.error = "Transport not available";
+            return;
+        }
+
+        // Target mode exchanges must be exclusive on the transport.
+        std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
+
+        Pn532KillerClient client(transport_raw);
+        const std::vector<uint8_t> tg_init_cfg = {
+            0x04, 0x08, 0x00, 0x11, 0x22, 0x33, 0x60, 0x01, 0xFE, 0xA2,
+            0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xC0, 0xC1, 0xC2, 0xC3, 0xC4,
+            0xC5, 0xC6, 0xC7, 0xFF, 0xFF, 0xAA, 0x99, 0x88, 0x77, 0x66,
+            0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0x00
+        };
+
+        bool init_ok = false;
+        std::string init_err;
+        for (int attempt = 0; attempt < 8 && !cancel_pn532_ndef_.load(); ++attempt) {
+            client.send_wakeup();
+            client.sam_configuration(nullptr);
+            std::vector<uint8_t> init_resp;
+            if (client.tg_init_as_target(tg_init_cfg, &init_resp, &init_err)) {
+                init_ok = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        }
+
+        if (!init_ok) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pn532_ndef_.running = false;
+            pn532_ndef_.status = "Init failed";
+            pn532_ndef_.error = init_err.empty() ? "TgInitAsTarget failed" : init_err;
+            return;
+        }
+
+        const std::vector<uint8_t> cc = {
+            0x00, 0x0F, 0x20, 0x00, 0x54, 0x00, 0xFF, 0x04,
+            0x06, 0xE1, 0x04, 0x00, 0xFF, 0x00, 0x00
+        };
+        const std::vector<uint8_t> ndef = build_ndef_message_from_uri(uri);
+
+        enum class TagFile { None, CC, Ndef };
+        TagFile current_file = TagFile::None;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pn532_ndef_.status = "Emulating";
+            pn532_ndef_.error.clear();
+        }
+
+        while (!cancel_pn532_ndef_.load()) {
+            std::vector<uint8_t> req;
+            std::string req_err;
+            if (!client.tg_get_data(&req, &req_err)) {
+                if (!req_err.empty()) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    pn532_ndef_.error = req_err;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                continue;
+            }
+            if (req.empty()) continue;
+
+            const uint8_t tg_status = req[0];
+            if (tg_status == 0x29 || tg_status == 0x25) {
+                std::vector<uint8_t> init_resp;
+                client.tg_init_as_target(tg_init_cfg, &init_resp, nullptr);
+                current_file = TagFile::None;
+                continue;
+            }
+
+            if (req.size() < 6) continue;
+            std::vector<uint8_t> apdu(req.begin() + 1, req.end());
+            if (apdu.size() < 5) continue;
+
+            const uint8_t ins = apdu[1];
+            const uint8_t p1 = apdu[2];
+            const uint8_t p2 = apdu[3];
+            const uint8_t lc = apdu[4];
+            std::vector<uint8_t> rsp;
+
+            // ISO7816 constants used by Bruce's PN532 NDEF emulation flow.
+            constexpr uint8_t INS_SELECT_FILE = 0xA4;
+            constexpr uint8_t INS_READ_BINARY = 0xB0;
+            constexpr uint8_t INS_UPDATE_BINARY = 0xD6;
+            constexpr uint8_t SW1_OK = 0x90;
+            constexpr uint8_t SW2_OK = 0x00;
+            constexpr uint8_t SW1_NF = 0x6A;
+            constexpr uint8_t SW2_NF = 0x82;
+
+            if (ins == INS_SELECT_FILE) {
+                if (p1 == 0x00) { // select by id
+                    if (p2 != 0x0C) {
+                        rsp = {SW1_OK, SW2_OK};
+                    } else if (lc == 0x02 && apdu.size() >= 7 && apdu[5] == 0xE1 &&
+                               (apdu[6] == 0x03 || apdu[6] == 0x04)) {
+                        current_file = (apdu[6] == 0x03) ? TagFile::CC : TagFile::Ndef;
+                        rsp = {SW1_OK, SW2_OK};
+                    } else {
+                        rsp = {SW1_NF, SW2_NF};
+                    }
+                } else if (p1 == 0x04) { // select by AID
+                    rsp = {SW1_OK, SW2_OK};
+                } else {
+                    rsp = {SW1_NF, SW2_NF};
+                }
+            } else if (ins == INS_READ_BINARY) {
+                const uint16_t offset = static_cast<uint16_t>((p1 << 8) | p2);
+                const uint8_t le = lc;
+                if (current_file == TagFile::CC) {
+                    if (offset + le <= cc.size()) {
+                        rsp.insert(rsp.end(), cc.begin() + offset, cc.begin() + offset + le);
+                    }
+                    rsp.push_back(SW1_OK);
+                    rsp.push_back(SW2_OK);
+                } else if (current_file == TagFile::Ndef) {
+                    if (offset + le <= ndef.size()) {
+                        rsp.insert(rsp.end(), ndef.begin() + offset, ndef.begin() + offset + le);
+                    }
+                    rsp.push_back(SW1_OK);
+                    rsp.push_back(SW2_OK);
+                } else {
+                    rsp = {SW1_NF, SW2_NF};
+                }
+            } else if (ins == INS_UPDATE_BINARY) {
+                rsp = {SW1_OK, SW2_OK};
+            } else {
+                rsp = {SW1_NF, SW2_NF};
+            }
+
+            if (!rsp.empty()) {
+                std::string set_err;
+                client.tg_set_data(rsp, &set_err);
+                if (!set_err.empty()) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    pn532_ndef_.error = set_err;
+                }
+            }
+        }
+
+        client.in_release_all();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pn532_ndef_.running = false;
+            if (pn532_ndef_.status != "Init failed") pn532_ndef_.status = "Stopped";
+        }
     }
 
     SavedRecord build_mock_record(const TransportEndpoint &endpoint) const
@@ -1629,6 +2447,7 @@ private:
 
     mutable std::mutex mutex_;
     mutable std::mutex pending_log_mutex_;          // separate — safe to lock inside scan thread
+    std::mutex transport_op_mutex_;                 // serialize all transport write/read cycles
     std::vector<std::string> pending_log_lines_;    // real-time per-block lines, drained by UI
     NfcStorage storage_;
     std::vector<TransportEndpoint> endpoints_;
@@ -1638,6 +2457,7 @@ private:
     std::unique_ptr<I2cGroveNfcDevice> i2c_device_;
     ConnectionState connection_;
     ScanState scan_;
+    bool last_dump_success_ = false;
     ProtocolKind selected_emulator_protocol_ = ProtocolKind::MifareClassic;
     std::map<ProtocolKind, int> selected_slot_by_protocol_;
     std::map<ProtocolKind, std::vector<EmulatorSlotRecord>> emulator_slots_by_protocol_;
@@ -1647,6 +2467,8 @@ private:
     std::atomic<bool> cancel_emu_probe_{false};
     std::thread emu_dump_thread_;
     std::atomic<bool> cancel_emu_dump_{false};
+    std::thread pn532_ndef_thread_;
+    std::atomic<bool> cancel_pn532_ndef_{false};
     std::thread hw_upload_thread_;
     std::atomic<bool> cancel_hw_upload_{false};
     std::thread hw_mfkey_thread_;
@@ -1670,6 +2492,7 @@ private:
     bool uart_test_running_ = false;          // guarded by pending_log_mutex_
     std::string uart_test_result_;            // guarded by pending_log_mutex_
     std::vector<std::string> uart_test_log_lines_; // guarded by pending_log_mutex_
+    Pn532NdefState pn532_ndef_;
 
     void finish_uart_test(const std::string &result)
     {
@@ -1686,10 +2509,14 @@ private:
             NfcHexLog::get().log_event("emu-probe", msg);
         }
         INfcTransport *transport_raw = nullptr;
+        TransportKind ep_kind = TransportKind::UsbSerial;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             transport_raw = transport_.get();
+            ep_kind = connection_.endpoint.kind;
         }
+        // Serialize all UART/USB operations — prevents interleaving with dump/upload threads
+        std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
 
         EmuSlotInfo info;
         info.probed = true;
@@ -1702,8 +2529,10 @@ private:
             std::string sw_err;
             client.set_work_mode(0x02, type_byte, static_cast<uint8_t>(slot), &sw_err);
 
-            // Breakable wait for hardware to stabilize (10ms ticks, ~150ms total)
-            for (int i = 0; i < 15; ++i) {
+            // Breakable wait for hardware to stabilize.
+            // UART needs more time than USB-CDC for the device to settle after SetWorkMode.
+            const int stabilize_ticks = (ep_kind == TransportKind::UartSerial) ? 30 : 15;
+            for (int i = 0; i < stabilize_ticks; ++i) {
                 if (cancel_emu_probe_.load()) {
                     std::lock_guard<std::mutex> lk(pending_log_mutex_);
                     emu_probe_running_ = false;
@@ -1712,15 +2541,22 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
 
-            // Prepare read session
+            // Prepare read session; UART requires longer flush before reading.
             client.emu_prepare_read(type_byte, static_cast<uint8_t>(slot));
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                (ep_kind == TransportKind::UartSerial) ? 60 : 20));
 
             if (protocol == ProtocolKind::MifareClassic) {
-                // MFC: block0 bytes[0..3] = 4-byte UID
+                // MFC: block0 bytes[0..3] = 4-byte UID; retry up to 3 times on failure
                 std::vector<uint8_t> block0;
-                if (client.emu_download_block(type_byte, static_cast<uint8_t>(slot), 0, &block0)
-                    && block0.size() >= 4) {
+                for (int retry = 0; retry < 3; ++retry) {
+                    if (client.emu_download_block(type_byte, static_cast<uint8_t>(slot), 0, &block0)
+                        && block0.size() >= 4) break;
+                    block0.clear();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(
+                        (ep_kind == TransportKind::UartSerial) ? 40 : 10));
+                }
+                if (block0.size() >= 4) {
                     const size_t n = std::min(block0.size(), size_t{16});
                     char buf[33] = {};
                     for (size_t i = 0; i < n; ++i)
@@ -1787,16 +2623,27 @@ private:
             NfcHexLog::get().log_event("upload", msg);
         }
         INfcTransport *transport_raw = nullptr;
+        TransportEndpoint endpoint;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             transport_raw = transport_.get();
+            endpoint      = connection_.endpoint;
         }
+        // Serialize all transport operations
+        std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
 
         bool ok = false;
         if (transport_raw && transport_raw->is_open() && record.tag.raw_data.size() == 64) {
             Pn532KillerClient client(transport_raw);
             constexpr uint8_t type_mfc = 1;
             const uint8_t actual_slot = static_cast<uint8_t>(slot);
+            const bool is_uart = (endpoint.kind == TransportKind::UartSerial);
+
+            // Do NOT call set_work_mode before uploading.
+            // pn532-python hf_mf_load uploads all blocks first, then calls set_work_mode(EMULATOR)
+            // after upload_done.  Calling set_work_mode before may cause the device to reject
+            // subsequent setEmulatorData frames.
+
             bool any_fail = false;
             for (int blk = 0; blk < 64; ++blk) {
                 if (cancel_hw_upload_.load()) break;
@@ -1816,19 +2663,30 @@ private:
                     };
                     data.push_back(static_cast<uint8_t>((from_hex(hi) << 4) | from_hex(lo)));
                 }
-                if (!client.emu_upload_block(type_mfc, actual_slot,
-                                             static_cast<uint16_t>(blk), data)) {
-                    any_fail = true;
-                    break;
+                // Retry each block up to 3 times to handle UART noise
+                bool blk_ok = false;
+                for (int retry = 0; retry < 3 && !cancel_hw_upload_.load(); ++retry) {
+                    if (client.emu_upload_block(type_mfc, actual_slot,
+                                               static_cast<uint16_t>(blk), data)) {
+                        blk_ok = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(is_uart ? 20 : 5));
                 }
+                if (!blk_ok) { any_fail = true; break; }
                 {
                     std::lock_guard<std::mutex> lk(pending_log_mutex_);
                     hw_upload_progress_ = blk + 1;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                // UART needs more inter-block gap than USB
+                std::this_thread::sleep_for(std::chrono::milliseconds(is_uart ? 20 : 5));
             }
             if (!any_fail && !cancel_hw_upload_.load()) {
                 client.emu_upload_done(type_mfc, actual_slot);
+                // Switch to emulator mode AFTER uploading (pn532-python hf_mf_load flow:
+                // upload_data_block * N -> upload_data_block_done -> set_work_mode EMULATOR).
+                std::string sw_err;
+                client.set_work_mode(0x02, type_mfc, actual_slot, &sw_err);
                 ok = true;
             }
         }
@@ -1855,6 +2713,8 @@ private:
             std::lock_guard<std::mutex> lock(mutex_);
             transport_raw = transport_.get();
         }
+        // Serialize transport access against probe/dump/upload threads
+        std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
 
         std::vector<MfkeyResult> results;
 
@@ -1986,6 +2846,8 @@ private:
             transport_raw = transport_.get();
             endpoint      = connection_.endpoint;
         }
+        // Serialize all transport operations
+        std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
 
         std::vector<std::string> lines;
         bool ok = false;
@@ -2005,8 +2867,23 @@ private:
                 bytes_per_block = 4;
             }
 
+            // Switch hardware to the correct slot before dumping.
+            // Without this, switching slots then downloading reads stale data.
+            std::string sw_err;
+            client.set_work_mode(0x02, type_byte, static_cast<uint8_t>(slot), &sw_err);
+            const int stabilize_ticks = (endpoint.kind == TransportKind::UartSerial) ? 30 : 15;
+            for (int i = 0; i < stabilize_ticks; ++i) {
+                if (cancel_emu_dump_.load()) {
+                    std::lock_guard<std::mutex> lk(pending_log_mutex_);
+                    emu_dump_running_ = false;
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+
             client.emu_prepare_read(type_byte, static_cast<uint8_t>(slot));
-            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                (endpoint.kind == TransportKind::UartSerial) ? 60 : 20));
 
             for (int blk = 0; blk < block_count; ++blk) {
                 if (cancel_emu_dump_.load()) break;
@@ -2024,42 +2901,13 @@ private:
                 lines.push_back(linebuf);
                 ok = true;
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                std::this_thread::sleep_for(std::chrono::milliseconds(
+                    (endpoint.kind == TransportKind::UartSerial) ? 20 : 5));
             }
         }
 
-        // Save successful dump to local SAVED storage so it appears in the SAVED tab.
-        if (ok) {
-            TagInfo tag;
-            tag.protocol = protocol;
-            // Get UID from cache if already probed (may be empty).
-            {
-                std::lock_guard<std::mutex> lk2(pending_log_mutex_);
-                auto it = emu_slot_cache_.find({protocol, slot});
-                if (it != emu_slot_cache_.end() && !it->second.uid.empty())
-                    tag.uid = it->second.uid;
-            }
-            // Convert dump_lines ("HH: XXYY...") to raw_data (plain hex per block).
-            for (const auto &line : lines) {
-                if (line.size() > 4)
-                    tag.raw_data.push_back(line.substr(4));
-                else
-                    tag.raw_data.push_back(line);
-            }
-
-            SavedRecord record;
-            record.meta.created_at     = iso8601_now();
-            record.meta.record_id      = std::string("emu_dump_") + to_string(protocol)
-                                         + "_" + std::to_string(slot)
-                                         + "_" + record.meta.created_at;
-            record.meta.display_name   = std::string("EMU ") + to_string(protocol)
-                                         + " Slot" + std::to_string(slot);
-            record.meta.source         = "emu_download";
-            record.meta.transport      = endpoint.kind;
-            record.meta.transport_path = endpoint.path;
-            record.tag = tag;
-            storage_.save_record(record, nullptr);
-        }
+        // Dump data is stored in cache only — NOT auto-saved to storage.
+        // User must explicitly call save_emu_dump_cached() (e.g. via "Save Dump" in UI).
 
         std::lock_guard<std::mutex> lk(pending_log_mutex_);
         if (ok) {

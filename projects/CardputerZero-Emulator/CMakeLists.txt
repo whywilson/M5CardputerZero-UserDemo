@@ -25,8 +25,10 @@ if(NOT EMSCRIPTEN)
 
     find_package(SDL2 QUIET)
     if(NOT SDL2_FOUND)
-        find_package(PkgConfig REQUIRED)
-        pkg_check_modules(SDL2 REQUIRED sdl2)
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(SDL2 sdl2)
+        endif()
     endif()
 
     find_package(PkgConfig QUIET)

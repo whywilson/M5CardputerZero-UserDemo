@@ -96,6 +96,16 @@ public:
         lines_.clear();
     }
 
+    // Set the transport mode prefix used in log file names.
+    // E.g. set_mode("uart") → "uart-2025-01-01.txt"
+    //      set_mode("iic")  → "iic-2025-01-01.txt"
+    //      set_mode("")     → "2025-01-01.txt" (no prefix)
+    void set_mode(const char *mode)
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        mode_prefix_ = mode ? mode : "";
+    }
+
     // Write all current in-memory lines to a timestamped file under save_dir.
     // Returns the file path on success, empty string on failure.
     std::string save_snapshot(const char *save_dir)
@@ -143,6 +153,7 @@ private:
 
     mutable std::mutex mutex_;
     std::deque<std::string> lines_;
+    std::string mode_prefix_;  // "uart", "iic", "usb", or "" (no prefix)
 
     static std::string timestamp()
     {
@@ -162,7 +173,9 @@ private:
 #endif
     }
 
-    static std::string today_file()
+    // Build the log file path for today, optionally prefixed by mode.
+    // E.g. prefix="uart" → "<log_dir>/uart-2025-01-01.txt"
+    static std::string today_file_with_prefix(const std::string &prefix)
     {
         time_t t = time(nullptr);
         struct tm tm_info;
@@ -186,7 +199,8 @@ private:
             }
         }
 #endif
-        return std::string(log_dir) + "/" + date;
+        std::string fname = prefix.empty() ? date : (prefix + "-" + date);
+        return std::string(log_dir) + "/" + fname;
     }
 
     static std::string format_hex_line(const char *tag, const char *arrow,
@@ -214,14 +228,17 @@ private:
 
     void push(const std::string &line)
     {
-        // Write to file outside lock to avoid blocking callers
-        const std::string path = today_file();
+        // Capture mode prefix and update ring buffer under lock.
+        std::string prefix;
         {
             std::lock_guard<std::mutex> lk(mutex_);
+            prefix = mode_prefix_;
             lines_.push_back(line);
             while (static_cast<int>(lines_.size()) > MAX_LINES)
                 lines_.pop_front();
         }
+        // Write to file outside lock to avoid blocking callers.
+        const std::string path = today_file_with_prefix(prefix);
         FILE *f = std::fopen(path.c_str(), "a");
         if (f) {
             std::fprintf(f, "%s\n", line.c_str());

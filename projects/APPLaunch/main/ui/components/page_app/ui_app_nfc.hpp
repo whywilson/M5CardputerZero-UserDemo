@@ -28,19 +28,27 @@ class UINfcPage : public app_base
         EditHex,      // Edit raw hex data lines
         DeviceProbe,  // Probe all ports for PN532/PN532Killer
         UartConfig,   // Configure UART device path + baud rate
-        UidChanger,   // Tool placeholder page
-        TagEraser,    // Tool placeholder page
         ToolPage,      // Tool detail page
         EmulatorAction,// Upload / download / default menu
         HexExitConfirm,// Save/discard/cancel prompt
         ToolInfo,      // 'i' key tool detail popup (Tools tab only)
         AppInfo,       // 'i' key global RFID app introduction
         PostScan,      // After scan result: Read Again / Save Tag menu
-        ReadMenu,      // Read-mode OK menu: [Scan Card / Port Settings (UART) or Reconnect (USB)]
+        ReadMenu,      // Read-mode OK menu (device-aware actions)
         PortSettings,  // TX / RX / BAUD config popup
         UsbSelect,     // Multiple USB ports: choose which to connect
         I2cSelect,     // I2C bus scan: choose which device to connect
         HexLog,        // Ctrl+L full-screen hex TX/RX log overlay
+        Pn532NdefInput,// PN532 NDEF URI input popup
+    };
+
+    enum class ReadMenuAction {
+        ConnectDevice,
+        PortSettings,
+        Scan,
+        Dump,
+        Save,
+        Clear,
     };
 
 public:
@@ -133,8 +141,17 @@ private:
     int i2c_select_idx_ = 0;
     // Cached I2C endpoint list for I2cSelect modal
     std::vector<nfc_app::TransportEndpoint> i2c_select_list_;
+    // PN532 NDEF URI input buffer
+    std::string pn532_ndef_uri_ = "https://m5stack.com";
     // Hex log overlay scroll offset (line index from top)
     int hex_log_scroll_ = 0;
+    // UID Changer state
+    int uid_changer_field_idx_ = 0;     // 0=gen 1=uid_len 2=mode 3=input 4=execute
+    int uid_changer_generation_idx_ = 0; // 0=Gen1A 1=Gen2 2=Gen3 3=Gen4
+    int uid_changer_uid_len_idx_ = 0;   // 0=4B 1=7B
+    bool uid_changer_write_block0_ = false;
+    std::string uid_changer_uid_input_;
+    std::string uid_changer_block0_input_;
 
     static constexpr int TAB_H = 24;
     static constexpr int CONTENT_Y = 26;
@@ -258,7 +275,8 @@ private:
         // Detect EMU dump completion → show toast once
         const bool emu_running_now = self->service_.emu_dump_running();
         if (self->last_emu_dump_running_ && !emu_running_now) {
-            // Dump just finished; service already auto-saved → show toast
+            // Dump just finished; service already auto-saved → refresh list + show toast
+            self->refresh_saved_records();
             self->show_toast("Saved");
         }
         self->last_emu_dump_running_ = emu_running_now;
@@ -309,9 +327,9 @@ private:
                         }
                     }
                 }
-                if (self->scan_log_lines_.size() > 200)
+                if (self->scan_log_lines_.size() > 2000)
                     self->scan_log_lines_.erase(self->scan_log_lines_.begin(),
-                        self->scan_log_lines_.begin() + (int)self->scan_log_lines_.size() - 200);
+                        self->scan_log_lines_.begin() + (int)self->scan_log_lines_.size() - 2000);
                 self->log_scroll_offset_ = std::max(0, (int)self->scan_log_lines_.size() - LOG_VISIBLE_LINES);
                 if (done) self->uart_test_result_ = result;
             }
@@ -464,12 +482,12 @@ private:
                         const bool ok = service_.connect_current();
                         const auto conn2 = service_.connection_state();
                         if (!ok) {
-                            scan_log_lines_.push_back("ERR " + conn2.detail.substr(0, 28));
+                            scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
                             ui_message_ = "Connect failed";
                             render_all();
                             break;
                         }
-                        scan_log_lines_.push_back("OK  " + conn2.detail.substr(0, 28));
+                        scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
                     }
                     scan_log_lines_.push_back("> Scan card...");
                     service_.start_scan();
@@ -567,8 +585,13 @@ private:
                     ui_message_ = "HW Slot " + std::to_string(hw_emu_slot_ + 1);
                 }
             } else {
-                service_.cycle_slot(delta);
-                ui_message_ = "Slot changed";
+                if (conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+                    hw_emu_slot_ = 0;
+                    ui_message_ = "NFC Unit: single profile";
+                } else {
+                    service_.cycle_slot(delta);
+                    ui_message_ = "Slot changed";
+                }
             }
             break;
         }
@@ -585,64 +608,50 @@ private:
         case Tab::Read:
             {
                 const auto scan = service_.scan_state();
-                if (scan.has_result) {
-                    modal_     = Modal::PostScan;
-                    modal_idx_ = 0;
-                } else if (!scan.running) {
+                if (!scan.running) {
                     const auto ep = service_.current_endpoint();
                     if (ep.kind == nfc_app::TransportKind::UartSerial) {
-                        // UART mode: show Read menu (Scan Card / Port Settings)
+                        // UART mode: show unified Read menu
                         uart_edit_buf_ = service_.uart_config();
                         port_settings_field_ = 0;
                         modal_ = Modal::ReadMenu;
                         modal_idx_ = 0;
                     } else if (ep.kind == nfc_app::TransportKind::UsbSerial) {
-                        // USB mode: if already connected show ReadMenu;
-                        //           if not connected and multiple USB → port selector;
-                        //           if not connected and single USB → connect now.
+                        // USB mode: match I2C UX.
+                        // Connected: open action menu.
+                        // Not connected: always show USB device selector first.
                         const auto conn = service_.connection_state();
-                        if (conn.connected && conn.pn532_ready) {
+                        if (conn.connected) {
                             modal_ = Modal::ReadMenu;
                             modal_idx_ = 0;
                         } else {
-                            // Refresh endpoint list so we get the latest USB devices
                             service_.refresh_endpoints();
                             usb_select_list_ = service_.usb_endpoints();
-                            if (usb_select_list_.size() > 1) {
+                            if (usb_select_list_.empty()) {
+                                ui_message_ = "No USB device connected";
+                            } else {
                                 usb_select_idx_ = 0;
                                 modal_ = Modal::UsbSelect;
                                 modal_idx_ = 0;
-                            } else {
-                                // Single USB port: connect directly
-                                scan_log_lines_.clear();
-                                log_scroll_offset_ = 0;
-                                const std::string lbl = usb_select_list_.empty()
-                                    ? ep.label : usb_select_list_[0].label;
-                                scan_log_lines_.push_back("> Connect " + lbl.substr(0, 22) + "...");
-                                render_all();
-                                const bool ok = service_.connect_current();
-                                const auto conn2 = service_.connection_state();
-                                if (!ok) {
-                                    scan_log_lines_.push_back("ERR " + conn2.detail.substr(0, 28));
-                                    ui_message_ = "Connect failed";
-                                } else {
-                                    scan_log_lines_.push_back("OK  " + conn2.detail.substr(0, 28));
-                                    ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
-                                }
                             }
                         }
                     } else if (ep.kind == nfc_app::TransportKind::I2cBus) {
-                        // Scan I2C buses on-demand, then let user pick a device
-                        scan_log_lines_.push_back("> Scanning I2C buses...");
-                        render_all();
-                        i2c_select_list_ = service_.scan_i2c_devices();
-                        if (i2c_select_list_.empty()) {
-                            scan_log_lines_.push_back("No I2C device found");
-                            ui_message_ = "No I2C device";
-                        } else {
-                            i2c_select_idx_ = 0;
-                            modal_ = Modal::I2cSelect;
+                        // I2C mode: keep old UX.
+                        // Not connected: press OK to scan buses and show device selector first.
+                        // Connected: press OK to open Scan/Dump/Save/Clear menu.
+                        const auto conn = service_.connection_state();
+                        if (conn.connected) {
+                            modal_ = Modal::ReadMenu;
                             modal_idx_ = 0;
+                        } else {
+                            i2c_select_list_ = service_.scan_i2c_devices();
+                            if (i2c_select_list_.empty()) {
+                                ui_message_ = "No I2C device connected";
+                            } else {
+                                i2c_select_idx_ = 0;
+                                modal_ = Modal::I2cSelect;
+                                modal_idx_ = 0;
+                            }
                         }
                     }
                 }
@@ -730,6 +739,14 @@ private:
     {
         active_tool_idx_ = tools_idx_;
         if (active_tool_idx_ == 0) refresh_mifare_keys();
+        if (active_tool_idx_ == 1) {
+            uid_changer_field_idx_ = 0;
+            uid_changer_generation_idx_ = 0;
+            uid_changer_uid_len_idx_ = 0;
+            uid_changer_write_block0_ = false;
+            uid_changer_uid_input_.clear();
+            uid_changer_block0_input_.clear();
+        }
         // Reset MFKey wizard state when (re-)entering the tool
         if (active_tool_idx_ == 3 || active_tool_idx_ == 4) {
             mfkey_step_      = 0;
@@ -767,10 +784,8 @@ private:
         if (current_tab_ == Tab::Tools) {
             if (modal_ == Modal::DeviceProbe) set_page_title("RFID > Device Probe");
             else if (modal_ == Modal::UartConfig) set_page_title("RFID > UART Config");
-            else if (modal_ == Modal::UidChanger) set_page_title("RFID > UID Changer");
-            else if (modal_ == Modal::TagEraser) set_page_title("RFID > Tag Eraser");
             else if (modal_ == Modal::ToolPage) set_page_title((std::string("RFID > ") + tool_name(active_tool_idx_)).c_str());
-            else set_page_title("RFID");
+            else set_page_title("RFID > Tools");
         } else {
             set_page_title("RFID");
         }
@@ -810,6 +825,7 @@ private:
         case Tab::Emulator:
             render_emulator_tab(content);
             if (modal_ == Modal::EmulatorAction) render_emulator_modal(content);
+            else if (modal_ == Modal::Pn532NdefInput) render_pn532_ndef_input_modal(content);
             break;
         case Tab::Tools:
             render_tools_tab(content);
@@ -843,26 +859,17 @@ private:
         const auto scan = service_.scan_state();
         const bool now_running = scan.running;
         if (!now_running && last_scan_running_) {
-            // Scan just finished — show magic type; block lines were already streamed in real-time
-            if (scan.has_result) {
-                const auto &tag = scan.last_record.tag;
-                const std::string &mt = tag.magic_type;
-                if (!mt.empty()) {
-                    scan_log_lines_.push_back(std::string("MAGIC:") + mt);
-                } else {
-                    scan_log_lines_.push_back("MAGIC:Normal");
-                }
-                // block_log lines already pushed via drain_pending_log during scan; skip re-dump
-            } else {
+            if (!scan.has_result) {
                 scan_log_lines_.push_back(std::string("ERR ") + (scan.error.empty() ? "no tag" : to_compact(scan.error, 22)));
             }
             log_scroll_offset_ = std::max(0, (int)scan_log_lines_.size() - LOG_VISIBLE_LINES);
         }
         last_scan_running_ = now_running;
-        // Cap log size to avoid unbounded growth
-        if (scan_log_lines_.size() > 100) {
-            scan_log_lines_.erase(scan_log_lines_.begin(), scan_log_lines_.begin() + 50);
-            log_scroll_offset_ = std::max(0, log_scroll_offset_ - 50);
+        // Keep a larger history so long dumps can still be reviewed with scrolling.
+        if (scan_log_lines_.size() > 2000) {
+            const int trim = static_cast<int>(scan_log_lines_.size() - 2000);
+            scan_log_lines_.erase(scan_log_lines_.begin(), scan_log_lines_.begin() + trim);
+            log_scroll_offset_ = std::max(0, log_scroll_offset_ - trim);
         }
     }
 
@@ -889,6 +896,116 @@ private:
         for (int i = 0; defaults[i]; ++i)
             if (up == defaults[i]) return true;
         return false;
+    }
+
+    std::vector<ReadMenuAction> read_menu_actions() const
+    {
+        const auto ep = service_.current_endpoint();
+        const auto conn = service_.connection_state();
+
+        if (ep.kind == nfc_app::TransportKind::UsbSerial) {
+            if (!conn.connected) {
+                return {
+                    ReadMenuAction::ConnectDevice,
+                };
+            }
+            return {
+                ReadMenuAction::Scan,
+                ReadMenuAction::Dump,
+                ReadMenuAction::Save,
+                ReadMenuAction::Clear,
+            };
+        }
+
+        if (ep.kind == nfc_app::TransportKind::UartSerial) {
+            if (!conn.connected) {
+                return {
+                    ReadMenuAction::ConnectDevice,
+                    ReadMenuAction::PortSettings,
+                };
+            }
+            return {
+                ReadMenuAction::Scan,
+                ReadMenuAction::Dump,
+                ReadMenuAction::Save,
+                ReadMenuAction::Clear,
+            };
+        }
+
+        if (ep.kind == nfc_app::TransportKind::I2cBus) {
+            if (!conn.connected) {
+                return {
+                    ReadMenuAction::ConnectDevice,
+                };
+            }
+            return {
+                ReadMenuAction::Scan,
+                ReadMenuAction::Dump,
+                ReadMenuAction::Save,
+                ReadMenuAction::Clear,
+            };
+        }
+        return {
+            ReadMenuAction::Scan,
+            ReadMenuAction::Dump,
+            ReadMenuAction::Save,
+            ReadMenuAction::Clear,
+        };
+    }
+
+    static const char *protocol_short_name(nfc_app::ProtocolKind protocol)
+    {
+        switch (protocol) {
+        case nfc_app::ProtocolKind::Iso14443A: return "ISO14443A";
+        case nfc_app::ProtocolKind::Iso14443B: return "ISO14443B";
+        case nfc_app::ProtocolKind::Iso15693: return "ISO15693";
+        case nfc_app::ProtocolKind::Felica: return "Felica";
+        case nfc_app::ProtocolKind::MifareClassic: return "MFC";
+        default: return "UNKNOWN";
+        }
+    }
+
+    std::string supported_protocols_text() const
+    {
+        const auto supported = service_.supported_protocols_for_current_device();
+        if (supported.empty()) return "Protocols: (none)";
+
+        std::string text = "Protocols: ";
+        for (size_t i = 0; i < supported.size(); ++i) {
+            if (i > 0) text += '/';
+            text += protocol_short_name(supported[i]);
+        }
+        return text;
+    }
+
+    static const char *transport_supported_devices_text(nfc_app::TransportKind kind)
+    {
+        switch (kind) {
+        case nfc_app::TransportKind::UsbSerial:
+            return "PN532, PN532Killer";
+        case nfc_app::TransportKind::UartSerial:
+            return "PN532, PN532Killer";
+        case nfc_app::TransportKind::I2cBus:
+            return "NFC Unit, GroveNFC";
+        default:
+            return "Demo/Unknown";
+        }
+    }
+
+    const char *read_menu_action_label(ReadMenuAction action) const
+    {
+        switch (action) {
+        case ReadMenuAction::ConnectDevice: {
+            const auto conn = service_.connection_state();
+            return conn.connected ? "Reconnect Device" : "Connect Device";
+        }
+        case ReadMenuAction::PortSettings: return "Port Settings";
+        case ReadMenuAction::Scan:         return "Scan";
+        case ReadMenuAction::Dump:         return "Dump";
+        case ReadMenuAction::Save:         return "Save";
+        case ReadMenuAction::Clear:        return "Clear";
+        default:                           return "Unknown";
+        }
     }
 
     // Render one dump line ("BB:HHHH...32hex") with sector-trailer coloring.
@@ -935,6 +1052,7 @@ private:
     {
         const auto scan = service_.scan_state();
         const auto endpoint = service_.current_endpoint();
+        const auto conn = service_.connection_state();
         const nfc_app::SavedRecord &record = scan.last_record;
 
         // ── Top summary bar: transport mode pills + device label ──────────
@@ -979,20 +1097,32 @@ private:
         int log_h = 100;
         if (scan.has_result) {
             const auto &tag = record.tag;
-            const auto &fields = tag.identity_fields;
-            auto it_atqa = fields.find("atqa");
-            auto it_sak  = fields.find("sak");
-            const std::string atqa_str = (it_atqa != fields.end()) ? it_atqa->second : "-";
-            const std::string sak_str  = (it_sak  != fields.end()) ? it_sak->second  : "-";
+            const bool is_i2c = (endpoint.kind == nfc_app::TransportKind::I2cBus);
+            if (is_i2c) {
+                // GroveNFC: two-line display — protocol name then UID without colon separators
+                lv_obj_t *info = create_panel(parent, 0, 20, 320, 24, 0x0C1810);
+                std::string uid_clean;
+                for (char c : tag.uid) { if (c != ':') uid_clean += c; }
+                create_text(info, 4,  2, nfc_app::to_string(tag.protocol), 0x00FF88, 10);
+                create_text(info, 4, 13, to_compact(uid_clean, 52).c_str(), 0x00D2FF, 10);
+                log_y = 45;
+                log_h = 75;
+            } else {
+                const auto &fields = tag.identity_fields;
+                auto it_atqa = fields.find("atqa");
+                auto it_sak  = fields.find("sak");
+                const std::string atqa_str = (it_atqa != fields.end()) ? it_atqa->second : "-";
+                const std::string sak_str  = (it_sak  != fields.end()) ? it_sak->second  : "-";
 
-            lv_obj_t *info = create_panel(parent, 0, 20, 320, 13, 0x0C1810);
-            // Single line: Protocol + UID + SAK + ATQA
-            const std::string card_line =
-                std::string(nfc_app::to_string(tag.protocol)) + " " + tag.uid
-                + " SAK:" + sak_str + " ATQA:" + atqa_str;
-            create_text(info, 4, 2, to_compact(card_line, 52).c_str(), 0x00FF88, 10);
-            log_y = 34;
-            log_h = 86;
+                lv_obj_t *info = create_panel(parent, 0, 20, 320, 13, 0x0C1810);
+                // Single line: Protocol + UID + SAK + ATQA
+                const std::string card_line =
+                    std::string(nfc_app::to_string(tag.protocol)) + " " + tag.uid
+                    + " SAK:" + sak_str + " ATQA:" + atqa_str;
+                create_text(info, 4, 2, to_compact(card_line, 52).c_str(), 0x00FF88, 10);
+                log_y = 34;
+                log_h = 86;
+            }
         }
 
         // ── Log area: always full-width ────────────────────────────────────
@@ -1004,11 +1134,22 @@ private:
 
         if (!scan.running && !scan.has_result && scan_log_lines_.empty()) {
             // Idle — nothing scanned yet
-            create_text(detail, 4, 10, "No Card", 0x9E9E9E, 11);
+            create_text(detail, 4, 10,
+                        conn.connected ? "Ready" : "Device not connected",
+                        0x9E9E9E, 11);
             create_text(detail, 4, 28, "OK: Menu", 0xF7A600, 10);
             create_text(detail, 4, 42, "Tab: mode", 0xD8D8D8, 10);
+
+            if (conn.connected) {
+                create_text(detail, 4, 56, to_compact(supported_protocols_text(), 52).c_str(), 0x8DB6FF, 10);
+            } else {
+                const std::string supported = std::string("Supported: ") + transport_supported_devices_text(endpoint.kind);
+                create_text(detail, 4, 56, to_compact(supported, 52).c_str(), 0x8DB6FF, 10);
+            }
+
             if (!scan.error.empty())
-                create_text(detail, 4, 56, to_compact(scan.error, 40).c_str(), 0xFF6060, 10);
+                if (conn.connected)
+                    create_text(detail, 4, 68, to_compact(scan.error, 40).c_str(), 0xFF6060, 10);
         } else {
             for (int row = 0; row < visible_lines; ++row) {
                 const int idx = log_scroll_offset_ + row;
@@ -1182,49 +1323,48 @@ private:
                 create_text(right, 6, 36, "F/X to probe slot", 0x444444, 10);
             }
         } else if (connection.device_kind == nfc_app::DeviceKind::PN532) {
-            // ── PN532 does not support hardware EMU ──────────────────────────
-            create_text(left, 6, 4,  "EMU", 0xFF4444, 12);
-            create_text(left, 6, 22, "Not supported", 0xFF8888, 11);
-            create_text(left, 6, 40, "PN532 has no", 0x9E9E9E, 10);
-            create_text(left, 6, 54, "emulator mode", 0x9E9E9E, 10);
+            // ── PN532 NDEF target emulation ───────────────────────────────────
+            const auto ndef = service_.pn532_ndef_state();
+            create_text(left, 6, 4,  "NDEF EMU", 0x00D2FF, 12);
+            create_text(left, 6, 22, ndef.running ? "Running" : "Stopped",
+                        ndef.running ? 0x00FF88 : 0x9E9E9E, 11);
+            create_text(left, 6, 40, "OK:menu", 0xF7A600, 10);
+            create_text(left, 6, 54, "Enter URI + loop", 0x9E9E9E, 10);
 
-            create_text(right, 6, 4,  "Requires", 0x8E8E8E, 11);
-            create_text(right, 6, 20, "PN532Killer", 0xFFD700, 12);
-            create_text(right, 6, 38, "for HW emulation", 0x8E8E8E, 10);
-            create_text(right, 6, 60, (std::string("Connected: ") + nfc_app::to_string(connection.device_kind)).c_str(), 0x555555, 10);
-        } else if (connection.device_kind == nfc_app::DeviceKind::GroveNFC) {
-            // ── GroveNFC: software-side emulation, 8 slots, no block dump ────
+            create_text(right, 6, 4,  "PN532 Type4 NDEF", 0x8E8E8E, 11);
+            create_text(right, 6, 20, to_compact(ndef.uri, 30).c_str(), 0x00D2FF, 10);
+            create_text(right, 6, 34, to_compact(std::string("Status: ") + ndef.status, 30).c_str(), 0xD8D8D8, 10);
+            if (!ndef.error.empty()) {
+                create_text(right, 6, 50, to_compact(std::string("ERR: ") + ndef.error, 30).c_str(), 0xFF8888, 10);
+            }
+            create_text(right, 6, 76, "Start/Stop in menu", 0x555555, 10);
+        } else if (connection.device_kind == nfc_app::DeviceKind::GroveNFC ||
+                   connection.device_kind == nfc_app::DeviceKind::NFCUnit) {
+            // ── I2C EMU mode (GroveNFC / NFC Unit), 8 slots ───────────────────
             const std::string proto_name =
                 (protocol == nfc_app::ProtocolKind::MifareClassic) ? "MFC-1K" :
                 (protocol == nfc_app::ProtocolKind::Iso14443B)     ? "ISO14B"  :
                 (protocol == nfc_app::ProtocolKind::Iso15693)      ? "ISO15693" : "NTAG";
+            const bool is_nfc_unit = (connection.device_kind == nfc_app::DeviceKind::NFCUnit);
             create_text(left, 6, 4,  "SW EMU", 0x00FF88, 12);
-            const std::string slot_str = "Slot " + std::to_string(hw_emu_slot_ + 1) + "/8";
-            create_text(left, 6, 18, slot_str.c_str(), 0xFFFFFF, 12);
+            if (is_nfc_unit) {
+                create_text(left, 6, 18, "Profile mode", 0xFFFFFF, 12);
+            } else {
+                const std::string slot_str = "Slot " + std::to_string(hw_emu_slot_ + 1) + "/8";
+                create_text(left, 6, 18, slot_str.c_str(), 0xFFFFFF, 12);
+            }
             create_text(left, 6, 38, "Tab:proto", 0xD8D8D8, 10);
-            create_text(left, 6, 50, "F/X:slot", 0xD8D8D8, 10);
-            create_text(left, 6, 62, "OK:activate", 0xF7A600, 10);
-            create_text(left, 6, 80, "GroveNFC I2C", 0x00FF88, 10);
+            create_text(left, 6, 50, is_nfc_unit ? "No slot switch" : "F/X:slot", 0xD8D8D8, 10);
+            create_text(left, 6, 62, "OK:menu", 0xF7A600, 10);
+            create_text(left, 6, 80, is_nfc_unit ? "NFC Unit I2C" : "GroveNFC I2C", 0x00FF88, 10);
 
             create_text(right, 6, 4,  proto_name.c_str(), 0x00D2FF, 12);
-            create_text(right, 6, 20, "OK to activate", 0xD8D8D8, 10);
-            create_text(right, 6, 34, "emulation on slot", 0xD8D8D8, 10);
+            create_text(right, 6, 20, "OK menu: Dn/Up/Save", 0xD8D8D8, 10);
+            create_text(right, 6, 34, "activate selected slot", 0xD8D8D8, 10);
             create_text(right, 6, 52, "Protocols:", 0x9E9E9E, 10);
             create_text(right, 6, 64, "MFC/NTAG/ISO14B", 0x9E9E9E, 10);
             create_text(right, 6, 76, "ISO15693", 0x9E9E9E, 10);
-            create_text(right, 6, 92, "No dump/upload", 0x444444, 10);
-        } else if (connection.device_kind == nfc_app::DeviceKind::NFCUnit) {
-            // ── NFCUnit: read-only on Linux, no emulation support ────────────
-            create_text(left, 6, 4,  "EMU", 0xFF8844, 12);
-            create_text(left, 6, 22, "Not supported", 0xFF8888, 11);
-            create_text(left, 6, 40, "NFC Unit:", 0x9E9E9E, 10);
-            create_text(left, 6, 54, "read-only on Linux", 0x9E9E9E, 10);
-
-            create_text(right, 6, 4,  "NFC Unit", 0x8E8E8E, 12);
-            create_text(right, 6, 20, "Read-only device", 0xD8D8D8, 10);
-            create_text(right, 6, 36, "Emulation requires", 0x8E8E8E, 10);
-            create_text(right, 6, 50, "PN532Killer or", 0x8E8E8E, 10);
-            create_text(right, 6, 64, "GroveNFC (I2C)", 0xFFD700, 11);
+            create_text(right, 6, 92, is_nfc_unit ? "I2C profile cache enabled" : "I2C slot cache enabled", 0x444444, 10);
         } else {
             // ── No device / unknown ───────────────────────────────────────────
             create_text(left, 6, 4,  "EMU", 0x888888, 12);
@@ -1253,11 +1393,28 @@ private:
         lv_obj_set_style_border_width(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *card = make_modal_card(overlay, 220, 94, 0xF7A600);
-        const auto slot = service_.selected_slot_index();
-        create_text(card, 8, 5, (std::string(nfc_app::to_string(service_.current_emulator_protocol())) + " Slot " + std::to_string(slot)).c_str(), 0xFFFFFF, 12);
-        const char *options[] = {"Download Data", "Upload Data", "Set Default"};
-        for (int i = 0; i < 3; ++i) {
+        const auto conn = service_.connection_state();
+        const bool pn532_ndef_menu = (conn.device_kind == nfc_app::DeviceKind::PN532);
+        const bool nfc_unit_mode = (conn.device_kind == nfc_app::DeviceKind::NFCUnit);
+        const int emu_slot = nfc_unit_mode ? 0 : hw_emu_slot_;
+        const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
+        const int n_opts = pn532_ndef_menu ? 2 : (nfc_unit_mode ? (dump_ready ? 3 : 2) : (dump_ready ? 4 : 3));
+        const lv_coord_t card_h = static_cast<lv_coord_t>(pn532_ndef_menu ? 78 : (dump_ready ? 116 : (nfc_unit_mode ? 74 : 94)));
+        lv_obj_t *card = make_modal_card(overlay, 220, card_h, 0xF7A600);
+        if (pn532_ndef_menu) {
+            create_text(card, 8, 5, "PN532 NDEF", 0xFFFFFF, 12);
+        } else {
+            if (nfc_unit_mode) {
+                create_text(card, 8, 5, (std::string(nfc_app::to_string(service_.current_emulator_protocol())) + " Profile").c_str(), 0xFFFFFF, 12);
+            } else {
+                const auto slot = service_.selected_slot_index();
+                create_text(card, 8, 5, (std::string(nfc_app::to_string(service_.current_emulator_protocol())) + " Slot " + std::to_string(slot)).c_str(), 0xFFFFFF, 12);
+            }
+        }
+        const char *options[] = {"Download Data", "Upload Data", "Set Default", "Save Dump"};
+        const char *nfc_unit_opts[] = {"Download Data", "Upload Data", "Save Dump"};
+        const char *pn532_opts[] = {"Start NDEF Emu", "Stop NDEF Emu"};
+        for (int i = 0; i < n_opts; ++i) {
             const bool sel = (modal_idx_ == i);
             lv_obj_t *row = lv_obj_create(card);
             lv_obj_remove_style_all(row);
@@ -1266,7 +1423,57 @@ private:
             lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0xF7A600 : 0x2A2A2A), LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            create_text(row, 6, 4, options[i], sel ? 0x000000 : 0xD0D0D0, 11);
+            const char *label = nullptr;
+            if (pn532_ndef_menu) label = pn532_opts[i];
+            else if (nfc_unit_mode) label = nfc_unit_opts[i];
+            else label = options[i];
+            create_text(row, 6, 4, label, sel ? 0x000000 : 0xD0D0D0, 11);
+        }
+    }
+
+    void render_pn532_ndef_input_modal(lv_obj_t *parent)
+    {
+        lv_obj_t *overlay = lv_obj_create(parent);
+        lv_obj_remove_style_all(overlay);
+        lv_obj_set_size(overlay, 320, CONTENT_H);
+        lv_obj_set_pos(overlay, 0, 0);
+        lv_obj_set_style_radius(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(overlay, 170, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *card = make_modal_card(overlay, 280, 100, 0x00D2FF);
+        create_text(card, 8, 5, "PN532 NDEF URI", 0x00D2FF, 12);
+        create_text(card, 8, 22, "Enter URI/Text", 0xD8D8D8, 10);
+        create_text(card, 8, 38, to_compact(pn532_ndef_uri_ + "_", 40).c_str(), 0xFFFFFF, 11);
+        create_text(card, 8, 56, "http(s)/tel/mailto supported", 0x8DB6FF, 10);
+        create_text(card, 8, 74, "Enter:start  Bsp:del  ESC:cancel", 0x7A7A7A, 10);
+    }
+
+    void handle_pn532_ndef_input_key(uint32_t key)
+    {
+        if (key == KEY_ESC) {
+            modal_ = Modal::None;
+            return;
+        }
+        if (key == KEY_BACKSPACE) {
+            if (!pn532_ndef_uri_.empty()) pn532_ndef_uri_.pop_back();
+            return;
+        }
+        if (key == KEY_ENTER) {
+            std::string err;
+            if (service_.start_pn532_ndef_emulation(pn532_ndef_uri_, &err)) {
+                ui_message_ = "PN532 NDEF emulation running";
+            } else {
+                ui_message_ = err.empty() ? "NDEF start failed" : err;
+            }
+            modal_ = Modal::None;
+            return;
+        }
+        char c = keycode_to_char(key);
+        if (c >= 32 && c < 127 && pn532_ndef_uri_.size() < 96) {
+            pn532_ndef_uri_ += c;
         }
     }
 
@@ -1296,8 +1503,7 @@ private:
             }
         }
 
-        if (modal_ == Modal::ToolPage || modal_ == Modal::DeviceProbe || modal_ == Modal::UartConfig ||
-            modal_ == Modal::UidChanger || modal_ == Modal::TagEraser) {
+        if (modal_ == Modal::ToolPage || modal_ == Modal::DeviceProbe || modal_ == Modal::UartConfig) {
             render_tools_modal(detail);
         } else if (modal_ == Modal::ToolInfo) {
             render_tool_info_modal(parent);
@@ -1382,10 +1588,20 @@ private:
                     ui_message_ = error;
                 }
             } else {
-                // Clear Log
+                // Clear result + log
                 scan_log_lines_.clear();
                 log_scroll_offset_ = 0;
-                ui_message_ = "Log cleared";
+                std::string clear_error;
+                if (service_.clear_last_scan_result(&clear_error)) {
+                    const auto conn = service_.connection_state();
+                    if (conn.connected) {
+                        ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn.device_kind);
+                    } else {
+                        ui_message_ = "Cleared";
+                    }
+                } else {
+                    ui_message_ = clear_error.empty() ? "Clear failed" : clear_error;
+                }
             }
             break;
         }
@@ -1397,12 +1613,9 @@ private:
         }
     }
 
-    // ── ReadMenu modal (Read-mode OK: Scan Card + Port Settings/Reconnect) ───
+    // ── ReadMenu modal (device-aware menu) ───────────────────────────────────
     void render_read_menu_modal(lv_obj_t *parent)
     {
-        const auto ep = service_.current_endpoint();
-        const bool is_usb = (ep.kind == nfc_app::TransportKind::UsbSerial);
-
         lv_obj_t *overlay = lv_obj_create(parent);
         lv_obj_remove_style_all(overlay);
         lv_obj_set_size(overlay, 320, CONTENT_H);
@@ -1413,93 +1626,244 @@ private:
         lv_obj_set_style_border_width(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *card = make_modal_card(overlay, 180, 82, 0x00D2FF);
-        create_text(card, 8, 5, is_usb ? "USB Actions" : "UART Actions", 0x00D2FF, 12);
-        const char *opt0 = "Scan Card";
-        const char *opt1 = is_usb ? "Reconnect" : "Port Settings";
-        const char *opt2 = "Clear Log";
-        const char *options[] = {opt0, opt1, opt2};
-        for (int i = 0; i < 3; ++i) {
+        const auto actions = read_menu_actions();
+        const int n_opts = static_cast<int>(actions.size());
+        const auto ep = service_.current_endpoint();
+
+        std::string dump_error;
+        const bool can_dump = service_.can_dump_last_scan(&dump_error);
+        std::string save_error;
+        const bool can_save = service_.can_save_last_dump(&save_error);
+        const int card_h = 34 + n_opts * 20;
+
+        lv_obj_t *card = make_modal_card(overlay, 220, card_h, 0x00D2FF);
+        const char *title = (ep.kind == nfc_app::TransportKind::UsbSerial) ? "USB Actions" :
+                            (ep.kind == nfc_app::TransportKind::I2cBus)   ? "I2C Actions" :
+                                                                            "UART Actions";
+        create_text(card, 8, 5, title, 0x00D2FF, 12);
+        for (int i = 0; i < n_opts; ++i) {
             const bool sel = (modal_idx_ == i);
+            const auto action = actions[i];
+            const bool enabled =
+                (action == ReadMenuAction::Dump) ? can_dump :
+                (action == ReadMenuAction::Save) ? can_save : true;
             lv_obj_t *row = lv_obj_create(card);
             lv_obj_remove_style_all(row);
-            lv_obj_set_size(row, 164, 18);
+            lv_obj_set_size(row, 204, 18);
             lv_obj_set_pos(row, 8, 22 + i * 20);
             lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0x00D2FF : 0x242424), LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            create_text(row, 6, 3, options[i], sel ? 0x000000 : 0xD0D0D0, 11);
+            const uint32_t text_color = sel ? 0x000000 : (enabled ? 0xD0D0D0 : 0x666666);
+            create_text(row, 6, 3, read_menu_action_label(action), text_color, 11);
         }
-        // 3-item modal: no keyboard hint needed
+
     }
 
     void handle_read_menu_key(uint32_t key)
     {
+        const auto actions = read_menu_actions();
+        const int n_opts = std::max(1, static_cast<int>(actions.size()));
         const auto ep = service_.current_endpoint();
-        const bool is_usb = (ep.kind == nfc_app::TransportKind::UsbSerial);
         switch (key) {
         case KEY_UP:
-        case KEY_F:   modal_idx_ = (modal_idx_ + 2) % 3; break;
+        case KEY_F:   modal_idx_ = (modal_idx_ - 1 + n_opts) % n_opts; break;
         case KEY_DOWN:
-        case KEY_X:   modal_idx_ = (modal_idx_ + 1) % 3; break;
+        case KEY_X:   modal_idx_ = (modal_idx_ + 1) % n_opts; break;
         case KEY_ENTER:
-            if (modal_idx_ == 0) {
-                // Scan Card
+            if (modal_idx_ < 0 || modal_idx_ >= n_opts) {
+                modal_idx_ = 0;
+                break;
+            }
+            switch (actions[modal_idx_]) {
+            case ReadMenuAction::ConnectDevice: {
                 modal_ = Modal::None;
                 modal_idx_ = 0;
                 scan_log_lines_.clear();
                 log_scroll_offset_ = 0;
-                const auto conn = service_.connection_state();
-                if (!conn.connected) {
-                    scan_log_lines_.push_back("> Connect " + ep.label.substr(0, 22) + "...");
-                    render_all();
-                    const bool ok = service_.connect_current();
-                    const auto conn2 = service_.connection_state();
-                    if (!ok) {
-                        scan_log_lines_.push_back("ERR " + conn2.detail.substr(0, 28));
-                        ui_message_ = "Connect failed";
-                        return;
+
+                if (ep.kind == nfc_app::TransportKind::UsbSerial) {
+                    service_.refresh_endpoints();
+                    usb_select_list_ = service_.usb_endpoints();
+                    if (usb_select_list_.empty()) {
+                        ui_message_ = "No USB device";
+                        break;
                     }
-                    scan_log_lines_.push_back("OK  " + conn2.detail.substr(0, 28));
-                } else {
-                    scan_log_lines_.push_back("OK  " + conn.detail.substr(0, 28));
-                }
-                scan_log_lines_.push_back("> Scan card...");
-                service_.start_scan();
-                ui_message_ = "Scanning...";
-            } else if (modal_idx_ == 1) {
-                if (is_usb) {
-                    // USB: Reconnect
-                    modal_ = Modal::None;
+                    usb_select_idx_ = 0;
+                    modal_ = Modal::UsbSelect;
                     modal_idx_ = 0;
-                    scan_log_lines_.clear();
-                    log_scroll_offset_ = 0;
-                    service_.disconnect();
-                    scan_log_lines_.push_back("> Reconnect " + ep.label.substr(0, 20) + "...");
-                    render_all();
-                    const bool ok = service_.connect_current();
-                    const auto conn2 = service_.connection_state();
-                    if (!ok) {
-                        scan_log_lines_.push_back("ERR " + conn2.detail.substr(0, 28));
-                        ui_message_ = "Reconnect failed";
-                    } else {
-                        scan_log_lines_.push_back("OK  " + conn2.detail.substr(0, 28));
-                        ui_message_ = std::string("Reconnected: ") + nfc_app::to_string(conn2.device_kind);
+                    break;
+                }
+
+                if (ep.kind == nfc_app::TransportKind::I2cBus) {
+                    scan_log_lines_.push_back("> Scanning I2C buses...");
+                    i2c_select_list_ = service_.scan_i2c_devices();
+                    if (i2c_select_list_.empty()) {
+                        scan_log_lines_.push_back("No I2C device found");
+                        ui_message_ = "No I2C device";
+                        break;
                     }
-                } else {
-                    // UART: Port Settings
+                    if (i2c_select_list_.size() > 1) {
+                        i2c_select_idx_ = 0;
+                        modal_ = Modal::I2cSelect;
+                        modal_idx_ = 0;
+                        break;
+                    }
+                    service_.select_i2c_endpoint(i2c_select_list_[0]);
+                }
+
+                const auto conn0 = service_.connection_state();
+                if (conn0.connected) service_.disconnect();
+                const auto connect_ep = service_.current_endpoint();
+                scan_log_lines_.push_back("> Connect " + connect_ep.label.substr(0, 22) + "...");
+                const bool ok = service_.connect_current();
+                const auto conn2 = service_.connection_state();
+                if (!ok) {
+                    scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
+                    ui_message_ = "Connect failed";
+                    break;
+                }
+                scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
+                ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
+                if (ep.kind == nfc_app::TransportKind::UartSerial) {
+                    // UART uses two-stage menu: connect first, then scan/dump/save/clear.
+                    modal_ = Modal::ReadMenu;
+                    modal_idx_ = 0;
+                }
+                break;
+            }
+            case ReadMenuAction::PortSettings:
+                if (ep.kind == nfc_app::TransportKind::UartSerial) {
                     uart_edit_buf_ = service_.uart_config();
                     port_settings_field_ = 0;
+                    edit_buf_.clear();
+                    uart_test_result_.clear();
                     modal_ = Modal::PortSettings;
                     modal_idx_ = 0;
+                } else if (ep.kind == nfc_app::TransportKind::I2cBus) {
+                    scan_log_lines_.push_back("> Scanning I2C buses...");
+                    i2c_select_list_ = service_.scan_i2c_devices();
+                    if (i2c_select_list_.empty()) {
+                        ui_message_ = "No I2C device";
+                    } else {
+                        i2c_select_idx_ = 0;
+                        modal_ = Modal::I2cSelect;
+                        modal_idx_ = 0;
+                    }
                 }
-            } else {
-                // modal_idx_ == 2: Clear Log
+                break;
+            case ReadMenuAction::Scan: {
+                // Scan
                 modal_ = Modal::None;
                 modal_idx_ = 0;
                 scan_log_lines_.clear();
                 log_scroll_offset_ = 0;
-                ui_message_ = "Log cleared";
+
+                const auto conn = service_.connection_state();
+                if (!conn.connected) {
+                    if (ep.kind == nfc_app::TransportKind::UsbSerial) {
+                        service_.refresh_endpoints();
+                        usb_select_list_ = service_.usb_endpoints();
+                        if (usb_select_list_.empty()) {
+                            ui_message_ = "No USB device";
+                            break;
+                        }
+                        usb_select_idx_ = 0;
+                        modal_ = Modal::UsbSelect;
+                        modal_idx_ = 0;
+                        break;
+                    }
+                    if (ep.kind == nfc_app::TransportKind::I2cBus) {
+                        scan_log_lines_.push_back("> Scanning I2C buses...");
+                        i2c_select_list_ = service_.scan_i2c_devices();
+                        if (i2c_select_list_.empty()) {
+                            scan_log_lines_.push_back("No I2C device found");
+                            ui_message_ = "No I2C device";
+                            break;
+                        }
+                        if (i2c_select_list_.size() > 1) {
+                            i2c_select_idx_ = 0;
+                            modal_ = Modal::I2cSelect;
+                            modal_idx_ = 0;
+                            break;
+                        }
+                        service_.select_i2c_endpoint(i2c_select_list_[0]);
+                    }
+
+                    modal_ = Modal::None;
+                    scan_log_lines_.push_back("> Connect " + ep.label.substr(0, 22) + "...");
+                    const bool ok = service_.connect_current();
+                    const auto conn2 = service_.connection_state();
+                    if (!ok) {
+                        scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
+                        ui_message_ = "Connect failed";
+                        break;
+                    }
+                    scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
+                } else {
+                    scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn));
+                }
+
+                scan_log_lines_.push_back("> Scan card...");
+                if (service_.start_scan()) {
+                    ui_message_ = "Scanning...";
+                } else {
+                    const auto state = service_.scan_state();
+                    ui_message_ = state.error.empty() ? "Scan failed" : state.error;
+                }
+                break;
+            }
+            case ReadMenuAction::Dump: {
+                // Dump
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                std::string dump_error;
+                if (!service_.can_dump_last_scan(&dump_error)) {
+                    ui_message_ = dump_error;
+                    break;
+                }
+                scan_log_lines_.push_back("> Dump card...");
+                if (service_.start_dump_last_scan()) {
+                    ui_message_ = "Dumping...";
+                } else {
+                    const auto state = service_.scan_state();
+                    ui_message_ = state.error.empty() ? "Dump failed" : state.error;
+                }
+                break;
+            }
+            case ReadMenuAction::Save: {
+                // Save
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                std::string error;
+                if (service_.save_last_scan(&error)) {
+                    refresh_saved_records();
+                    show_toast("Saved");
+                    ui_message_ = "Record saved to JSON";
+                } else {
+                    ui_message_ = error;
+                }
+                break;
+            }
+            case ReadMenuAction::Clear: {
+                // Clear
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                scan_log_lines_.clear();
+                log_scroll_offset_ = 0;
+                std::string clear_error;
+                if (service_.clear_last_scan_result(&clear_error)) {
+                    const auto conn = service_.connection_state();
+                    if (conn.connected) {
+                        ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn.device_kind);
+                    } else {
+                        ui_message_ = "Cleared";
+                    }
+                } else {
+                    ui_message_ = clear_error.empty() ? "Clear failed" : clear_error;
+                }
+                break;
+            }
             }
             break;
         case KEY_ESC:
@@ -1574,10 +1938,10 @@ private:
                 const bool ok = service_.connect_current();
                 const auto conn2 = service_.connection_state();
                 if (!ok) {
-                    scan_log_lines_.push_back("ERR " + conn2.detail.substr(0, 28));
+                    scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
                     ui_message_ = "Connect failed";
                 } else {
-                    scan_log_lines_.push_back("OK  " + conn2.detail.substr(0, 28));
+                    scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
                     ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
                 }
             }
@@ -1650,10 +2014,10 @@ private:
                 const bool ok = service_.connect_current();
                 const auto conn2 = service_.connection_state();
                 if (!ok) {
-                    scan_log_lines_.push_back("ERR " + conn2.detail.substr(0, 28));
+                    scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
                     ui_message_ = "Connect failed";
                 } else {
-                    scan_log_lines_.push_back("OK  " + conn2.detail.substr(0, 28));
+                    scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
                     ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
                 }
             }
@@ -1966,6 +2330,10 @@ private:
                 render_mifare_keys_tool(parent);
                 return;
             }
+            if (active_tool_idx_ == 1) {
+                render_uid_changer_tool(parent);
+                return;
+            }
             if (active_tool_idx_ == 3 || active_tool_idx_ == 4) {
                 render_mfkey_wizard(parent);
                 return;
@@ -1990,19 +2358,59 @@ private:
             render_device_probe_modal(parent);
         } else if (modal_ == Modal::UartConfig) {
             render_uart_config_modal(parent);
-        } else if (modal_ == Modal::UidChanger) {
-            lv_obj_t *card = parent;
-            create_text(card, 6, 4, "UID Changer", 0xFFFFFF, 12);
-            create_text(card, 6, 24, "Tool scaffold is ready.", 0xD8D8D8, 11);
-            create_text(card, 6, 39, "Use this page for UID write", 0xD8D8D8, 11);
-            create_text(card, 6, 94, "ESC: back to tools", 0x7A7A7A, 10);
-        } else if (modal_ == Modal::TagEraser) {
-            lv_obj_t *card = parent;
-            create_text(card, 6, 4, "Tag Eraser", 0xFFFFFF, 12);
-            create_text(card, 6, 24, "Tool scaffold is ready.", 0xD8D8D8, 11);
-            create_text(card, 6, 39, "Use this page for wipe flow", 0xD8D8D8, 11);
-            create_text(card, 6, 94, "ESC: back to tools", 0x7A7A7A, 10);
         }
+    }
+
+    void render_uid_changer_tool(lv_obj_t *parent)
+    {
+        const auto conn = service_.connection_state();
+        const bool supported = conn.connected &&
+            (conn.device_kind == nfc_app::DeviceKind::PN532 ||
+             conn.device_kind == nfc_app::DeviceKind::PN532Killer);
+
+        const char *gen_labels[4] = {"Gen1A", "Gen2", "Gen3", "Gen4"};
+        const char *len_labels[2] = {"4B", "7B"};
+
+        uid_changer_fix_generation_for_uid_len();
+        const std::string uid_input = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+        const std::string block_input = uid_changer_normalize_hex(uid_changer_block0_input_, 32);
+        const std::string preview_block0 = uid_changer_build_block0_from_uid(uid_input);
+
+        create_text(parent, 6, 4, "UID Changer", 0xFFFFFF, 12);
+        const std::string dev_line = std::string("Device: ") + nfc_app::to_string(conn.device_kind);
+        create_text(parent, 6, 16, to_compact(dev_line, 36).c_str(), supported ? 0x00FF88 : 0xFF8888, 10);
+
+        const uint32_t c0 = (uid_changer_field_idx_ == 0) ? 0xF7A600 : 0xD8D8D8;
+        const uint32_t c1 = (uid_changer_field_idx_ == 1) ? 0xF7A600 : 0xD8D8D8;
+        const uint32_t c2 = (uid_changer_field_idx_ == 2) ? 0xF7A600 : 0xD8D8D8;
+        const uint32_t c3 = (uid_changer_field_idx_ == 3) ? 0x00D2FF : 0xD8D8D8;
+        const uint32_t c4 = (uid_changer_field_idx_ == 4) ? 0x00FF88 : 0x8DB6FF;
+
+        std::string gen_line = std::string("Gen: ") + gen_labels[uid_changer_generation_idx_];
+        create_text(parent, 6, 28, gen_line.c_str(), c0, 10);
+
+        std::string len_line = std::string("UID: ") + len_labels[uid_changer_uid_len_idx_];
+        create_text(parent, 98, 28, len_line.c_str(), c1, 10);
+
+        const std::string mode_line = std::string("Mode: ") + (uid_changer_write_block0_ ? "Block0" : "UID");
+        create_text(parent, 168, 28, mode_line.c_str(), c2, 10);
+
+        if (!uid_changer_write_block0_) {
+            std::string in = "UID(" + std::to_string(uid_changer_uid_hex_len()) + "): " + uid_input;
+            if (uid_changer_field_idx_ == 3) in += "_";
+            create_text(parent, 6, 42, to_compact(in, 46).c_str(), c3, 10);
+            const std::string p = preview_block0.empty() ? "B0: (waiting UID)" : ("B0: " + preview_block0);
+            create_text(parent, 6, 56, to_compact(p, 46).c_str(), 0x8DB6FF, 10);
+        } else {
+            std::string in = "Block0(32): " + block_input;
+            if (uid_changer_field_idx_ == 3) in += "_";
+            create_text(parent, 6, 42, to_compact(in, 46).c_str(), c3, 10);
+            create_text(parent, 6, 56, "Write raw block0 directly", 0x8DB6FF, 10);
+        }
+
+        create_text(parent, 6, 72, supported ? "Target: PN532 / PN532Killer" : "Connect PN532 / PN532Killer first", supported ? 0x00FF88 : 0xFF8888, 10);
+        create_text(parent, 6, 86, "[ Enter ] Execute", c4, 10);
+        create_text(parent, 140, 86, "L/R:set  U/D:field", 0x666666, 10);
     }
 
     // ── MFKey step-by-step wizard renderer ───────────────────────────────────
@@ -2580,7 +2988,7 @@ private:
         // Width 250, Height 114 → 5 visible slots + header + hint with bottom padding
         lv_obj_t *card = make_modal_card(parent, 250, 114, 0xF7A600);
         const auto protocol = saved_records_[saved_idx_].tag.protocol;
-        create_text(card, 8, 5, (std::string(nfc_app::to_string(protocol)) + " Slot (0-7)").c_str(), 0xFFFFFF, 12);
+        create_text(card, 8, 5, (std::string(nfc_app::to_string(protocol)) + " Slot (1-8)").c_str(), 0xFFFFFF, 12);
 
         const auto slots = service_.emulator_slots_padded(protocol);
         constexpr int VISIBLE = 5;
@@ -2593,7 +3001,7 @@ private:
             if (si >= 8) break;
             const bool sel = (si == slot_select_idx_);
             const auto &slot = slots[si];
-            std::string label = "Slot " + std::to_string(si) + ": ";
+            std::string label = "Slot " + std::to_string(si + 1) + ": ";
             if (slot.payload_record_id.empty()) label += "(empty)";
             else label += to_compact(slot.payload_record_id, 12) + "  [" + nfc_app::to_string(slot.protocol) + "]";
 
@@ -2646,6 +3054,75 @@ private:
             out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(hex[i]))));
         }
         return out;
+    }
+
+    int uid_changer_uid_hex_len() const
+    {
+        return (uid_changer_uid_len_idx_ == 0) ? 8 : 14;
+    }
+
+    static bool uid_changer_generation_allowed(int gen_idx, int uid_len_idx)
+    {
+        if (uid_len_idx == 1 && gen_idx == 1) return false; // Gen2 does not support 7B UID here.
+        return gen_idx >= 0 && gen_idx <= 3;
+    }
+
+    void uid_changer_fix_generation_for_uid_len()
+    {
+        if (!uid_changer_generation_allowed(uid_changer_generation_idx_, uid_changer_uid_len_idx_)) {
+            uid_changer_generation_idx_ = 2; // fallback to Gen3 for 7B
+        }
+    }
+
+    std::string uid_changer_normalize_hex(const std::string &in, size_t max_chars) const
+    {
+        std::string out;
+        out.reserve(in.size());
+        for (char ch : in) {
+            if (!std::isxdigit(static_cast<unsigned char>(ch))) continue;
+            out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+            if (out.size() >= max_chars) break;
+        }
+        return out;
+    }
+
+    std::string uid_changer_build_block0_from_uid(const std::string &uid_hex) const
+    {
+        const std::string uid = uid_changer_normalize_hex(uid_hex, static_cast<size_t>(uid_changer_uid_hex_len()));
+        if (uid.size() != static_cast<size_t>(uid_changer_uid_hex_len())) return "";
+
+        const std::string sak = "08";
+        const std::string atqa = "0400";
+        if (uid_changer_uid_len_idx_ == 0) {
+            const uint8_t b0 = static_cast<uint8_t>(std::stoul(uid.substr(0, 2), nullptr, 16));
+            const uint8_t b1 = static_cast<uint8_t>(std::stoul(uid.substr(2, 2), nullptr, 16));
+            const uint8_t b2 = static_cast<uint8_t>(std::stoul(uid.substr(4, 2), nullptr, 16));
+            const uint8_t b3 = static_cast<uint8_t>(std::stoul(uid.substr(6, 2), nullptr, 16));
+            char bcc[3];
+            std::snprintf(bcc, sizeof(bcc), "%02X", static_cast<unsigned>(b0 ^ b1 ^ b2 ^ b3));
+            return uid + bcc + sak + atqa + "1122334455667788";
+        }
+        return uid + sak + atqa + "112233445566";
+    }
+
+    nfc_app::UidMagicGeneration uid_changer_generation() const
+    {
+        switch (uid_changer_generation_idx_) {
+        case 0:  return nfc_app::UidMagicGeneration::Gen1A;
+        case 1:  return nfc_app::UidMagicGeneration::Gen2;
+        case 2:  return nfc_app::UidMagicGeneration::Gen3;
+        default: return nfc_app::UidMagicGeneration::Gen4;
+        }
+    }
+
+    std::string compact_read_connection_detail(const nfc_app::ConnectionState &conn) const
+    {
+        std::string detail = conn.detail;
+        if (conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+            const size_t hw_pos = detail.find(" HW:");
+            if (hw_pos != std::string::npos) detail = detail.substr(0, hw_pos);
+        }
+        return to_compact(detail, 40);
     }
 
     void render_edit_hex_modal_card(lv_obj_t *parent)
@@ -2742,11 +3219,10 @@ private:
         case Modal::UartConfig:  handle_uart_config_key(key);  break;
         case Modal::ToolPage:
             if (active_tool_idx_ == 0) handle_mifare_keys_tool_key(key);
+            else if (active_tool_idx_ == 1) handle_uid_changer_tool_key(key);
             else if (active_tool_idx_ == 3 || active_tool_idx_ == 4) handle_mfkey_tool_key(key);
             else if (key == KEY_ESC) modal_ = Modal::None;
             break;
-        case Modal::UidChanger:
-        case Modal::TagEraser:
         case Modal::ToolInfo:
             if (key == KEY_ESC) modal_ = Modal::None;
             break;
@@ -2772,6 +3248,9 @@ private:
             break;
         case Modal::HexLog:
             handle_hex_log_key(key);
+            break;
+        case Modal::Pn532NdefInput:
+            handle_pn532_ndef_input_key(key);
             break;
         default: break;
         }
@@ -2832,7 +3311,16 @@ private:
         case KEY_ENTER: {
             const auto &record = saved_records_[saved_idx_];
             if (service_.upload_record_to_slot_n(record, slot_select_idx_)) {
-                ui_message_ = "Uploaded -> Slot " + std::to_string(slot_select_idx_);
+                const auto dev_kind = service_.connection_state().device_kind;
+                if (dev_kind == nfc_app::DeviceKind::PN532Killer && record.tag.raw_data.size() == 64) {
+                    if (service_.hw_start_upload_async(slot_select_idx_, record)) {
+                        ui_message_ = "Uploading to HW slot " + std::to_string(slot_select_idx_ + 1) + "...";
+                    } else {
+                        ui_message_ = "Slot " + std::to_string(slot_select_idx_ + 1) + " saved (upload busy)";
+                    }
+                } else {
+                    ui_message_ = "Uploaded -> Slot " + std::to_string(slot_select_idx_ + 1);
+                }
             } else {
                 ui_message_ = "Upload failed";
             }
@@ -2849,42 +3337,72 @@ private:
 
     void handle_emulator_action_key(uint32_t key)
     {
+        const auto dev_kind = service_.connection_state().device_kind;
+        const bool pn532_ndef_menu = (dev_kind == nfc_app::DeviceKind::PN532);
+        const bool nfc_unit_mode = (dev_kind == nfc_app::DeviceKind::NFCUnit);
+        const int emu_slot = nfc_unit_mode ? 0 : hw_emu_slot_;
+        const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
+        const int n_opts = pn532_ndef_menu ? 2 : (nfc_unit_mode ? (dump_ready ? 3 : 2) : (dump_ready ? 4 : 3));
         switch (key) {
         case KEY_UP:
-        case KEY_F:    modal_idx_ = (modal_idx_ + 2) % 3; break;
+        case KEY_F:    modal_idx_ = (modal_idx_ + n_opts - 1) % n_opts; break;
         case KEY_DOWN:
-        case KEY_X:    modal_idx_ = (modal_idx_ + 1) % 3; break;
+        case KEY_X:    modal_idx_ = (modal_idx_ + 1) % n_opts; break;
         case KEY_ENTER:
             if (!service_.emulation_allowed(&ui_message_)) {
                 modal_ = Modal::None;
                 modal_idx_ = 0;
                 break;
             }
+            if (pn532_ndef_menu) {
+                if (modal_idx_ == 0) {
+                    modal_ = Modal::Pn532NdefInput;
+                    modal_idx_ = 0;
+                    break;
+                }
+                if (modal_idx_ == 1) {
+                    service_.stop_pn532_ndef_emulation();
+                    ui_message_ = "PN532 NDEF emulation stopped";
+                    modal_ = Modal::None;
+                    modal_idx_ = 0;
+                    break;
+                }
+            }
             if (modal_idx_ == 0) {
                 // Download Data: pull full block dump from HW slot into cache
-                const bool is_grove = (service_.connection_state().device_kind == nfc_app::DeviceKind::GroveNFC);
-                if (is_grove) {
-                    ui_message_ = "Download not supported\n(GroveNFC EEPROM is self-managed)";
-                } else if (service_.hw_start_emu_dump_async(service_.current_emulator_protocol(), hw_emu_slot_)) {
+                const bool is_i2c_emu = (dev_kind == nfc_app::DeviceKind::GroveNFC ||
+                                         dev_kind == nfc_app::DeviceKind::NFCUnit);
+                if (is_i2c_emu) {
+                    std::string dump_err;
+                    if (service_.cache_i2c_slot_dump(service_.current_emulator_protocol(), emu_slot, &dump_err)) {
+                        ui_message_ = nfc_unit_mode ? "I2C profile dump cached" : "I2C slot dump cached";
+                    } else {
+                        ui_message_ = "Download failed: " + dump_err;
+                    }
+                } else if (service_.hw_start_emu_dump_async(service_.current_emulator_protocol(), emu_slot)) {
                     ui_message_ = "Downloading slot data...";
                 } else {
                     ui_message_ = "Download failed (scan running?)";
                 }
             } else if (modal_idx_ == 1) {
                 // Upload Data / Activate Emulation
-                const auto dev_kind = service_.connection_state().device_kind;
-                if (dev_kind == nfc_app::DeviceKind::GroveNFC) {
-                    // For GroveNFC: activate emulation on the selected protocol/slot
+                const bool is_i2c_emu = (dev_kind == nfc_app::DeviceKind::GroveNFC ||
+                                         dev_kind == nfc_app::DeviceKind::NFCUnit);
+                if (is_i2c_emu) {
+                    if (!saved_records_.empty()) {
+                        service_.upload_record_to_slot_n(saved_records_[saved_idx_], emu_slot);
+                    }
+                    // For I2C emu devices: activate emulation on selected protocol/slot
                     std::string emu_err;
                     const bool ok = service_.grovenfc_activate(
-                        service_.current_emulator_protocol(), hw_emu_slot_, &emu_err);
-                    ui_message_ = ok ? "GroveNFC emulating..." : ("EMU failed: " + emu_err);
+                        service_.current_emulator_protocol(), emu_slot, &emu_err);
+                    ui_message_ = ok ? "I2C emulating..." : ("EMU failed: " + emu_err);
                 } else if (saved_records_.empty()) {
                     ui_message_ = "Upload failed: no saved data";
                 } else if (dev_kind == nfc_app::DeviceKind::PN532Killer
                            && saved_records_[saved_idx_].tag.raw_data.size() == 64) {
-                    if (service_.hw_start_upload_async(hw_emu_slot_, saved_records_[saved_idx_])) {
-                        ui_message_ = "Uploading to HW slot " + std::to_string(hw_emu_slot_ + 1) + "...";
+                    if (service_.hw_start_upload_async(emu_slot, saved_records_[saved_idx_])) {
+                        ui_message_ = "Uploading to HW slot " + std::to_string(emu_slot + 1) + "...";
                     } else {
                         ui_message_ = "Upload failed (busy?)";
                     }
@@ -2896,9 +3414,31 @@ private:
                         ui_message_ = "Upload failed";
                     }
                 }
-            } else {
+            } else if (nfc_unit_mode && modal_idx_ == 2) {
+                // Save Dump: persist the cached dump to storage
+                std::string save_err;
+                if (service_.save_emu_dump_cached(
+                        service_.current_emulator_protocol(), emu_slot, &save_err)) {
+                    refresh_saved_records();
+                    show_toast("Saved");
+                    ui_message_ = "Dump saved to records";
+                } else {
+                    ui_message_ = "Save failed: " + save_err;
+                }
+            } else if (!nfc_unit_mode && modal_idx_ == 2) {
                 service_.set_default_slot();
                 ui_message_ = "Set as module default mode";
+            } else if (!nfc_unit_mode && modal_idx_ == 3) {
+                // Save Dump: persist the cached dump to storage
+                std::string save_err;
+                if (service_.save_emu_dump_cached(
+                        service_.current_emulator_protocol(), emu_slot, &save_err)) {
+                    refresh_saved_records();
+                    show_toast("Saved");
+                    ui_message_ = "Dump saved to records";
+                } else {
+                    ui_message_ = "Save failed: " + save_err;
+                }
             }
             modal_ = Modal::None;
             modal_idx_ = 0;
@@ -3006,6 +3546,110 @@ private:
             if (ch && ch != ' ' && ch != ':' && edit_buf_.size() < 80) {
                 edit_buf_ += ch;
                 edit_hex_dirty_ = true;
+            }
+        }
+    }
+
+    void handle_uid_changer_tool_key(uint32_t key)
+    {
+        if (key == KEY_ESC) {
+            modal_ = Modal::None;
+            return;
+        }
+
+        const bool editing_input = (uid_changer_field_idx_ == 3);
+
+        if ((key == KEY_UP || (!editing_input && key == KEY_F))) {
+            uid_changer_field_idx_ = (uid_changer_field_idx_ + 4) % 5;
+            return;
+        }
+        if ((key == KEY_DOWN || (!editing_input && key == KEY_X))) {
+            uid_changer_field_idx_ = (uid_changer_field_idx_ + 1) % 5;
+            return;
+        }
+
+        if (key == KEY_LEFT || key == KEY_RIGHT) {
+            const int delta = (key == KEY_LEFT) ? -1 : 1;
+            if (uid_changer_field_idx_ == 0) {
+                int next = uid_changer_generation_idx_;
+                for (int i = 0; i < 4; ++i) {
+                    next = (next + delta + 4) % 4;
+                    if (uid_changer_generation_allowed(next, uid_changer_uid_len_idx_)) break;
+                }
+                uid_changer_generation_idx_ = next;
+            } else if (uid_changer_field_idx_ == 1) {
+                uid_changer_uid_len_idx_ = (uid_changer_uid_len_idx_ + delta + 2) % 2;
+                uid_changer_fix_generation_for_uid_len();
+                uid_changer_uid_input_ = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+            } else if (uid_changer_field_idx_ == 2) {
+                uid_changer_write_block0_ = !uid_changer_write_block0_;
+            }
+            return;
+        }
+
+        if (key == KEY_ENTER) {
+            if (uid_changer_field_idx_ == 4) {
+                const auto conn = service_.connection_state();
+                if (!conn.connected ||
+                    (conn.device_kind != nfc_app::DeviceKind::PN532 &&
+                     conn.device_kind != nfc_app::DeviceKind::PN532Killer)) {
+                    ui_message_ = "Connect PN532/PN532Killer first";
+                    return;
+                }
+
+                std::string uid_hex;
+                std::string block0_hex;
+                if (!uid_changer_write_block0_) {
+                    uid_hex = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+                    if (uid_hex.size() != static_cast<size_t>(uid_changer_uid_hex_len())) {
+                        ui_message_ = "Invalid UID length";
+                        return;
+                    }
+                    block0_hex = uid_changer_build_block0_from_uid(uid_hex);
+                    if (block0_hex.size() != 32) {
+                        ui_message_ = "Block0 build failed";
+                        return;
+                    }
+                } else {
+                    block0_hex = uid_changer_normalize_hex(uid_changer_block0_input_, 32);
+                    if (block0_hex.size() != 32) {
+                        ui_message_ = "Block0 must be 32 hex";
+                        return;
+                    }
+                    const int uid_len = uid_changer_uid_hex_len();
+                    uid_hex = block0_hex.substr(0, static_cast<size_t>(uid_len));
+                }
+
+                std::string err;
+                if (service_.write_magic_uid(uid_changer_generation(), uid_hex, block0_hex, &err)) {
+                    ui_message_ = "UID write success";
+                } else {
+                    ui_message_ = err.empty() ? "UID write failed" : err;
+                }
+                return;
+            }
+            uid_changer_field_idx_ = (uid_changer_field_idx_ + 1) % 5;
+            return;
+        }
+
+        if (key == KEY_BACKSPACE && uid_changer_field_idx_ == 3) {
+            if (uid_changer_write_block0_) {
+                if (!uid_changer_block0_input_.empty()) uid_changer_block0_input_.pop_back();
+            } else {
+                if (!uid_changer_uid_input_.empty()) uid_changer_uid_input_.pop_back();
+            }
+            return;
+        }
+
+        if (uid_changer_field_idx_ == 3) {
+            const char ch = keycode_to_hex_char(key);
+            if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F')) {
+                if (uid_changer_write_block0_) {
+                    if (uid_changer_block0_input_.size() < 32) uid_changer_block0_input_.push_back(ch);
+                } else {
+                    const size_t max_uid = static_cast<size_t>(uid_changer_uid_hex_len());
+                    if (uid_changer_uid_input_.size() < max_uid) uid_changer_uid_input_.push_back(ch);
+                }
             }
         }
     }

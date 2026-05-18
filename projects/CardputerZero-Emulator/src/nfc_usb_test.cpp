@@ -291,8 +291,8 @@ int main(int argc, char **argv)
         pass("Step 2-5: detect_device", label);
     }
 
-    // ── Step 6: scan for Mifare Classic card ──────────────────────────────────
-    std::cout << "\n" YEL "[INFO]" RST " Step 6: Waiting for Mifare Classic card ("
+    // ── Step 6: scan for any NFC card (ISO14443A then ISO15693 each iteration) ─
+    std::cout << "\n" YEL "[INFO]" RST " Step 6: Waiting for NFC card ("
               << SCAN_TIMEOUT_S << "s timeout) – place card on reader…\n";
 
     const auto deadline = std::chrono::steady_clock::now()
@@ -303,79 +303,148 @@ int main(int argc, char **argv)
     int attempts = 0;
     while (std::chrono::steady_clock::now() < deadline) {
         ++attempts;
-        tag = nfc_app::TagInfo{};
-        if (client.in_list_passive_target_iso14443a(&tag, &err)) {
+        std::string e14, e15;
+
+        nfc_app::TagInfo t14;
+        if (client.in_list_passive_target_iso14443a(&t14, &e14)) {
+            tag = t14;
+            card_found = true;
+            break;
+        }
+        nfc_app::TagInfo t15;
+        if (client.in_list_passive_target_iso15693(&t15, &e15)) {
+            tag = t15;
             card_found = true;
             break;
         }
         if (attempts == 1) {
-            std::cout << "       (waiting: " << err << ")\n";
+            std::cout << "       (waiting – 14443A: " << e14
+                      << " / 15693: " << e15 << ")\n";
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(SCAN_POLL_MS));
     }
 
     if (!card_found) {
-        fail("Step 6: Card scan timeout", std::to_string(attempts) + " attempts, last error: " + err);
+        fail("Step 6: Card scan timeout",
+             std::to_string(attempts) + " attempts");
         transport->close();
         std::cout << "\n=== Test complete (card not found) ===\n\n";
         return 2;
     }
 
-    pass("Step 6: Card detected");
-    std::cout << "       Type:     " << tag.tag_type << "\n";
-    std::cout << "       UID:      " << tag.uid << "\n";
-    std::cout << "       Protocol: " << nfc_app::to_string(tag.protocol) << "\n";
-    for (const auto &kv : tag.identity_fields) {
-        std::cout << "       " << kv.first << ": " << kv.second << "\n";
-    }
+    // ── Unified result output ─────────────────────────────────────────────────
+    pass("Step 6: Tag detected");
+    std::cout << "\n";
+    std::cout << "Result: Tag Found\n";
+    std::cout << "Protocol: " << nfc_app::to_string(tag.protocol) << "\n";
+    std::cout << "UID: " << tag.uid << "\n";
+    if (!tag.tag_type.empty() && tag.tag_type != "Unknown")
+        std::cout << "Type: " << tag.tag_type << "\n";
+    for (const auto &kv : tag.identity_fields)
+        std::cout << "  " << kv.first << ": " << kv.second << "\n";
+    std::cout << "\n";
 
-    const bool is_mfc = tag.tag_type.find("Mifare Classic") != std::string::npos;
+    // ── Shared dump-line printer ──────────────────────────────────────────────
+    auto print_dump_line = [](const std::string &line) {
+        if (line.size() >= 3 && line[0] == 'E' && line[1] == 'R' && line[2] == 'R')
+            std::cout << "  " RED << line << RST "\n";
+        else if (line.size() >= 2 && line[0] == 'O' && line[1] == 'K')
+            std::cout << "  " GRN << line << RST "\n";
+        else if (!line.empty() && line[0] == '>')
+            std::cout << "  " YEL << line << RST "\n";
+        else
+            std::cout << "  " << line << "\n";
+        std::cout.flush();
+    };
 
-    // ── Step 7: Gen1A magic card detection ────────────────────────────────────
-    std::cout << "\n" YEL "[INFO]" RST " Step 7: Probing Gen1A magic card unlock…\n";
-    const bool is_gen1a = client.is_gen1a(&err);
-    if (is_gen1a) {
-        pass("Step 7: Gen1A unlocked – magic card confirmed");
-    } else {
-        // Not Gen1A – could be standard Mifare Classic with key auth required,
-        // or a non-magic card.  Not a test failure.
-        std::cout << YEL "[SKIP]" RST " Step 7: Not Gen1A"
-                  << (err.empty() ? "" : " – " + err) << "\n";
-        if (!is_mfc) {
-            std::cout << "       (not Mifare Classic, Gen1A n/a)\n";
-        }
-    }
+    // Magic card detection is only meaningful with PN532 or PN532Killer.
+    // NFCUnit / GroveNFC do not support the raw InCommunicateThru needed.
+    const bool supports_magic = (kind == nfc_app::DeviceKind::PN532 ||
+                                  kind == nfc_app::DeviceKind::PN532Killer);
 
-    // ── Step 8: Gen1A full dump (64 blocks) ───────────────────────────────────
-    if (is_gen1a) {
-        std::cout << "\n" YEL "[INFO]" RST " Step 8: Reading all 64 blocks (Gen1A dump)…\n";
-        std::vector<std::vector<uint8_t>> blocks;
-        std::vector<std::string> log;
-        bool dump_ok = client.read_gen1a_full(&blocks, &log, &err,
-            [](const std::string &line) {
-                // Stream each line as it arrives
-                if (line.size() >= 2 && line[0] == 'E' && line[1] == 'R') {
-                    std::cout << "  " RED << line << RST "\n";
-                } else if (line.size() >= 2 && line[0] == 'O' && line[1] == 'K') {
-                    std::cout << "  " GRN << line << RST "\n";
-                } else if (line.size() >= 2 && line[0] == '>') {
-                    std::cout << "  " YEL << line << RST "\n";
-                } else {
-                    std::cout << "  " << line << "\n";
-                }
-                std::cout.flush();
-            });
+    const bool is_15693  = (tag.protocol == nfc_app::ProtocolKind::Iso15693);
+    const bool is_mfc    = (tag.tag_type.find("Mifare Classic") != std::string::npos);
+    const bool is_ntag   = (tag.tag_type.find("NTAG")       != std::string::npos ||
+                             tag.tag_type.find("Ultralight") != std::string::npos ||
+                             tag.tag_type.find("SAK=00")     != std::string::npos);
+    const bool is_desfire = (tag.tag_type.find("DESFire") != std::string::npos);
 
-        if (dump_ok) {
-            pass("Step 8: Gen1A full dump complete");
+    int result_code = 0;
+
+    if (is_15693) {
+        // ── ISO15693: read data blocks ────────────────────────────────────────
+        std::cout << YEL "[INFO]" RST " Dumping ISO15693 blocks…\n";
+        bool dump_ok = client.iso15693_read_all_blocks(nullptr, &err, print_dump_line);
+        if (dump_ok) pass("ISO15693 dump complete");
+        else         { fail("ISO15693 dump failed", err); result_code = 3; }
+
+    } else if (is_mfc) {
+        // ── Mifare Classic ────────────────────────────────────────────────────
+        bool dumped = false;
+
+        if (supports_magic) {
+            std::cout << "\n" YEL "[INFO]" RST " Probing Gen1A magic…\n";
+            bool is_gen1a = client.is_gen1a(&err);
+            if (is_gen1a) {
+                pass("Gen1A magic card confirmed");
+                std::cout << "\n" YEL "[INFO]" RST
+                          << " Reading all 64 blocks (Gen1A dump)…\n";
+                std::vector<std::vector<uint8_t>> blocks;
+                dumped = client.read_gen1a_full(&blocks, nullptr, &err,
+                                                print_dump_line);
+                if (dumped) pass("Gen1A full dump complete");
+                else        { fail("Gen1A dump failed", err); result_code = 3; }
+            } else {
+                std::cout << YEL "[SKIP]" RST " Not Gen1A"
+                          << (err.empty() ? "" : " – " + err) << "\n";
+            }
         } else {
-            fail("Step 8: Gen1A dump failed", err);
+            std::cout << YEL "[SKIP]" RST
+                      << " Magic detection skipped"
+                         " (only for PN532 / PN532Killer readers)\n";
         }
+
+        if (!dumped) {
+            // Standard default-key dump
+            std::cout << "\n" YEL "[INFO]" RST " Attempting standard key dump…\n";
+            const int sector_count =
+                (tag.tag_type.find("4K") != std::string::npos) ? 40 : 16;
+            // Parse first 4 bytes of hex UID
+            std::vector<uint8_t> uid4;
+            const std::string &u = tag.uid;
+            for (int i = 0; i < 4 && (i * 2 + 1) < static_cast<int>(u.size()); ++i) {
+                char hex[3] = {u[i * 2], u[i * 2 + 1], 0};
+                uid4.push_back(
+                    static_cast<uint8_t>(std::strtol(hex, nullptr, 16)));
+            }
+            std::vector<std::string> blocks_hex;
+            bool std_ok = client.read_mifare_standard(
+                uid4, sector_count, &blocks_hex, &err, print_dump_line);
+            if (std_ok) pass("Standard key dump complete");
+            else        { fail("Standard key dump failed", err); result_code = 3; }
+        }
+
+    } else if (is_ntag) {
+        // ── NTAG / Mifare Ultralight ──────────────────────────────────────────
+        std::cout << YEL "[INFO]" RST " Dumping NTAG/Ultralight pages…\n";
+        std::string ntag_type;
+        bool dump_ok = client.ntag_read_all_pages(
+            nullptr, &ntag_type, &err, print_dump_line);
+        if (dump_ok) pass("NTAG dump complete", ntag_type);
+        else         { fail("NTAG dump failed", err); result_code = 3; }
+
+    } else if (is_desfire) {
+        std::cout << YEL "[SKIP]" RST
+                  << " DESFire detected – deep dump not implemented in this tool\n";
+
     } else {
-        std::cout << YEL "[SKIP]" RST " Step 8: Gen1A dump skipped (not Gen1A)\n";
+        // Unknown ISO14443A: attempt NTAG-style page read as a best-effort probe
+        std::cout << YEL "[INFO]" RST " Unknown tag – attempting page read…\n";
+        std::string ntag_type;
+        client.ntag_read_all_pages(nullptr, &ntag_type, &err, print_dump_line);
     }
 
     transport->close();
     std::cout << "\n=== Test complete ===\n\n";
-    return (card_found && (!is_gen1a || true)) ? 0 : 2;
+    return result_code;
 }

@@ -26,11 +26,40 @@
 #include <unistd.h>
 #if defined(__linux__)
 #include <linux/i2c-dev.h>
-#include <cstdio>   // fopen / fwrite
-#include <cstring>  // strerror
+#include <linux/i2c.h>     // I2C_SMBUS_WRITE/READ/QUICK (moved here in kernel ≥ 3.4)
+#include <cstdio>          // fopen / fwrite
+#include <cstring>         // strerror
 #endif
 #ifndef I2C_SLAVE
 #define I2C_SLAVE 0x0703
+#endif
+// Fallback defines for minimal cross-compilation sysroots that ship a stripped
+// linux/i2c-dev.h without pulling in the SMBus constant / struct definitions.
+#ifndef I2C_SMBUS_WRITE
+# define I2C_SMBUS_WRITE   0
+#endif
+#ifndef I2C_SMBUS_READ
+# define I2C_SMBUS_READ    1
+#endif
+#ifndef I2C_SMBUS_QUICK
+# define I2C_SMBUS_QUICK   0
+#endif
+#ifndef I2C_SMBUS
+# define I2C_SMBUS         0x0720
+#endif
+#ifndef I2C_SMBUS_BLOCK_MAX
+# define I2C_SMBUS_BLOCK_MAX 32
+  union i2c_smbus_data {
+      uint8_t  byte;
+      uint16_t word;
+      uint8_t  block[I2C_SMBUS_BLOCK_MAX + 2];
+  };
+  struct i2c_smbus_ioctl_data {
+      uint8_t              read_write;
+      uint8_t              command;
+      uint32_t             size;
+      union i2c_smbus_data *data;
+  };
 #endif
 #endif
 
@@ -422,17 +451,21 @@ public:
     {
         std::vector<TransportEndpoint> result;
 #if defined(__linux__)
-        // ── Enable Grove 5V power via GROVE_EN (BCM17 = FSW7227 load switch) ──
-        // The CardputerZero silkscreen: GROVE_EN:G17 (BCM17).
-        // On this SoC the kernel gpiochip base is not 0; e.g. pinctrl-bcm2835
-        // registers with base=512, so sysfs GPIO for BCM17 = 512+17 = 529.
-        // grove_gpio_enable_bcm() looks up the correct base at runtime.
+        // ── Enable Grove 5V power via GROVE_EN (BCM17 = AW35112FDR load switch) ──
+        // G17 (BCM17) HIGH = GROVE power on.
         grove_gpio_enable_bcm(17, true);
+
+        // ── Switch GROVE mux to I2C1 mode (BCM4 = G4 = FSW7227 SEL pin) ──
+        // From schematic: SEL=L → UART, SEL=H → I2C1.
+        // Without this the GROVE connector is routed to UART, not I2C,
+        // so GroveNFC can never be found on /dev/i2c-*.
+        grove_gpio_enable_bcm(4, true);
+
         // Allow the load switch and the NFC module to power up.
         // GroveNFC M090 / PN532-based modules need ≥200 ms after supply rise
         // before they respond to I2C traffic.
         {
-            struct timespec ts = {0, 250 * 1000 * 1000}; // 250 ms
+            struct timespec ts = {0, 300 * 1000 * 1000}; // 300 ms
             nanosleep(&ts, nullptr);
         }
 
@@ -518,7 +551,7 @@ public:
         struct dirent *de;
         while ((de = readdir(d)) != nullptr) {
             if (!starts_with(de->d_name, "gpiochip")) continue;
-            char lpath[128], bpath[128];
+            char lpath[320], bpath[320];
             std::snprintf(lpath, sizeof(lpath), "/sys/class/gpio/%s/label",  de->d_name);
             std::snprintf(bpath, sizeof(bpath), "/sys/class/gpio/%s/base",   de->d_name);
             FILE *lf = fopen(lpath, "r");

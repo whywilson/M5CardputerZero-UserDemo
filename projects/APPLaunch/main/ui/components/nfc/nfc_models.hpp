@@ -14,6 +14,7 @@ enum class ProtocolKind {
     Iso14443A,
     Iso14443B,
     Iso15693,
+    Felica,
     MifareClassic,
 };
 
@@ -94,6 +95,7 @@ inline const char *to_string(ProtocolKind value)
     case ProtocolKind::Iso14443A: return "ISO14443A";
     case ProtocolKind::Iso14443B: return "ISO14443B";
     case ProtocolKind::Iso15693: return "ISO15693";
+    case ProtocolKind::Felica: return "FELICA";
     case ProtocolKind::MifareClassic: return "MIFARE_CLASSIC";
     default: return "UNKNOWN";
     }
@@ -144,6 +146,7 @@ inline ProtocolKind protocol_from_string(const std::string &value)
     if (value == "ISO14443A") return ProtocolKind::Iso14443A;
     if (value == "ISO14443B") return ProtocolKind::Iso14443B;
     if (value == "ISO15693") return ProtocolKind::Iso15693;
+    if (value == "FELICA") return ProtocolKind::Felica;
     if (value == "MIFARE_CLASSIC") return ProtocolKind::MifareClassic;
     return ProtocolKind::Unknown;
 }

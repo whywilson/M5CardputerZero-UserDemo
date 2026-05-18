@@ -5,6 +5,7 @@
 // Does NOT depend on Arduino / M5UnitUnified.
 
 #include "nfc_models.hpp"
+#include "nfc_hex_logger.hpp"
 
 #include <cerrno>
 #include <cstdint>
@@ -181,9 +182,10 @@ public:
     bool readCard(I2cCardInfo &card)
     {
         if (is_nfc_unit()) {
-            // NFC Unit: use same register protocol path (ST25R3916 shares the same I2C register map
-            // exposed by the GroveNFC firmware bridge). Try ISO14443A only; if it fails, fall through.
-            if (readISO14A(card)) return true;
+            // M5 NFC Unit (ST25R3916B at 0x50) uses a completely different I2C
+            // register protocol from GroveNFC (Nuvoton MCU at 0x48).
+            // Use the dedicated ST25R3916B driver path.
+            return readCardNFCUnit(card);
         }
 
         if (readISO14B(card)) return true;
@@ -202,7 +204,6 @@ public:
 
     bool startEmulationNtag213()
     {
-        if (is_nfc_unit()) return false;
         writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
         delay_ms(5);
         writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_NTAG213);
@@ -212,7 +213,6 @@ public:
 
     bool startEmulationNtag215()
     {
-        if (is_nfc_unit()) return false;
         writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
         delay_ms(5);
         writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_NTAG215);
@@ -222,7 +222,6 @@ public:
 
     bool startEmulationNtag216()
     {
-        if (is_nfc_unit()) return false;
         writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
         delay_ms(5);
         writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_NTAG216);
@@ -232,7 +231,6 @@ public:
 
     bool startEmulationMifare1K()
     {
-        if (is_nfc_unit()) return false;
         writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
         delay_ms(5);
         writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_MFC1K);
@@ -242,7 +240,6 @@ public:
 
     bool startEmulationISO15()
     {
-        if (is_nfc_unit()) return false;
         writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
         delay_ms(5);
         writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_ISO15);
@@ -252,7 +249,6 @@ public:
 
     bool startEmulationChinaII()
     {
-        if (is_nfc_unit()) return false;
         writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
         delay_ms(5);
         writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_14B);
@@ -262,15 +258,13 @@ public:
 
     bool stopEmulation()
     {
-        if (is_nfc_unit()) return false;
         return writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
     }
 
-    // ── Slot selection (GroveNFC 0x48 only) ──────────────────────────────────
+    // ── Slot selection (GroveNFC / NFC Unit) ─────────────────────────────────
 
     bool setSlot(uint8_t slot_index)
     {
-        if (is_nfc_unit()) return false;
         return writeMiscReg(i2c_reg::MISC_SLOT, slot_index);
     }
 
@@ -312,10 +306,18 @@ public:
     {
 #ifndef _WIN32
         if (fd_ < 0) return 0;
+        // Use I2C_RDWR (repeated-start) so no STOP is issued between the
+        // register address write and the data read. GroveNFC M090 clears its
+        // receive buffer on a STOP, so a plain write()+read() sequence returns
+        // stale / zero data for volatile registers (STATUS, RX_LEN, DATA).
         uint8_t reg_buf[2] = {(uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF)};
-        if (::write(fd_, reg_buf, 2) != 2) return 0;
         uint8_t rx[2] = {0, 0};
-        if (::read(fd_, rx, 2) != 2) return 0;
+        struct i2c_msg msgs[2] = {
+            {addr_, 0,        2, (__u8*)reg_buf},
+            {addr_, I2C_M_RD, 2, (__u8*)rx}
+        };
+        struct i2c_rdwr_ioctl_data data = {msgs, 2};
+        if (::ioctl(fd_, I2C_RDWR, &data) < 0) return 0;
         return (uint16_t(rx[1]) << 8) | rx[0]; // little-endian
 #else
         return 0;
@@ -340,10 +342,14 @@ public:
     {
 #ifndef _WIN32
         if (fd_ < 0) return false;
-        uint8_t reg_buf[2] = {(uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF)};
-        if (::write(fd_, reg_buf, 2) != 2) return false;
         if (len == 0) return true;
-        return ::read(fd_, data, len) == (ssize_t)len;
+        uint8_t reg_buf[2] = {(uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF)};
+        struct i2c_msg msgs[2] = {
+            {addr_, 0,        2,   (__u8*)reg_buf},
+            {addr_, I2C_M_RD, len, (__u8*)data}
+        };
+        struct i2c_rdwr_ioctl_data ioctl_data = {msgs, 2};
+        return ::ioctl(fd_, I2C_RDWR, &ioctl_data) >= 0;
 #else
         return false;
 #endif
@@ -353,6 +359,736 @@ private:
     int      fd_   = -1;
     uint8_t  addr_ = 0;
     std::string bus_path_;
+
+    // ── ST25R3916B I2C protocol helpers (M5 NFC Unit at 0x50) ────────────────
+    //
+    // The ST25R3916B I2C command-byte encoding:
+    //   0x00-0x3F  Space-A register (addr in [5:0]); write = [addr][data], read
+    //              via I2C_RDWR repeated-start [addr] → read [data]
+    //   0x40-0x7F  Space-B register (addr in [5:0]); same R/W pattern
+    //   0x80       FIFO access; write = [0x80][data…], read via repeated-start
+    //   0xC0-0xFF  Direct command (single write byte, no data)
+    //
+    // Key registers:
+    //   0x02 OP_CONTROL: bit7=en(osc), bit6=rx_en, bit3=tx_en(RF field)
+    //   0x03 MODE:       bits[6:3]=0x1 → ISO14443A initiator
+    //   0x04 BIT_RATE:   0x00 = 106kbps TX+RX
+    //   0x05 ISO14443A_NFC: bit0=antcl (anticollision enable)
+    //   0x1A IRQ_MAIN:   bit4=rxe(end-of-receive), bit3=txe, bit2=col(collision)
+    //   0x1E FIFO_STATUS1: RX FIFO byte count (lower 8 bits)
+    //   0x22/0x23 NUM_TX_BYTES: TX byte count + incomplete-bits
+
+    bool st25r_write_reg(uint8_t reg, uint8_t val)
+    {
+#ifndef _WIN32
+        uint8_t buf[2] = {(uint8_t)(reg & 0x3F), val};
+        return ::write(fd_, buf, 2) == 2;
+#else
+        return false;
+#endif
+    }
+
+    bool st25r_read_reg(uint8_t reg, uint8_t &val)
+    {
+#ifndef _WIN32
+        uint8_t rb = (reg & 0x3F) | 0x40;  // bit6=1 indicates register read in ST25R3916B I2C protocol
+        uint8_t data = 0;
+        struct i2c_msg msgs[2] = {
+            {addr_, 0,        1, (__u8*)&rb},
+            {addr_, I2C_M_RD, 1, (__u8*)&data}
+        };
+        struct i2c_rdwr_ioctl_data d = {msgs, 2};
+        if (::ioctl(fd_, I2C_RDWR, &d) < 0) return false;
+        val = data;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool st25r_cmd(uint8_t cmd)
+    {
+#ifndef _WIN32
+        return ::write(fd_, &cmd, 1) == 1;
+#else
+        return false;
+#endif
+    }
+
+    bool st25r_fifo_write(const uint8_t *data, uint8_t len)
+    {
+#ifndef _WIN32
+        std::vector<uint8_t> buf;
+        buf.push_back(0x80);
+        buf.insert(buf.end(), data, data + len);
+        return ::write(fd_, buf.data(), buf.size()) == (ssize_t)buf.size();
+#else
+        return false;
+#endif
+    }
+
+    bool st25r_fifo_read(uint8_t *data, uint8_t len)
+    {
+#ifndef _WIN32
+        // OP_READ_FIFO = 0x9F (NOT 0x80! 0x80 = OP_LOAD_FIFO, 0xC0 = OP_DIRECT_COMMAND)
+        uint8_t op = 0x9F;
+        struct i2c_msg msgs[2] = {
+            {addr_, 0,        1,   (__u8*)&op},
+            {addr_, I2C_M_RD, len, (__u8*)data}
+        };
+        struct i2c_rdwr_ioctl_data d = {msgs, 2};
+        return ::ioctl(fd_, I2C_RDWR, &d) >= 0;
+#else
+        return false;
+#endif
+    }
+
+    // Set NUM_TX_BYTES registers (0x22-0x23).
+    // Format: 16-bit big-endian value = (bytes_count << 3) | last_bits
+    // CMD_TRANSMIT_WITH_CRC (0xC4) appends CRC automatically; do NOT include CRC in count.
+    // CMD_TRANSMIT_WITHOUT_CRC (0xC5) transmits exactly bytes_count bytes.
+    void st25r_set_ntx(uint16_t bytes_count, uint8_t last_bits = 0)
+    {
+        uint16_t v = ((bytes_count & 0x1FF) << 3) | (last_bits & 0x07);
+        st25r_write_reg(0x22, (uint8_t)((v >> 8) & 0xFF));
+        st25r_write_reg(0x23, (uint8_t)(v & 0xFF));
+    }
+
+    // Poll IRQ_MAIN (0x1A) until `mask` bits are set or `timeout_ms` expires.
+    // Returns the IRQ_MAIN byte (0 on timeout).
+    uint8_t st25r_wait_irq(uint8_t mask, int timeout_ms)
+    {
+        // No sleep between polls: ISO14443A card responses start within ~302µs
+        // after TX ends. With delay_ms(1) the RECEIVE command would arrive after
+        // the card is already done. Tight I2C polling (~200µs/read) is needed.
+        auto start = std::chrono::steady_clock::now();
+        while (true) {
+            uint8_t irq = 0;
+            st25r_read_reg(0x1A, irq);
+            if (irq & mask) return irq;
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed >= timeout_ms) return 0;
+            // No sleep — tight polling required for NFC timing
+        }
+    }
+
+    // ── ISO15693 / NFC-V helpers ──────────────────────────────────────────────
+
+    // Write a Space-B register via the ST25R3916B I2C protocol.
+    // Space-B access: [0xFB, reg&0x3F, value]
+    bool st25r_write_spaceb(uint8_t reg, uint8_t val)
+    {
+#ifndef _WIN32
+        uint8_t buf[3] = {0xFB, (uint8_t)(reg & 0x3F), val};
+        return ::write(fd_, buf, 3) == 3;
+#else
+        return false;
+#endif
+    }
+
+    // ISO15693 CRC-16 (poly=0x8408 reflected 0x1021, init=0xFFFF, xor-out=0xFFFF)
+    static uint16_t crc16_iso15693(const uint8_t *data, size_t len)
+    {
+        uint16_t crc = 0xFFFF;
+        for (size_t i = 0; i < len; i++) {
+            uint8_t b = data[i];
+            for (int j = 0; j < 8; j++) {
+                uint8_t mix = (uint8_t)((crc ^ b) & 1);
+                crc >>= 1;
+                if (mix) crc ^= 0x8408;
+                b >>= 1;
+            }
+        }
+        return crc ^ 0xFFFF;
+    }
+
+    // Encode data bytes with ISO15693 1-of-4 PPM (SubCarrierStream TX).
+    // Prepends SOF (0x21), appends CRC16 + EOF (0x04).
+    // out must be at least 1 + (len+2)*4 + 1 bytes.
+    // Returns encoded length.
+    static uint8_t encode_nfcv_1of4(uint8_t *out, const uint8_t *data, uint8_t len)
+    {
+        static const uint8_t SYM4[4] = {0x02, 0x08, 0x20, 0x80};
+        uint16_t crc = crc16_iso15693(data, len);
+        // Build frame: data + CRC
+        uint8_t frame[64];
+        uint8_t flen = 0;
+        for (uint8_t i = 0; i < len && flen < 60; i++) frame[flen++] = data[i];
+        frame[flen++] = (uint8_t)(crc & 0xFF);
+        frame[flen++] = (uint8_t)(crc >> 8);
+        // Encode
+        uint8_t pos = 0;
+        out[pos++] = 0x21;  // SOF_1OF4
+        for (uint8_t i = 0; i < flen; i++) {
+            uint8_t b = frame[i];
+            for (int j = 0; j < 4; j++) {
+                out[pos++] = SYM4[b & 3];
+                b >>= 2;
+            }
+        }
+        out[pos++] = 0x04;  // EOF
+        return pos;
+    }
+
+    // Decode Manchester-encoded ISO15693 response (SubCarrierStream RX).
+    // buf/len = raw FIFO bytes; out must be >= 16 bytes; out_len = payload bytes (excl CRC).
+    // Returns true on success (SOF ok, no collision, CRC matches).
+    static bool decode_vicc_manchester(const uint8_t *buf, uint8_t len,
+                                       uint8_t *out, uint8_t &out_len)
+    {
+        if (!buf || len == 0) return false;
+        if ((buf[0] & 0x1F) != 0x17) return false;  // SOF check
+
+        const uint32_t manBits     = (uint32_t)len * 8;
+        const uint32_t maxPayBits  = (manBits > 5) ? ((manBits - 5) / 2) : 0;
+        const uint32_t outBufLen   = (maxPayBits + 7) / 8;
+        if (outBufLen == 0) return false;
+
+        std::memset(out, 0, outBufLen < 32 ? outBufLen : 32);
+
+        uint16_t mp = 5;   // Manchester bit position (after 5-bit SOF)
+        uint16_t bp = 0;   // Payload bit position
+
+        for (; mp < (uint16_t)(manBits - 2); mp += 2) {
+            bool isEOF = false;
+            uint8_t man = (buf[mp / 8] >> (mp % 8)) & 1;
+            man |= (uint8_t)(((buf[(mp + 1) / 8] >> ((mp + 1) % 8)) & 1) << 1);
+
+            if (man == 1) {
+                bp++;
+            } else if (man == 2) {
+                uint16_t bpos = bp / 8;
+                if (bpos < outBufLen && bpos < 32) out[bpos] |= (uint8_t)(1 << (bp % 8));
+                bp++;
+            }
+
+            if ((bp % 8) == 0) {
+                uint16_t byte_pos = (uint16_t)(mp / 8);
+                if (byte_pos + 1 < len) {
+                    if (((buf[byte_pos] & 0xE0) == 0xA0) && (buf[byte_pos + 1] == 0x03)) {
+                        isEOF = true;
+                    }
+                }
+            }
+
+            if ((man == 0 || man == 3) && !isEOF) return false;  // Collision
+            if (bp >= (uint16_t)(outBufLen * 8) || isEOF) break;
+        }
+
+        uint8_t out_bytes = (uint8_t)(bp / 8);
+        if (out_bytes < 3) return false;  // Need flags+DSFID+UID minimum
+        if ((bp % 8) != 0) return false;  // Bit boundary error
+
+        // Verify CRC (last 2 bytes of decoded output)
+        uint16_t crc_calc = crc16_iso15693(out, out_bytes - 2);
+        uint16_t crc_rx   = ((uint16_t)out[out_bytes - 1] << 8) | out[out_bytes - 2];
+        if (crc_calc != crc_rx) return false;
+
+        out_len = out_bytes - 2;  // Strip CRC
+        return true;
+    }
+
+    // Configure ST25R3916B for ISO15693 / NFC-V SubCarrierStream mode.
+    // Mirrors GroveNFC UnitST25R3916::configure_nfc_v() exactly.
+    // Includes CMD_NFC_INITIAL_FIELD_ON at end (no tx_en/rx_en set — critical).
+    bool configure_nfcv()
+    {
+        // Stop all active operations before reconfiguring
+        st25r_cmd(0xC2);   // CMD_STOP
+        delay_ms(5);
+        st25r_write_reg(0x02, 0x80);  // OP_CONTROL: osc only, field off
+        delay_ms(5);
+        // Space-A: Receiver config for 424kHz subcarrier demodulation
+        st25r_write_reg(0x0B, 0x13);  // ReceiverConfig1: lp0|h80|z12k
+        st25r_write_reg(0x0C, 0x2D);  // ReceiverConfig2: sqm_dyn|agc_en|agc_m|agc6_3
+        st25r_write_reg(0x0D, 0x00);  // ReceiverConfig3
+        st25r_write_reg(0x0E, 0x00);  // ReceiverConfig4
+        // TX driver 40% modulation (required for ISO15693)
+        st25r_write_reg(0x28, 0x70);
+        // IOConfiguration1: MCU_CLK disabled, no LF clock
+        st25r_write_reg(0x00, 0x07);
+        // IOConfiguration2: enable AAT D/A (aat_en=0x20) — critical for RX sensitivity
+        st25r_write_reg(0x01, 0x20);
+        // OP_CONTROL: set en_fd_c1|en_fd_c0=0x03 (field detector auto-enable)
+        // Do NOT set tx_en|rx_en here — GroveNFC explicitly avoids this for NFC-V
+        st25r_write_reg(0x02, 0x80 | 0x03);
+        // StreamModeDefinition: fc/32=424kHz subcarrier, num pulses=2
+        st25r_write_reg(0x09, 0x38);
+        // AuxiliaryDefinition
+        st25r_write_reg(0x0A, 0x02);
+        // Space-B: correlator and subcarrier configuration
+        st25r_write_spaceb(0x05, 0x40);  // EMD_SUPPRESSION_CONFIGURATION
+        st25r_write_spaceb(0x06, 0x14);  // SUBCARRIER_START_TIMER = 20
+        st25r_write_spaceb(0x0B, 0x0C);  // P2P_RECEIVER_CONFIGURATION
+        st25r_write_spaceb(0x0C, 0x13);  // CORRELATOR_CONFIGURATION_1: corr_s4|corr_s1|corr_s0
+        st25r_write_spaceb(0x0D, 0x01);  // CORRELATOR_CONFIGURATION_2: 424kHz subcarrier stream
+        st25r_write_spaceb(0x0E, 0x00);  // SQUELCH_TIMER
+        st25r_write_spaceb(0x0F, 0x00);  // NFC_FIELD_ON_GUARD_TIMER
+        st25r_write_spaceb(0x10, 0x10);  // AUXILIARY_MODULATION_SETTING
+        st25r_write_spaceb(0x11, 0x7C);  // TX_DRIVER_TIMING
+        st25r_write_spaceb(0x12, 0x80);  // RESISTIVE_AM_MODULATION
+        // ModeDefinition = SubCarrierStream (0x70) — write LAST per GroveNFC
+        st25r_write_reg(0x03, 0x70);
+        // nfc_initial_field_on(): CMD + 5ms delay + explicitly set tx_en|rx_en.
+        // GroveNFC modify_bit_register8(OP_CONTROL, set=tx_en|rx_en, clear=0x00)
+        // sets BOTH tx_en and rx_en after CMD_NFC_INITIAL_FIELD_ON.
+        // rx_en is required so the chip auto-switches to RX after CMD_TRANSMIT.
+        st25r_cmd(0xC8);   // CMD_NFC_INITIAL_FIELD_ON (RFCA + field on; sets tx_en)
+        delay_ms(5);
+        {
+            uint8_t op = 0;
+            st25r_read_reg(0x02, op);
+            st25r_write_reg(0x02, op | 0x40);  // Set rx_en (bit6), tx_en already set by cmd
+        }
+        return true;
+    }
+
+    // Restore ST25R3916B to ISO14443A mode after ISO15693 scan attempt.
+    // Clears all registers changed by configure_nfcv() that are NOT reset
+    // by the readCardNFCUnit() init sequence on the next call.
+    void restore_iso14443a()
+    {
+        // Stop cleanly first
+        st25r_cmd(0xC2);   // CMD_STOP
+        delay_ms(5);
+        // Restore IOConfiguration2: clear aat_en bit (reg 0x01, was set to 0x20)
+        st25r_write_reg(0x01, 0x00);
+        // Restore AUX_DEF (not set by readCardNFCUnit init, was changed to 0x02)
+        st25r_write_reg(0x0A, 0x00);  // AUXILIARY_DEFINITION: reset to default
+        // CRITICAL: Reset Space-B correlator to ISO14443A mode.
+        // configure_nfcv() set CORRELATOR_CONFIGURATION_2=0x01 (424kHz subcarrier).
+        // GroveNFC configure_nfc_a() explicitly calls writeCorrelatorConfiguration2(0x00)
+        // before each ISO14443A scan — without this, the demodulator stays in NFC-V mode.
+        st25r_write_spaceb(0x0B, 0x00);  // P2P_RECEIVER_CONFIGURATION: reset
+        st25r_write_spaceb(0x0C, 0x00);  // CORRELATOR_CONFIGURATION_1: reset
+        st25r_write_spaceb(0x0D, 0x00);  // CORRELATOR_CONFIGURATION_2: 0=ISO14443A (was 0x01=NFC-V)
+        // OP_CONTROL: OSC only, field off (clears en_fd bits too)
+        // readCardNFCUnit init will re-enable the field on next scan
+        st25r_write_reg(0x02, 0x80);
+    }
+
+    // Compute ISO14443-3 CRC-A (for SELECT frames).
+    static uint16_t crc_a(const uint8_t* data, uint8_t len) {
+        uint16_t crc = 0x6363;
+        for (int i = 0; i < len; i++) {
+            uint8_t b = data[i] ^ (uint8_t)(crc & 0xFF);
+            b ^= b << 4;
+            crc = (crc >> 8) ^ ((uint16_t)b << 8) ^ ((uint16_t)b << 3) ^ ((uint16_t)b >> 4);
+        }
+        return crc;
+    }
+
+    // ── ST25R3916B ISO14443A card reader ─────────────────────────────────────
+    // Implements WUPA → ATQA → SDD CL1/CL2 → SELECT → UID + SAK.
+    // Returns true if a card was found.
+    bool readCardNFCUnit(I2cCardInfo &card)
+    {
+#ifndef _WIN32
+        if (fd_ < 0) return false;
+
+        auto &hexlog = NfcHexLog::get();
+
+        // Init sequence per M5UnitNFC library reference (confirmed via hardware testing):
+        // 1. Enable oscillator only, configure mode/bitrate/receiver.
+        // 2. CMD_NFC_INITIAL_FIELD_ON (0xC8) = RF Collision Avoidance + field on.
+        // 3. Set tx_en | rx_en in OP_CONTROL.
+        hexlog.log_event("NFC-I2C", "Init: OSC only, mode/receiver config, CMD_NFC_INITIAL_FIELD_ON");
+        st25r_cmd(0xD6);              // ADJUST_REGULATORS first
+        delay_ms(5);
+        st25r_write_reg(0x02, 0x80);  // OP_CONTROL: en (osc only, no TX yet)
+        delay_ms(20);
+        // Clear any pending IRQs
+        { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }
+
+        // ISO14443A initiator mode at 106 kbps.
+        st25r_write_reg(0x03, 0x08);  // MODE: om_iso14443a
+        st25r_write_reg(0x04, 0x00);  // BIT_RATE: 106kbps
+        st25r_write_reg(0x05, 0x00);  // ISO14443A_NFC: no antcl, no no_rx_par (initial)
+        st25r_write_reg(0x09, 0x03);  // TX1+TX2 antenna drivers
+        st25r_write_reg(0x26, 0x80);  // IRQ_MASK: only mask osc IRQ
+        // Receiver configuration (per M5UnitNFC stability settings):
+        st25r_write_reg(0x0B, 0x08);  // ReceiverConfig1: z_600k
+        st25r_write_reg(0x0C, 0x2D);  // ReceiverConfig2: agc settings
+        st25r_write_reg(0x0D, 0xD8);  // ReceiverConfig3: stability
+        st25r_write_reg(0x0E, 0x22);  // ReceiverConfig4: stability
+        delay_ms(10);
+
+        // CMD_NFC_INITIAL_FIELD_ON (0xC8): RFCA + enable RF field.
+        st25r_cmd(0xC8);
+        delay_ms(10);
+        // Now set tx_en (bit3) | rx_en (bit6) in OP_CONTROL.
+        {
+            uint8_t op = 0x80;
+            st25r_read_reg(0x02, op);
+            if (!st25r_write_reg(0x02, op | 0x48)) {
+                hexlog.log_event("NFC-I2C", "ERR: OP_CONTROL write failed");
+                return false;
+            }
+        }
+        delay_ms(20);
+        { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }  // clear IRQs
+
+        // Clear FIFO + IRQ status, then send WUPA (wakes IDLE and HALT cards).
+        hexlog.log_event("NFC-I2C", "CMD CLEAR_FIFO (0xDB) then TRANSMIT_WUPA (0xC7)");
+        st25r_cmd(0xDB);  // CLEAR_FIFO
+        st25r_cmd(0xC7);  // TRANSMIT_WUPA (7-bit short frame, no CRC)
+
+        // Wait for ATQA (end-of-receive IRQ_MAIN bit4=rxe).
+        uint8_t irq = st25r_wait_irq(0x10 | 0x04, 25);
+        {
+            char irq_msg[40];
+            std::snprintf(irq_msg, sizeof(irq_msg), "WUPA irq=0x%02X (rxe=%d col=%d)",
+                          irq, !!(irq & 0x10), !!(irq & 0x04));
+            hexlog.log_event("NFC-I2C", irq_msg);
+        }
+        if (!(irq & 0x10)) {
+            hexlog.log_event("NFC-I2C", "WUPA: no rxe → try ISO15693 SubCarrierStream");
+            // ── ISO15693 INVENTORY (SubCarrierStream mode) ────────────────
+            // ST25R3916B has no native ISO15693 mode.  It uses SubCarrierStream
+            // (MODE=0x70) with software 1-of-4 PPM TX and Manchester decode RX.
+            // Reference: M5UnitNFC configure_nfc_v() + encode_VCD() + decode_VICC().
+
+            configure_nfcv();  // includes CMD_NFC_INITIAL_FIELD_ON + 5ms delay
+
+            // Encode INVENTORY frame: {0x26, 0x01, 0x00} + CRC16 → 1-of-4 PPM
+            const uint8_t inv_raw[3] = {0x26, 0x01, 0x00};
+            uint8_t encoded[32];
+            uint8_t enc_len = encode_nfcv_1of4(encoded, inv_raw, 3);
+
+            st25r_cmd(0xDB);  // CLEAR_FIFO
+            { uint8_t dummy15 = 0; st25r_read_reg(0x1A, dummy15); }
+
+            if (!st25r_fifo_write(encoded, enc_len)) {
+                hexlog.log_event("NFC-I2C", "ISO15693: FIFO write failed");
+                restore_iso14443a();
+                return false;
+            }
+            // NUM_TX_BYTES: total encoded bytes (CRC already inside encoded stream)
+            st25r_set_ntx(enc_len, 0);
+            { uint8_t dummy15 = 0; st25r_read_reg(0x1A, dummy15); }
+            st25r_cmd(0xC5);  // TRANSMIT_WITHOUT_CRC (CRC is inside PPM stream)
+
+            // Wait for txe then rxe
+            uint8_t irq15 = st25r_wait_irq(0x08, 20);
+            if (irq15 & 0x08) {
+                irq15 |= st25r_wait_irq(0x10 | 0x04, 50);
+            }
+            {
+                char msg15[64];
+                std::snprintf(msg15, sizeof(msg15), "ISO15693 irq=0x%02X (rxe=%d txe=%d)",
+                              irq15, !!(irq15 & 0x10), !!(irq15 & 0x08));
+                hexlog.log_event("NFC-I2C", msg15);
+            }
+            if (!(irq15 & 0x10)) {
+                hexlog.log_event("NFC-I2C", "ISO15693: no response → no card");
+                restore_iso14443a();
+                return false;
+            }
+
+            // Read raw Manchester-encoded response from FIFO
+            uint8_t fc15 = 0;
+            st25r_read_reg(0x1E, fc15);
+            {
+                char msg15[48];
+                std::snprintf(msg15, sizeof(msg15), "ISO15693 FIFO=%d bytes", fc15);
+                hexlog.log_event("NFC-I2C", msg15);
+            }
+            if (fc15 < 8) {
+                hexlog.log_event("NFC-I2C", "ISO15693: response too short");
+                restore_iso14443a();
+                return false;
+            }
+            uint8_t raw15[64] = {0};
+            uint8_t to_read15 = (fc15 < 64) ? fc15 : 64;
+            if (!st25r_fifo_read(raw15, to_read15)) {
+                hexlog.log_event("NFC-I2C", "ISO15693: FIFO read failed");
+                restore_iso14443a();
+                return false;
+            }
+
+            // Decode Manchester stream → flags + DSFID + UID (8 bytes) [+ CRC stripped]
+            uint8_t decoded[32] = {0};
+            uint8_t dec_len = 0;
+            if (!decode_vicc_manchester(raw15, to_read15, decoded, dec_len) || dec_len < 10) {
+                char msg15[64];
+                std::snprintf(msg15, sizeof(msg15),
+                              "ISO15693: decode failed (fc=%d dec=%d sof=0x%02X)",
+                              fc15, dec_len, raw15[0]);
+                hexlog.log_event("NFC-I2C", msg15);
+                restore_iso14443a();
+                return false;
+            }
+
+            // decoded[0] = response flags, decoded[1] = DSFID, decoded[2..9] = UID LSB-first
+            std::string uid15;
+            uid15.reserve(16);
+            for (int i = 9; i >= 2; --i) {
+                char h[3];
+                std::snprintf(h, sizeof(h), "%02X", decoded[i]);
+                uid15 += h;
+            }
+            {
+                char msg15[72];
+                std::snprintf(msg15, sizeof(msg15),
+                              "ISO15693 flags=0x%02X DSFID=0x%02X UID=%s",
+                              decoded[0], decoded[1], uid15.c_str());
+                hexlog.log_event("NFC-I2C", msg15);
+            }
+            card.uid      = uid15;
+            card.protocol = "ISO15693";
+            card.detail   = "ISO15693 Tag";
+            card.valid    = true;
+            restore_iso14443a();
+            return true;
+        }
+
+        // Read ATQA (2 bytes) from FIFO via OP_READ_FIFO (0x9F).
+        uint8_t fifo_cnt = 0;
+        st25r_read_reg(0x1E, fifo_cnt);
+        if (fifo_cnt < 2) {
+            hexlog.log_event("NFC-I2C", "ATQA: FIFO too short (<2 bytes)");
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+        uint8_t atqa[2] = {0, 0};
+        if (!st25r_fifo_read(atqa, 2)) {
+            hexlog.log_event("NFC-I2C", "ATQA: FIFO read failed");
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+        // Drain any extra FIFO bytes beyond the 2 ATQA bytes.
+        if (fifo_cnt > 2) {
+            uint8_t drain[8];
+            st25r_fifo_read(drain, (uint8_t)(fifo_cnt - 2));
+        }
+        // Clear IRQ before next step.
+        { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }
+        {
+            char atqa_msg[40];
+            std::snprintf(atqa_msg, sizeof(atqa_msg), "ATQA=%02X%02X", atqa[0], atqa[1]);
+            hexlog.log_event("NFC-I2C", atqa_msg);
+        }
+
+        // ── Anticollision CL1 ────────────────────────────────────────────────
+        // Set antcl (bit0) in ISO14443A_NFC reg for anticollision bit-framing.
+        // no_rx_par (bit6=0x40) is intentionally NOT set here (parity checked).
+        hexlog.log_event("NFC-I2C", "Anticol CL1: ISO14443A_NFC=0x01, sending 93 20");
+        st25r_write_reg(0x05, 0x01);  // antcl only (NOT 0x81 - bit7 is not no_rx_par!)
+        st25r_cmd(0xDB);
+        const uint8_t anticol1[2] = {0x93, 0x20};
+        if (!st25r_fifo_write(anticol1, 2)) {
+            hexlog.log_event("NFC-I2C", "CL1: FIFO write failed");
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+        // NUM_TX_BYTES: 16-bit big-endian at 0x22-0x23, value = (bytes<<3)|last_bits
+        // For 2 complete bytes: (2<<3)|0 = 0x0010 → 0x22=0x00, 0x23=0x10
+        st25r_set_ntx(2);
+        { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }  // clear IRQ
+        st25r_cmd(0xC5);  // TRANSMIT_WITHOUT_CRC (transceive: auto-enables RX after TX)
+
+        // CMD_TRANSMIT_WITHOUT_CRC is a transceive: no separate RECEIVE command needed.
+        // Wait directly for rxe (bit4) or col (bit2). No txe-then-RECEIVE sequence!
+        irq = st25r_wait_irq(0x10 | 0x04, 50);
+        {
+            char irq_msg[48];
+            std::snprintf(irq_msg, sizeof(irq_msg), "CL1 irq=0x%02X (rxe=%d col=%d)",
+                          irq, !!(irq & 0x10), !!(irq & 0x04));
+            hexlog.log_event("NFC-I2C", irq_msg);
+        }
+        if (!(irq & (0x10 | 0x04))) {
+            hexlog.log_event("NFC-I2C", "CL1: timeout, no rxe/col");
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+        st25r_read_reg(0x1E, fifo_cnt);
+        {
+            char fcnt_msg[40];
+            std::snprintf(fcnt_msg, sizeof(fcnt_msg), "CL1 FIFO=%d bytes", fifo_cnt);
+            hexlog.log_event("NFC-I2C", fcnt_msg);
+        }
+        if (fifo_cnt < 5) {
+            hexlog.log_event("NFC-I2C", "CL1: FIFO too short (<5 bytes)");
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+        uint8_t cl1[5] = {0};
+        if (!st25r_fifo_read(cl1, 5)) {
+            hexlog.log_event("NFC-I2C", "CL1: FIFO read failed");
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+        {
+            char cl1_msg[64];
+            std::snprintf(cl1_msg, sizeof(cl1_msg), "CL1=%02X%02X%02X%02X%02X",
+                          cl1[0], cl1[1], cl1[2], cl1[3], cl1[4]);
+            hexlog.log_event("NFC-I2C", cl1_msg);
+        }
+
+        // ── SELECT CL1 ───────────────────────────────────────────────────────
+        // CMD_TRANSMIT_WITH_CRC (0xC4) automatically appends 2-byte CRC-A.
+        // Write only 7 data bytes to FIFO (NOT 9); chip adds CRC to make 9 bytes on air.
+        hexlog.log_event("NFC-I2C", "SELECT CL1: ISO14443A_NFC=0x00, 7 bytes, cmd 0xC4 (auto-CRC)");
+        st25r_write_reg(0x05, 0x00);  // clear antcl for SELECT (normal framing + parity)
+        st25r_cmd(0xDB);
+        {
+            const uint8_t sel1[7] = {0x93, 0x70, cl1[0], cl1[1], cl1[2], cl1[3], cl1[4]};
+            st25r_fifo_write(sel1, 7);
+        }
+        st25r_set_ntx(7);   // 7 data bytes; chip appends 2 CRC bytes automatically
+        { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }  // clear IRQ
+        st25r_cmd(0xC4);  // TRANSMIT_WITH_CRC: TX the 7 bytes + auto CRC, then RX
+
+        irq = st25r_wait_irq(0x10 | 0x08, 50);
+        uint8_t sak = 0;
+        {
+            char irq_msg[40];
+            std::snprintf(irq_msg, sizeof(irq_msg), "SELECT CL1 irq=0x%02X (rxe=%d txe=%d)", irq, !!(irq & 0x10), !!(irq & 0x08));
+            hexlog.log_event("NFC-I2C", irq_msg);
+        }
+        if (irq & 0x10) {
+            st25r_read_reg(0x1E, fifo_cnt);
+            if (fifo_cnt >= 1) {
+                uint8_t sak_buf[3] = {0};
+                // Read up to 3 bytes (SAK + optional CRC if no_crc_rx=1)
+                uint8_t to_read = fifo_cnt < 3 ? fifo_cnt : 3;
+                st25r_fifo_read(sak_buf, to_read);
+                sak = sak_buf[0];
+            }
+        }
+        {
+            char sak_msg[32];
+            std::snprintf(sak_msg, sizeof(sak_msg), "SAK=0x%02X cascade=%d", sak, !!(sak & 0x04) && cl1[0] == 0x88);
+            hexlog.log_event("NFC-I2C", sak_msg);
+        }
+
+        // UID cascade: if uid[0]==CT(0x88) AND SAK bit2 set → more levels.
+        const bool cascade = (cl1[0] == 0x88) && (sak & 0x04);
+
+        uint8_t uid_buf[10] = {0};
+        size_t uid_len = 0;
+
+        if (!cascade) {
+            // 4-byte UID: cl1[0..3]
+            std::memcpy(uid_buf, cl1, 4);
+            uid_len = 4;
+        } else {
+            // 7-byte UID: CL1 part = cl1[1..3], CL2 part = cl2[0..3]
+            uid_buf[0] = cl1[1];
+            uid_buf[1] = cl1[2];
+            uid_buf[2] = cl1[3];
+
+            // Anticollision CL2
+            st25r_write_reg(0x05, 0x01);  // antcl for CL2
+            st25r_cmd(0xDB);
+            const uint8_t anticol2[2] = {0x95, 0x20};
+            if (st25r_fifo_write(anticol2, 2)) {
+                st25r_set_ntx(2);
+                { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }
+                st25r_cmd(0xC5);  // transceive
+
+                irq = st25r_wait_irq(0x10 | 0x04, 50);
+                if (irq & (0x10 | 0x04)) {
+                    st25r_read_reg(0x1E, fifo_cnt);
+                    if (fifo_cnt >= 5) {
+                        uint8_t cl2[5] = {0};
+                        if (st25r_fifo_read(cl2, 5)) {
+                            // SELECT CL2 - use CMD_TRANSMIT_WITH_CRC (0xC4), 7 bytes only
+                            st25r_write_reg(0x05, 0x00);  // clear antcl
+                            st25r_cmd(0xDB);
+                            {
+                                const uint8_t sel2[7] = {0x95, 0x70,
+                                    cl2[0], cl2[1], cl2[2], cl2[3], cl2[4]};
+                                st25r_fifo_write(sel2, 7);
+                            }
+                            st25r_set_ntx(7);
+                            { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }
+                            st25r_cmd(0xC4);  // TRANSMIT_WITH_CRC (auto-CRC)
+                            irq = st25r_wait_irq(0x10 | 0x08, 50);
+                            if (irq & 0x10) {
+                                st25r_read_reg(0x1E, fifo_cnt);
+                                if (fifo_cnt >= 1) {
+                                    uint8_t s2[3] = {0};
+                                    uint8_t to_read = fifo_cnt < 3 ? fifo_cnt : 3;
+                                    st25r_fifo_read(s2, to_read);
+                                    sak = s2[0];
+                                }
+                            }
+                            uid_buf[3] = cl2[0];
+                            uid_buf[4] = cl2[1];
+                            uid_buf[5] = cl2[2];
+                            uid_buf[6] = cl2[3];
+                            uid_len = 7;
+                        }
+                    }
+                }
+            }
+            if (uid_len == 0) {
+                // Partial: return the 3 CL1 bytes we already have.
+                uid_len = 3;
+            }
+        }
+
+        // Turn off RF field (keep oscillator on for fast next poll).
+        // TX_CTRL stays at 0x03; it's set before OP_CONTROL each scan so is always safe.
+        st25r_write_reg(0x02, 0x80);
+
+        if (uid_len == 0) return false;
+
+        // Format UID (no colon separators, consistent with GroveNFC path).
+        std::string uid_str;
+        uid_str.reserve(uid_len * 2);
+        for (size_t i = 0; i < uid_len; ++i) {
+            char h[3];
+            std::snprintf(h, sizeof(h), "%02X", uid_buf[i]);
+            uid_str += h;
+        }
+        card.uid = uid_str;
+        card.valid = true;
+        {
+            char done_msg[80];
+            std::snprintf(done_msg, sizeof(done_msg), "Card found: UID=%s SAK=%02X proto=%s",
+                          uid_str.c_str(), sak, card.protocol.c_str());
+            hexlog.log_event("NFC-I2C", done_msg);
+        }
+
+        // Classify by SAK (same mapping as readISO14A).
+        if (sak == 0x08) {
+            card.protocol = "MFC1K";
+            card.detail = "MIFARE Classic 1K (SAK:08)";
+        } else if (sak == 0x18) {
+            card.protocol = "MFC4K";
+            card.detail = "MIFARE Classic 4K (SAK:18)";
+        } else if (sak == 0x09) {
+            card.protocol = "MFCMini";
+            card.detail = "MIFARE Classic Mini (SAK:09)";
+        } else if (sak == 0x10 || sak == 0x11) {
+            card.protocol = "MFPlus";
+            char buf[32]; std::snprintf(buf, sizeof(buf), "MIFARE Plus (SAK:%02X)", sak);
+            card.detail = buf;
+        } else if (sak == 0x20 || sak == 0x28) {
+            card.protocol = "DESFire";
+            char buf[32]; std::snprintf(buf, sizeof(buf), "DESFire/JCOP (SAK:%02X)", sak);
+            card.detail = buf;
+        } else if (sak == 0x00) {
+            // NTAG / Ultralight
+            card.protocol = "NTAG";
+            card.detail = "NTAG/Ultralight (SAK:00)";
+        } else {
+            card.protocol = "ISO14443A";
+            char buf[32]; std::snprintf(buf, sizeof(buf), "ISO14443A (SAK:%02X)", sak);
+            card.detail = buf;
+        }
+        return true;
+#else
+        card.valid = false;
+        card.protocol = "None";
+        card.uid = "";
+        card.detail = "No card";
+        return false;
+#endif
+    }
 
     // Arduino delay() → usleep
     static void delay_ms(int ms)
