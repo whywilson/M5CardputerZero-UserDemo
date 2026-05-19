@@ -5,6 +5,7 @@
 #include "nfc_protocol.hpp"
 #include "nfc_storage.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
@@ -976,6 +977,8 @@ public:
     bool write_magic_uid(UidMagicGeneration generation,
                          const std::string &uid_hex,
                          const std::string &block0_hex,
+                         const std::string &gen4_password,
+                         const std::string &gen2_sector0_key_a,
                          std::string *error = nullptr)
     {
         INfcTransport *transport_raw = nullptr;
@@ -1016,6 +1019,25 @@ public:
             return false;
         }
 
+        std::vector<uint8_t> gen2_key_a;
+        if (!parse_hex_bytes(gen2_sector0_key_a, &gen2_key_a) || gen2_key_a.size() != 6) {
+            if (error) *error = "Sector0 KeyA must be 12 hex";
+            return false;
+        }
+
+        std::string gen4_pw;
+        for (char c : gen4_password) {
+            if (!std::isspace(static_cast<unsigned char>(c))) {
+                gen4_pw.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+            }
+        }
+        if (gen4_pw.size() != 8 ||
+            !std::all_of(gen4_pw.begin(), gen4_pw.end(),
+                         [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); })) {
+            if (error) *error = "Gen4 password must be 8 hex";
+            return false;
+        }
+
         Pn532KillerClient client(transport_raw);
         client.send_wakeup();
         client.sam_configuration(nullptr);
@@ -1027,13 +1049,13 @@ public:
             ok = client.write_gen1a_block0(block0, &op_err);
             break;
         case UidMagicGeneration::Gen2:
-            ok = client.write_gen2_block0(block0, &op_err);
+            ok = client.write_gen2_block0(block0, gen2_key_a, &op_err);
             break;
         case UidMagicGeneration::Gen3:
             ok = client.set_classic_gen3_uid(uid, block0, &op_err);
             break;
         case UidMagicGeneration::Gen4:
-            ok = client.set_gen4_uid(uid, block0, "00000000", &op_err);
+            ok = client.set_gen4_uid(uid, block0, gen4_pw, &op_err);
             break;
         }
 
@@ -1042,6 +1064,42 @@ public:
             return false;
         }
         if (error) error->clear();
+        return true;
+    }
+
+    bool scan_uid_once(std::string *uid_hex, std::string *error)
+    {
+        INfcTransport *transport_raw = nullptr;
+        DeviceKind kind = DeviceKind::Unknown;
+        bool busy = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            busy = scan_.running;
+            transport_raw = transport_.get();
+            kind = connection_.device_kind;
+        }
+
+        if (busy) {
+            if (error) *error = "Scan/dump running";
+            return false;
+        }
+        if (!transport_raw || !transport_raw->is_open()) {
+            if (error) *error = "Device not connected";
+            return false;
+        }
+        if (kind != DeviceKind::PN532 && kind != DeviceKind::PN532Killer) {
+            if (error) *error = "PN532/PN532Killer required";
+            return false;
+        }
+
+        Pn532KillerClient client(transport_raw);
+        client.send_wakeup();
+        client.sam_configuration(nullptr);
+        TagInfo tag;
+        if (!client.in_list_passive_target_iso14443a(&tag, error)) {
+            return false;
+        }
+        if (uid_hex) *uid_hex = tag.uid;
         return true;
     }
 
@@ -1279,6 +1337,13 @@ public:
     std::vector<std::string> load_key_file(const std::string &filename) const
     {
         return storage_.load_key_file(filename);
+    }
+
+    bool save_key_file(const std::string &filename,
+                       const std::vector<std::string> &keys,
+                       std::string *err = nullptr) const
+    {
+        return storage_.save_key_file(filename, keys, err);
     }
 
     // Save keys from a SavedRecord's raw_data (MFC sector trailers) to <uid>.dic.

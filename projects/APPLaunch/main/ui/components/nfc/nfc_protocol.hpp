@@ -935,25 +935,52 @@ public:
             return false;
         }
 
-        std::vector<uint8_t> resp;
-        if (!in_communicate_thru_checked({0xA0, 0x00}, true, &resp, error)) return false;
-        if (resp.size() < 2 || resp[1] != 0x0A) {
-            if (error) *error = "write command not acknowledged";
+        // Gen1A write ACK is a 4-bit frame (0x0A). The PN532 firmware often
+        // reports framing-error status 0x05 for these, even when the write
+        // succeeded. Accept both 0x00 (clean) and 0x05 (framing error) as long
+        // as the ACK byte 0x0A is present in the response data.
+        auto gen1a_ict_write = [&](const std::vector<uint8_t> &payload, bool append_crc,
+                                   const char *step_name) -> bool {
+            std::vector<uint8_t> tx = payload;
+            if (append_crc) {
+                uint8_t lo = 0, hi = 0;
+                compute_crc_a(tx.data(), tx.size(), &lo, &hi);
+                tx.push_back(lo);
+                tx.push_back(hi);
+            }
+            std::vector<uint8_t> resp;
+            in_communicate_thru_raw(tx.data(), tx.size(), &resp, nullptr);
+            // Accept: status 0x00 or 0x05 (framing error from 4-bit ACK), ACK byte 0x0A
+            const bool status_ok = !resp.empty() && (resp[0] == 0x00 || resp[0] == 0x05);
+            if (status_ok && resp.size() >= 2 && resp[1] == 0x0A) return true;
+            if (status_ok && resp.size() == 1 && resp[0] == 0x05) return true; // ACK squeezed into status
+            if (error) {
+                char b[48];
+                if (resp.empty()) std::snprintf(b, sizeof(b), "%s: no response", step_name);
+                else std::snprintf(b, sizeof(b), "%s: status 0x%02X ack 0x%02X",
+                                   step_name, resp[0], resp.size() >= 2 ? resp[1] : 0xFF);
+                *error = b;
+            }
             return false;
-        }
-        if (!in_communicate_thru_checked(block0, true, &resp, error)) return false;
-        if (resp.size() < 2 || resp[1] != 0x0A) {
-            if (error) *error = "write data not acknowledged";
-            return false;
-        }
+        };
+
+        if (!gen1a_ict_write({0xA0, 0x00}, true, "write cmd")) return false;
+        if (!gen1a_ict_write(block0, true, "write data")) return false;
         return true;
     }
 
     // Write Mifare Classic block 0 using authenticated write (CUID/Gen2 style).
-    bool write_gen2_block0(const std::vector<uint8_t> &block0, std::string *error)
+    // key_a must be 6 bytes (Sector0 KeyA).
+    bool write_gen2_block0(const std::vector<uint8_t> &block0,
+                           const std::vector<uint8_t> &key_a,
+                           std::string *error)
     {
         if (block0.size() != 16) {
             if (error) *error = "block0 must be 16 bytes";
+            return false;
+        }
+        if (key_a.size() != 6) {
+            if (error) *error = "Sector0 KeyA must be 6 bytes";
             return false;
         }
 
@@ -974,13 +1001,15 @@ public:
             uid_bytes[uid_bytes.size() - 2],
             uid_bytes[uid_bytes.size() - 1],
         };
-        const uint8_t ff_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        uint8_t key_arr[6] = {
+            key_a[0], key_a[1], key_a[2], key_a[3], key_a[4], key_a[5]
+        };
 
         std::string auth_err;
-        bool authed = mf_authenticate(0, false, ff_key, uid4, &auth_err);
+        bool authed = mf_authenticate(0, false, key_arr, uid4, &auth_err);
         if (!authed) {
             reselect_card_lightweight(nullptr);
-            authed = mf_authenticate(0, true, ff_key, uid4, &auth_err);
+            authed = mf_authenticate(0, true, key_arr, uid4, &auth_err);
         }
         if (!authed) {
             if (error) *error = auth_err.empty() ? "auth sector0 failed" : auth_err;
@@ -1004,8 +1033,10 @@ public:
             return false;
         }
 
-        TagInfo tag;
-        if (!in_list_passive_target_iso14443a(&tag, error)) return false;
+        if (!is_gen3(error)) {
+            if (error && error->empty()) *error = "not Gen3";
+            return false;
+        }
 
         std::vector<uint8_t> cmd_uid = {0x90, 0xFB, 0xCC, 0xCC, 0x07};
         cmd_uid.insert(cmd_uid.end(), uid.begin(), uid.end());

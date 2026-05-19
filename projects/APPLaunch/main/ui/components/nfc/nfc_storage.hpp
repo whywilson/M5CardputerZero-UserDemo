@@ -450,6 +450,35 @@ public:
         return keys;
     }
 
+    // Save hex keys (one 12-char key per line) to a .dic/.txt file.
+    bool save_key_file(const std::string &filename,
+                       const std::vector<std::string> &keys,
+                       std::string *error = nullptr) const
+    {
+        ensure_keys_dir();
+        if (filename.empty()) {
+            if (error) *error = "Missing filename";
+            return false;
+        }
+        const std::string path = keys_dict_dir() + "/" + filename;
+        std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc);
+        if (!out.is_open()) {
+            if (error) *error = "Cannot write key file: " + path;
+            return false;
+        }
+        for (const auto &raw : keys) {
+            std::string hex;
+            for (char c : raw) {
+                if (std::isxdigit(static_cast<unsigned char>(c))) {
+                    hex += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    if (hex.size() == 12) break;
+                }
+            }
+            if (hex.size() == 12) out << hex << "\n";
+        }
+        return true;
+    }
+
     // Extract MIFARE Classic sector-trailer keys from raw dump blocks and save to
     // <keys_dict_dir>/<uid>.dic.  raw_lines: hex strings, one per block (64 blocks for 1K).
     bool save_uid_key_file(const std::string &uid, const std::vector<std::string> &raw_lines,
