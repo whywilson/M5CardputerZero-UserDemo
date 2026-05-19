@@ -125,12 +125,17 @@ private:
     // mfkey64:   0=ready     1=sniffing 2=cracking 3=results
     int  mfkey_step_ = 0;
     std::string mfkey_uid_input_; // hex UID typed by user (mfkey32v2 only)
+    bool mfkey_save_mode_      = false; // save-all-to-file filename input overlay
+    std::string mfkey_save_filename_;   // filename being typed in save overlay
     // MIFARE Keys file-browser sub-mode
     bool mifare_keys_file_mode_ = false;      // false=internal, true=file list
     std::vector<std::string> key_files_;      // .dic/.txt file names
+    std::vector<int> key_file_counts_;        // cached key count per file
     int  key_file_idx_ = 0;                   // selected file
     std::vector<std::string> key_file_keys_;  // keys loaded from selected file
     int  key_file_key_idx_ = 0;               // scroll in loaded key list
+    bool key_file_editing_ = false;
+    bool key_file_dirty_ = false;
     // Port Settings field selection (0=TX 1=RX 2=BAUD)
     int port_settings_field_ = 0;
     // USB port selection (index into usb_endpoints() list)
@@ -142,16 +147,24 @@ private:
     // Cached I2C endpoint list for I2cSelect modal
     std::vector<nfc_app::TransportEndpoint> i2c_select_list_;
     // PN532 NDEF URI input buffer
-    std::string pn532_ndef_uri_ = "https://m5stack.com";
+    std::string pn532_ndef_uri_      = "https://m5stack.com";
+    int         pn532_ndef_type_idx_ = 0; // 0=https 1=http 2=tel 3=mailto 4=custom
+    std::string pn532_ndef_body_     = "m5stack.com";
+    uint32_t    last_key_codepoint_  = 0; // Unicode codepoint of last key event
     // Hex log overlay scroll offset (line index from top)
     int hex_log_scroll_ = 0;
     // UID Changer state
-    int uid_changer_field_idx_ = 0;     // 0=gen 1=uid_len 2=mode 3=input 4=execute
+    int uid_changer_step_ = 0;          // 0=UID 1=Magic type 2=Confirm write
+    int uid_changer_field_idx_ = 0;
     int uid_changer_generation_idx_ = 0; // 0=Gen1A 1=Gen2 2=Gen3 3=Gen4
     int uid_changer_uid_len_idx_ = 0;   // 0=4B 1=7B
+    int uid_changer_source_idx_ = 0;    // 0=input 1=scan
     bool uid_changer_write_block0_ = false;
+    bool uid_changer_block0_manual_ = false; // true = user manually edited Block 0
     std::string uid_changer_uid_input_;
     std::string uid_changer_block0_input_;
+    std::string uid_changer_gen2_keya_input_ = "FFFFFFFFFFFF";
+    std::string uid_changer_gen4_pwd_input_ = "00000000";
 
     static constexpr int TAB_H = 24;
     static constexpr int CONTENT_Y = 26;
@@ -181,6 +194,7 @@ private:
         lv_obj_set_style_border_width(tab_bar, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_pad_all(tab_bar, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_clear_flag(tab_bar, LV_OBJ_FLAG_SCROLLABLE);
+        ui_obj_["tab_bar"] = tab_bar;
 
         const char *titles[4] = {"READ", "SAVED", "EMU", "TOOLS"};
         for (int index = 0; index < 4; ++index) {
@@ -275,9 +289,11 @@ private:
         // Detect EMU dump completion → show toast once
         const bool emu_running_now = self->service_.emu_dump_running();
         if (self->last_emu_dump_running_ && !emu_running_now) {
-            // Dump just finished; service already auto-saved → refresh list + show toast
+            // Dump just finished; refresh records and clear transient status text.
             self->refresh_saved_records();
-            self->show_toast("Saved");
+            if (self->ui_message_.find("Downloading") != std::string::npos) {
+                self->ui_message_ = "Download complete  Ctrl+S: save";
+            }
         }
         self->last_emu_dump_running_ = emu_running_now;
         // Detect HW upload completion → show toast
@@ -393,6 +409,9 @@ private:
         }
 
         if (modal_ != Modal::None) {
+            // Capture Unicode codepoint for character-input modals (more
+            // reliable than keycode_to_char which assumes a fixed layout).
+            last_key_codepoint_ = key_item ? key_item->codepoint : 0;
             handle_modal_key(raw_key, mods);
             return;
         }
@@ -488,6 +507,7 @@ private:
                             break;
                         }
                         scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
+                        scan_log_lines_.push_back(supported_protocols_text());
                     }
                     scan_log_lines_.push_back("> Scan card...");
                     service_.start_scan();
@@ -533,6 +553,13 @@ private:
             if (should_reconnect && !service_.endpoints().empty()) {
                 if (conn0.connected) service_.disconnect();
                 service_.connect_current();
+            }
+        }
+        // If leaving Emulator tab while PN532 NDEF emulation is running, stop it.
+        if (prev_tab == Tab::Emulator && current_tab_ != Tab::Emulator) {
+            if (service_.pn532_ndef_state().running) {
+                service_.stop_pn532_ndef_emulation();
+                ui_message_ = "NDEF emulation stopped";
             }
         }
         const auto conn = service_.connection_state();
@@ -596,7 +623,7 @@ private:
             break;
         }
         case Tab::Tools:
-            tools_idx_ = (tools_idx_ + delta + 5) % 5;
+            tools_idx_ = (tools_idx_ + delta + 4) % 4;
             break;
         }
         render_all();
@@ -738,21 +765,37 @@ private:
     void activate_tool_action()
     {
         active_tool_idx_ = tools_idx_;
-        if (active_tool_idx_ == 0) refresh_mifare_keys();
+        if (active_tool_idx_ == 0) {
+            refresh_mifare_keys();
+            mifare_keys_file_mode_ = true;  // default: show file list
+            refresh_key_files_with_counts();
+            key_file_idx_ = 0;
+            key_file_keys_.clear();
+            key_file_key_idx_ = 0;
+            key_file_editing_ = false;
+            key_file_dirty_ = false;
+        }
         if (active_tool_idx_ == 1) {
+            uid_changer_step_ = 0;
             uid_changer_field_idx_ = 0;
             uid_changer_generation_idx_ = 0;
             uid_changer_uid_len_idx_ = 0;
+            uid_changer_source_idx_ = 0;
             uid_changer_write_block0_ = false;
+            uid_changer_block0_manual_ = false;
             uid_changer_uid_input_.clear();
             uid_changer_block0_input_.clear();
+            uid_changer_gen2_keya_input_ = "FFFFFFFFFFFF";
+            uid_changer_gen4_pwd_input_ = "00000000";
         }
         // Reset MFKey wizard state when (re-)entering the tool
-        if (active_tool_idx_ == 3 || active_tool_idx_ == 4) {
-            mfkey_step_      = 0;
-            mfkey_uid_input_ = "";
+        if (active_tool_idx_ == 2 || active_tool_idx_ == 3) {
+            mfkey_step_           = 0;
+            mfkey_uid_input_      = "";
             mfkey_results_.clear();
-            mfkey_result_idx_ = 0;
+            mfkey_result_idx_     = 0;
+            mfkey_save_mode_      = false;
+            mfkey_save_filename_  = "";
         }
         modal_ = Modal::ToolPage;
         ui_message_ = std::string(tool_name(active_tool_idx_)) + " opened";
@@ -778,6 +821,22 @@ private:
         }
     }
 
+    bool tools_focus_mode() const
+    {
+        return current_tab_ == Tab::Tools && modal_ == Modal::ToolPage;
+    }
+
+    void refresh_key_files_with_counts()
+    {
+        key_files_ = service_.list_key_files();
+        key_file_counts_.clear();
+        key_file_counts_.reserve(key_files_.size());
+        for (const auto &name : key_files_) {
+            key_file_counts_.push_back(static_cast<int>(service_.load_key_file(name).size()));
+        }
+        if (key_file_idx_ >= static_cast<int>(key_files_.size())) key_file_idx_ = 0;
+    }
+
     void render_all()
     {
         update_scan_log();
@@ -795,8 +854,12 @@ private:
 
     void render_tabs()
     {
+        lv_obj_t *tab_bar = ui_obj_["tab_bar"];
+        lv_obj_clear_flag(tab_bar, LV_OBJ_FLAG_HIDDEN);
+
         for (int index = 0; index < 4; ++index) {
             lv_obj_t *item = ui_obj_[std::string("tab_") + std::to_string(index)];
+            lv_obj_clear_flag(item, LV_OBJ_FLAG_HIDDEN);
             const bool active = (index == static_cast<int>(current_tab_));
             lv_obj_set_style_bg_color(item, lv_color_hex(active ? 0xF7A600 : 0x1E1E1E), LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_opa(item, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -807,6 +870,8 @@ private:
     void render_content()
     {
         lv_obj_t *content = ui_obj_["content"];
+        lv_obj_set_pos(content, 0, CONTENT_Y);
+        lv_obj_set_size(content, 320, CONTENT_H);
         lv_obj_clean(content);
 
         switch (current_tab_) {
@@ -1332,12 +1397,12 @@ private:
             create_text(left, 6, 54, "Enter URI + loop", 0x9E9E9E, 10);
 
             create_text(right, 6, 4,  "PN532 Type4 NDEF", 0x8E8E8E, 11);
-            create_text(right, 6, 20, to_compact(ndef.uri, 30).c_str(), 0x00D2FF, 10);
+            create_text(right, 6, 20, to_compact(pn532_ndef_uri_, 30).c_str(), 0x00D2FF, 10);
             create_text(right, 6, 34, to_compact(std::string("Status: ") + ndef.status, 30).c_str(), 0xD8D8D8, 10);
             if (!ndef.error.empty()) {
                 create_text(right, 6, 50, to_compact(std::string("ERR: ") + ndef.error, 30).c_str(), 0xFF8888, 10);
             }
-            create_text(right, 6, 76, "Start/Stop in menu", 0x555555, 10);
+            create_text(right, 6, 76, "OK: Start / Edit URI / Stop", 0x555555, 10);
         } else if (connection.device_kind == nfc_app::DeviceKind::GroveNFC ||
                    connection.device_kind == nfc_app::DeviceKind::NFCUnit) {
             // ── I2C EMU mode (GroveNFC / NFC Unit), 8 slots ───────────────────
@@ -1398,8 +1463,8 @@ private:
         const bool nfc_unit_mode = (conn.device_kind == nfc_app::DeviceKind::NFCUnit);
         const int emu_slot = nfc_unit_mode ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
-        const int n_opts = pn532_ndef_menu ? 2 : (nfc_unit_mode ? (dump_ready ? 3 : 2) : (dump_ready ? 4 : 3));
-        const lv_coord_t card_h = static_cast<lv_coord_t>(pn532_ndef_menu ? 78 : (dump_ready ? 116 : (nfc_unit_mode ? 74 : 94)));
+        const int n_opts = pn532_ndef_menu ? 3 : (nfc_unit_mode ? (dump_ready ? 3 : 2) : (dump_ready ? 4 : 3));
+        const lv_coord_t card_h = static_cast<lv_coord_t>(pn532_ndef_menu ? 98 : (dump_ready ? 116 : (nfc_unit_mode ? 74 : 94)));
         lv_obj_t *card = make_modal_card(overlay, 220, card_h, 0xF7A600);
         if (pn532_ndef_menu) {
             create_text(card, 8, 5, "PN532 NDEF", 0xFFFFFF, 12);
@@ -1413,7 +1478,7 @@ private:
         }
         const char *options[] = {"Download Data", "Upload Data", "Set Default", "Save Dump"};
         const char *nfc_unit_opts[] = {"Download Data", "Upload Data", "Save Dump"};
-        const char *pn532_opts[] = {"Start NDEF Emu", "Stop NDEF Emu"};
+        const char *pn532_opts[] = {"Start NDEF Emu", "Edit URI", "Stop NDEF Emu"};
         for (int i = 0; i < n_opts; ++i) {
             const bool sel = (modal_idx_ == i);
             lv_obj_t *row = lv_obj_create(card);
@@ -1443,54 +1508,88 @@ private:
         lv_obj_set_style_border_width(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *card = make_modal_card(overlay, 280, 100, 0x00D2FF);
-        create_text(card, 8, 5, "PN532 NDEF URI", 0x00D2FF, 12);
-        create_text(card, 8, 22, "Enter URI/Text", 0xD8D8D8, 10);
-        create_text(card, 8, 38, to_compact(pn532_ndef_uri_ + "_", 40).c_str(), 0xFFFFFF, 11);
-        create_text(card, 8, 56, "http(s)/tel/mailto supported", 0x8DB6FF, 10);
-        create_text(card, 8, 74, "Enter:start  Bsp:del  ESC:cancel", 0x7A7A7A, 10);
+        static const char *PFXS[] = {"https://", "http://", "tel:", "mailto:", ""};
+
+        lv_obj_t *card = make_modal_card(overlay, 280, 86, 0x00D2FF);
+        create_text(card, 8, 4, "Edit URI", 0x00D2FF, 12);
+
+        // Type indicator: current prefix shown in yellow; Tab to cycle
+        const char *pfx = PFXS[pn532_ndef_type_idx_];
+        create_text(card, 8, 20,
+                    pfx[0] ? pfx : "(custom)",
+                    pfx[0] ? 0xF7A600 : 0x888888, 10);
+        create_text(card, 170, 20, "[Tab:type]", 0x555555, 9);
+
+        // Body input – tail-compact so cursor stays visible when text is long
+        create_text(card, 8, 36,
+                    to_tail_compact(pn532_ndef_body_ + "_", 36).c_str(),
+                    0xFFFFFF, 11);
+
+        // Hints
+        create_text(card, 8, 56, "Bsp:del  Enter:save", 0x555555, 9);
+        create_text(card, 8, 70, "Tab:type  ESC:cancel", 0x7A7A7A, 9);
     }
 
     void handle_pn532_ndef_input_key(uint32_t key)
     {
+        static const char *PFXS[] = {"https://", "http://", "tel:", "mailto:", ""};
+
         if (key == KEY_ESC) {
             modal_ = Modal::None;
             return;
         }
-        if (key == KEY_BACKSPACE) {
-            if (!pn532_ndef_uri_.empty()) pn532_ndef_uri_.pop_back();
+        if (key == KEY_TAB) {
+            pn532_ndef_type_idx_ = (pn532_ndef_type_idx_ + 1) % 5;
             return;
         }
-        if (key == KEY_ENTER) {
-            std::string err;
-            if (service_.start_pn532_ndef_emulation(pn532_ndef_uri_, &err)) {
-                ui_message_ = "PN532 NDEF emulation running";
-            } else {
-                ui_message_ = err.empty() ? "NDEF start failed" : err;
-            }
+        if (key == KEY_BACKSPACE) {
+            if (!pn532_ndef_body_.empty()) pn532_ndef_body_.pop_back();
+            return;
+        }
+        if (key == KEY_ENTER || key == KEY_KPENTER) {
+            pn532_ndef_uri_ = std::string(PFXS[pn532_ndef_type_idx_]) + pn532_ndef_body_;
             modal_ = Modal::None;
             return;
         }
-        char c = keycode_to_char(key);
-        if (c >= 32 && c < 127 && pn532_ndef_uri_.size() < 96) {
-            pn532_ndef_uri_ += c;
+        // Character input: prefer Unicode codepoint captured by event_handler
+        // (reflects keyboard layout and shift state); fall back to keycode map.
+        uint32_t cp = last_key_codepoint_;
+        if (cp == 0) {
+            const char c = keycode_to_char(key);
+            cp = c ? static_cast<uint32_t>(static_cast<unsigned char>(c)) : 0;
+        }
+        if (cp >= 32 && cp <= 126 && pn532_ndef_body_.size() < 88) {
+            pn532_ndef_body_ += static_cast<char>(cp);
         }
     }
 
     void render_tools_tab(lv_obj_t *parent)
     {
-        // MFKey tools (idx 3/4) use a full-width panel — hide the tool list
-        const bool mfkey_active = (modal_ == Modal::ToolPage) &&
-                                   (active_tool_idx_ == 3 || active_tool_idx_ == 4);
+        const bool tool_page_active = (modal_ == Modal::ToolPage);
+        const bool modal_full_width = tool_page_active ||
+                                      modal_ == Modal::DeviceProbe ||
+                                      modal_ == Modal::UartConfig;
+        const int panel_h = std::max(80, static_cast<int>(lv_obj_get_height(parent)) - 14);
 
         lv_obj_t *detail = nullptr;
-        if (mfkey_active) {
-            detail = create_panel(parent, 0, 0, 320, 104, 0x101010);
+        if (modal_full_width) {
+            if (tool_page_active) {
+                // Box + arrow indicator: box with "<" spanning full height
+                const int sh = panel_h;
+                lv_obj_t *strip = create_panel(parent, 0, 0, 10, sh, 0x1E2D4A);
+                create_text(strip, 2, sh / 2 - 5, "<", 0xAAC4FF, 10);
+                detail = create_panel(parent, 10, 0, 310, sh, 0x101010);
+            } else {
+                detail = create_panel(parent, 0, 0, 320, panel_h, 0x101010);
+            }
         } else {
-            lv_obj_t *list = create_panel(parent, 0, 0, 140, 104, 0x101010);
-            detail = create_panel(parent, 144, 0, 176, 104, 0x101010);
+            lv_obj_t *list = create_panel(parent, 0, 0, 130, panel_h, 0x101010);
+            // Box + arrow on the right edge of the list, spanning full height
+            lv_obj_t *arrow = create_panel(parent, 130, 0, 10, panel_h, 0x1E2D4A);
+            create_text(arrow, 2, panel_h / 2 - 5, ">", 0xAAC4FF, 10);
+            detail = create_panel(parent, 140, 0, 180, panel_h, 0x101010);
 
-            for (int i = 0; i < 5; ++i) {
+            for (int i = 0; i < 4; ++i) {
                 const bool selected = (modal_ == Modal::None) ? (tools_idx_ == i) : (active_tool_idx_ == i);
                 lv_obj_t *row = lv_obj_create(list);
                 lv_obj_remove_style_all(row);
@@ -1516,24 +1615,22 @@ private:
                 create_text(detail, 6, 50, "OK to open manager", 0x8DB6FF, 11);
                 break;
             case 1:
-                create_text(detail, 6, 24, "Change writable card UID", 0xD8D8D8, 11);
-                create_text(detail, 6, 37, "hf mf setuid style flow", 0xD8D8D8, 11);
-                create_text(detail, 6, 50, "OK to view workflow", 0x8DB6FF, 11);
+                create_text(detail, 6, 22, "Change magic Mifare/", 0xD8D8D8, 10);
+                create_text(detail, 6, 34, "Ultralight card UID", 0xD8D8D8, 10);
+                create_text(detail, 6, 48, "Gen1A  Chinese Magic Card", 0x9E9E9E, 10);
+                create_text(detail, 6, 60, "Gen2   CUID", 0x9E9E9E, 10);
+                create_text(detail, 6, 72, "Gen3   Direct Write", 0x9E9E9E, 10);
+                create_text(detail, 6, 84, "Gen4   Ultimate Magic Card", 0x9E9E9E, 10);
                 break;
             case 2:
-                create_text(detail, 6, 24, "Format tag memory", 0xD8D8D8, 11);
-                create_text(detail, 6, 37, "NDEF / blank templates", 0xD8D8D8, 11);
-                create_text(detail, 6, 50, "OK to view workflow", 0x8DB6FF, 11);
+                create_text(detail, 6, 22, "MIFARE Classic sniff", 0xD8D8D8, 11);
+                create_text(detail, 6, 35, "without tag present", 0xD8D8D8, 11);
+                create_text(detail, 6, 50, "PN532Killer required", 0x8DB6FF, 11);
                 break;
             case 3:
-                create_text(detail, 6, 24, "Recover Mifare key", 0xD8D8D8, 11);
-                create_text(detail, 6, 37, "Save to Mifare Keys", 0xD8D8D8, 11);
-                create_text(detail, 6, 50, "PN532Killer mfkey32v2", 0x8DB6FF, 11);
-                break;
-            case 4:
-                create_text(detail, 6, 24, "Recover 64-bit nonce key", 0xD8D8D8, 11);
-                create_text(detail, 6, 37, "Save to Mifare Keys", 0xD8D8D8, 11);
-                create_text(detail, 6, 50, "PN532Killer mfkey64", 0x8DB6FF, 11);
+                create_text(detail, 6, 22, "MIFARE Classic sniff", 0xD8D8D8, 11);
+                create_text(detail, 6, 35, "with tag present", 0xD8D8D8, 11);
+                create_text(detail, 6, 50, "PN532Killer required", 0x8DB6FF, 11);
                 break;
             default: break;
             }
@@ -1724,12 +1821,10 @@ private:
                     break;
                 }
                 scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
+                scan_log_lines_.push_back(supported_protocols_text());
                 ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
-                if (ep.kind == nfc_app::TransportKind::UartSerial) {
-                    // UART uses two-stage menu: connect first, then scan/dump/save/clear.
-                    modal_ = Modal::ReadMenu;
-                    modal_idx_ = 0;
-                }
+                modal_ = Modal::None;
+                modal_idx_ = 0;
                 break;
             }
             case ReadMenuAction::PortSettings:
@@ -1800,8 +1895,10 @@ private:
                         break;
                     }
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
+                    scan_log_lines_.push_back(supported_protocols_text());
                 } else {
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn));
+                    scan_log_lines_.push_back(supported_protocols_text());
                 }
 
                 scan_log_lines_.push_back("> Scan card...");
@@ -1942,6 +2039,7 @@ private:
                     ui_message_ = "Connect failed";
                 } else {
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
+                    scan_log_lines_.push_back(supported_protocols_text());
                     ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
                 }
             }
@@ -2018,6 +2116,7 @@ private:
                     ui_message_ = "Connect failed";
                 } else {
                     scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
+                    scan_log_lines_.push_back(supported_protocols_text());
                     ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
                 }
             }
@@ -2156,16 +2255,13 @@ private:
         struct ToolDesc {
             const char *lines[3];
         };
-        static const ToolDesc descs[5] = {
+        static const ToolDesc descs[4] = {
             {{"Manage MIFARE key dictionary.",
               "Keys used by MFKey32/64 attacks",
               "and sector authentication."}},
             {{"Write UID to Gen1a magic card.",
               "Scan target → type UID → write.",
               "Requires Gen1a/Gen3 card."}},
-            {{"Erase tag to blank/NDEF state.",
-              "Select template, preview blocks,",
-              "then confirm write."}},
             {{"MFKey32v2: nested-nonce attack.",
               "PN532Killer sniff two reads same",
               "sector w/o card → recover key."}},
@@ -2334,7 +2430,7 @@ private:
                 render_uid_changer_tool(parent);
                 return;
             }
-            if (active_tool_idx_ == 3 || active_tool_idx_ == 4) {
+            if (active_tool_idx_ == 2 || active_tool_idx_ == 3) {
                 render_mfkey_wizard(parent);
                 return;
             }
@@ -2346,11 +2442,6 @@ private:
                 create_text(parent, 6, 24, "1. Scan target card", 0xD8D8D8, 11);
                 create_text(parent, 6, 38, "2. Type new UID", 0xD8D8D8, 11);
                 create_text(parent, 6, 52, "3. Write to magic card", 0x8DB6FF, 11);
-                break;
-            case 2:
-                create_text(parent, 6, 24, "Choose blank / NDEF", 0xD8D8D8, 11);
-                create_text(parent, 6, 38, "Preview memory blocks", 0xD8D8D8, 11);
-                create_text(parent, 6, 52, "Confirm before write", 0x8DB6FF, 11);
                 break;
             default: break;
             }
@@ -2370,47 +2461,100 @@ private:
 
         const char *gen_labels[4] = {"Gen1A", "Gen2", "Gen3", "Gen4"};
         const char *len_labels[2] = {"4B", "7B"};
+        const char *source_labels[2] = {"Input", "Scan"};
 
         uid_changer_fix_generation_for_uid_len();
         const std::string uid_input = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
         const std::string block_input = uid_changer_normalize_hex(uid_changer_block0_input_, 32);
-        const std::string preview_block0 = uid_changer_build_block0_from_uid(uid_input);
+        const std::string gen2_key = uid_changer_normalize_hex(uid_changer_gen2_keya_input_, 12);
+        const std::string gen4_pwd = uid_changer_normalize_hex(uid_changer_gen4_pwd_input_, 8);
 
         create_text(parent, 6, 4, "UID Changer", 0xFFFFFF, 12);
+        // Step indicator: ①②③ with current step highlighted
+        {
+            const char *step_ch[3] = {"(1)", "(2)", "(3)"}; // ①②③ UTF-8
+            int sx = 220;
+            for (int si = 0; si < 3; ++si) {
+                const bool cur = (si == uid_changer_step_);
+                create_text(parent, sx, 4, step_ch[si], cur ? 0xF7A600 : 0x444444, cur ? 12 : 10);
+                sx += cur ? 16 : 14;
+            }
+        }
         const std::string dev_line = std::string("Device: ") + nfc_app::to_string(conn.device_kind);
         create_text(parent, 6, 16, to_compact(dev_line, 36).c_str(), supported ? 0x00FF88 : 0xFF8888, 10);
 
-        const uint32_t c0 = (uid_changer_field_idx_ == 0) ? 0xF7A600 : 0xD8D8D8;
-        const uint32_t c1 = (uid_changer_field_idx_ == 1) ? 0xF7A600 : 0xD8D8D8;
-        const uint32_t c2 = (uid_changer_field_idx_ == 2) ? 0xF7A600 : 0xD8D8D8;
-        const uint32_t c3 = (uid_changer_field_idx_ == 3) ? 0x00D2FF : 0xD8D8D8;
-        const uint32_t c4 = (uid_changer_field_idx_ == 4) ? 0x00FF88 : 0x8DB6FF;
+        if (uid_changer_step_ == 0) {
+            const uint32_t c0 = (uid_changer_field_idx_ == 0) ? 0xF7A600 : 0xD8D8D8;
+            const uint32_t c1 = (uid_changer_field_idx_ == 1) ? 0x00D2FF : 0xD8D8D8;
+            const uint32_t c2 = (uid_changer_field_idx_ == 2) ? 0x00D2FF : 0x8DB6FF;
 
-        std::string gen_line = std::string("Gen: ") + gen_labels[uid_changer_generation_idx_];
-        create_text(parent, 6, 28, gen_line.c_str(), c0, 10);
-
-        std::string len_line = std::string("UID: ") + len_labels[uid_changer_uid_len_idx_];
-        create_text(parent, 98, 28, len_line.c_str(), c1, 10);
-
-        const std::string mode_line = std::string("Mode: ") + (uid_changer_write_block0_ ? "Block0" : "UID");
-        create_text(parent, 168, 28, mode_line.c_str(), c2, 10);
-
-        if (!uid_changer_write_block0_) {
-            std::string in = "UID(" + std::to_string(uid_changer_uid_hex_len()) + "): " + uid_input;
-            if (uid_changer_field_idx_ == 3) in += "_";
-            create_text(parent, 6, 42, to_compact(in, 46).c_str(), c3, 10);
-            const std::string p = preview_block0.empty() ? "B0: (waiting UID)" : ("B0: " + preview_block0);
-            create_text(parent, 6, 56, to_compact(p, 46).c_str(), 0x8DB6FF, 10);
-        } else {
-            std::string in = "Block0(32): " + block_input;
-            if (uid_changer_field_idx_ == 3) in += "_";
-            create_text(parent, 6, 42, to_compact(in, 46).c_str(), c3, 10);
-            create_text(parent, 6, 56, "Write raw block0 directly", 0x8DB6FF, 10);
+            create_text(parent, 6, 27, "(1) Set UID", 0xF7A600, 11);
+            // Len toggle row
+            create_text(parent, 6, 40, (std::string("UID Len: ") + len_labels[uid_changer_uid_len_idx_] + "  [L/R]").c_str(), c0, 10);
+            // UID input row
+            {
+                std::string in = std::string("UID(") + std::to_string(uid_changer_uid_hex_len()) + "): " + uid_input;
+                if (uid_changer_field_idx_ == 1) in += "_";
+                create_text(parent, 6, 54, to_compact(in, 46).c_str(), c1, 10);
+            }
+            // Block 0 editable row (auto-filled from UID, or manually edited)
+            {
+                const std::string b0_disp = uid_changer_normalize_hex(uid_changer_block0_input_, 32);
+                std::string b0_line = std::string("Block 0: ") + b0_disp;
+                if (uid_changer_field_idx_ == 2) b0_line += "_";
+                create_text(parent, 6, 68, to_compact(b0_line, 46).c_str(), c2, 10);
+            }
+            create_text(parent, 6, 82, "[S] Scan card from PN532/PN532Killer", 0x00FF88, 10);
+            create_text(parent, 6, 95, "U/D:field Bsp:del [S]:scan Enter:next", 0x666666, 10);
+            return;
         }
 
-        create_text(parent, 6, 72, supported ? "Target: PN532 / PN532Killer" : "Connect PN532 / PN532Killer first", supported ? 0x00FF88 : 0xFF8888, 10);
-        create_text(parent, 6, 86, "[ Enter ] Execute", c4, 10);
-        create_text(parent, 140, 86, "L/R:set  U/D:field", 0x666666, 10);
+        if (uid_changer_step_ == 1) {
+            const uint32_t c0 = (uid_changer_field_idx_ == 0) ? 0xF7A600 : 0xD8D8D8;
+            const uint32_t c1 = (uid_changer_field_idx_ == 1) ? 0x00FF88 : 0x8DB6FF;
+            create_text(parent, 6, 27, "(2) Card Type", 0xF7A600, 11);
+            create_text(parent, 6, 44, (std::string("Type: ") + gen_labels[uid_changer_generation_idx_]).c_str(), c0, 10);
+            create_text(parent, 6, 58, (std::string("UID: ") + uid_input).c_str(), 0x8DB6FF, 10);
+            create_text(parent, 6, 80, "[ Enter ] Next  L/R type  ESC back", c1, 10);
+            return;
+        }
+
+        int row_y = 27;
+        int row = 0;
+        const auto draw_row = [&](const std::string &text, uint32_t color) {
+            create_text(parent, 6, row_y + row * 14, to_compact(text, 46).c_str(), color, 10);
+            ++row;
+        };
+
+        draw_row("(3) Confirm Write", 0xF7A600);
+        draw_row(std::string("UID: ") + uid_input, 0xD8D8D8);
+        draw_row(std::string("Type: ") + gen_labels[uid_changer_generation_idx_], 0xD8D8D8);
+
+        int field_idx = 0;
+        int keya_field = -1;
+        int pwd_field = -1;
+        int execute_field = -1;
+
+        if (uid_changer_generation_idx_ == 0) {
+            // Gen1A: show Block 0 (set in step 1, not editable here)
+            const std::string b0_show = block_input.empty() ? uid_changer_build_block0_from_uid(uid_input) : block_input;
+            draw_row(std::string("Block 0: ") + b0_show, 0x8DB6FF);
+        } else if (uid_changer_generation_idx_ == 1) {
+            keya_field = field_idx++;
+            std::string key_line = "Sector0 KeyA(12): " + gen2_key;
+            if (uid_changer_field_idx_ == keya_field) key_line += "_";
+            draw_row(key_line, uid_changer_field_idx_ == keya_field ? 0x00D2FF : 0xD8D8D8);
+        } else if (uid_changer_generation_idx_ == 3) {
+            pwd_field = field_idx++;
+            std::string pwd_line = "Gen4 PWD(8): " + gen4_pwd;
+            if (uid_changer_field_idx_ == pwd_field) pwd_line += "_";
+            draw_row(pwd_line, uid_changer_field_idx_ == pwd_field ? 0x00D2FF : 0xD8D8D8);
+        }
+
+        execute_field = field_idx++;
+        draw_row("[ Enter ] Confirm Write", uid_changer_field_idx_ == execute_field ? 0x00FF88 : 0x8DB6FF);
+        draw_row(supported ? "Target ready" : "Connect PN532/PN532Killer first", supported ? 0x00FF88 : 0xFF8888);
+        draw_row("U/D field  ESC back", 0x666666);
     }
 
     // ── MFKey step-by-step wizard renderer ───────────────────────────────────
@@ -2422,36 +2566,37 @@ private:
 
         // Title bar with step indicator
         create_text(parent, 8, 4, title, 0xFFFFFF, 12);
+        // ①②③ step indicator
         {
-            char sbuf[16];
-            if (mfkey_step_ < 3)
-                std::snprintf(sbuf, sizeof(sbuf), "Step %d/3", mfkey_step_ + 1);
-            else
-                std::strncpy(sbuf, "Results", sizeof(sbuf));
-            create_text(parent, 260, 4, sbuf, 0x6A6A6A, 10);
+            const char *step_ch[3] = {"(1)", "(2)", "(3)"};
+            int sx = 250;
+            for (int si = 0; si < 3; ++si) {
+                const bool is_cur = (si == (mfkey_step_ < 3 ? mfkey_step_ : 2));
+                const bool is_done = (si < (mfkey_step_ < 3 ? mfkey_step_ : 3));
+                const uint32_t col = is_cur ? 0xF7A600 : (is_done ? 0x00AA55 : 0x444444);
+                create_text(parent, sx, 4, step_ch[si], col, is_cur ? 12 : 10);
+                sx += is_cur ? 16 : 14;
+            }
         }
 
         // ── mfkey32v2 ────────────────────────────────────────────────────────
         if (!with_card) {
             switch (mfkey_step_) {
             case 0: {
-                // Step 1: UID input (optional — Enter with empty = skip UID, use device default)
-                create_text(parent, 8, 22, "Step 1/3  Set sniffer UID (optional)", 0xF7A600, 11);
+                create_text(parent, 8, 22, "(1) Set sniffer UID (optional)", 0xF7A600, 11);
                 create_text(parent, 8, 38, "Target card UID (8 hex chars):", 0xD8D8D8, 11);
                 const std::string disp = mfkey_uid_input_.empty() ? "_" : mfkey_uid_input_ + "_";
                 create_text(parent, 8, 54, disp.c_str(), 0x00FFAA, 12);
                 create_text(parent, 8, 74, "Leave empty to use device default UID", 0x888888, 10);
-                create_text(parent, 8, 90, "Type UID  Bsp:del  Enter:confirm  ESC:back", 0x7A7A7A, 10);
+                create_text(parent, 8, 90, "Bsp:del  Enter:confirm  ESC:back", 0x7A7A7A, 10);
                 break;
             }
             case 1: {
-                // Step 2: Device now in sniffer mode
-                create_text(parent, 8, 22, "Step 2/3  Sniffer active", 0xF7A600, 11);
+                create_text(parent, 8, 22, "(2) Sniffer active", 0xF7A600, 11);
                 if (mfkey_uid_input_.empty()) {
                     create_text(parent, 8, 38, "No UID set. Device uses its own UID.", 0xD8D8D8, 11);
                 } else {
-                    const std::string uid_msg = "UID: " + mfkey_uid_input_;
-                    create_text(parent, 8, 38, uid_msg.c_str(), 0xD8D8D8, 11);
+                    create_text(parent, 8, 38, (std::string("UID: ") + mfkey_uid_input_).c_str(), 0xD8D8D8, 11);
                 }
                 create_text(parent, 8, 54, "Approach reader, capture auth sessions.", 0xD8D8D8, 11);
                 create_text(parent, 8, 70, "Press Enter when done sniffing.", 0x8DB6FF, 11);
@@ -2459,16 +2604,15 @@ private:
                 break;
             }
             case 2: {
-                // Step 3: Cracking
-                const int pct = service_.hw_mfkey_progress();
-                char buf[48];
-                std::snprintf(buf, sizeof(buf), "Cracking... %d%%", pct);
-                create_text(parent, 8, 22, "Step 3/3  Calculating keys", 0xF7A600, 11);
-                create_text(parent, 8, 38, buf, 0xF7A600, 12);
+                const int pct32 = service_.hw_mfkey_progress();
+                char buf32[48];
+                std::snprintf(buf32, sizeof(buf32), "Cracking... %d%%", pct32);
+                create_text(parent, 8, 22, "(3) Calculating keys", 0xF7A600, 11);
+                create_text(parent, 8, 38, buf32, 0xF7A600, 12);
                 create_text(parent, 8, 56, "Running mfkey32v2 on nonce pairs...", 0xD8D8D8, 11);
                 break;
             }
-            default: // step 3 = results
+            default:
                 render_mfkey_results(parent);
                 break;
             }
@@ -2476,17 +2620,15 @@ private:
         // ── mfkey64 ──────────────────────────────────────────────────────────
             switch (mfkey_step_) {
             case 0: {
-                // Step 1: Ready to enter sniffer mode
-                create_text(parent, 8, 22, "Step 1/3  Enter sniffer mode", 0xF7A600, 11);
+                create_text(parent, 8, 22, "(1) Enter sniffer mode", 0xF7A600, 11);
                 create_text(parent, 8, 38, "Place real card on device, then", 0xD8D8D8, 11);
                 create_text(parent, 8, 54, "let reader authenticate the card.", 0xD8D8D8, 11);
-                create_text(parent, 8, 70, "Press Enter to start card-present sniffing.", 0x8DB6FF, 11);
-                create_text(parent, 8, 90, "Enter:enter sniff  ESC:back", 0x7A7A7A, 10);
+                create_text(parent, 8, 70, "Press Enter to start sniffing.", 0x8DB6FF, 11);
+                create_text(parent, 8, 90, "Enter:start  ESC:back", 0x7A7A7A, 10);
                 break;
             }
             case 1: {
-                // Step 2: Device in card-present sniffer mode
-                create_text(parent, 8, 22, "Step 2/3  Sniffer active (card)", 0xF7A600, 11);
+                create_text(parent, 8, 22, "(2) Sniffer active (card-present)", 0xF7A600, 11);
                 create_text(parent, 8, 38, "Device is in card-present sniffer mode.", 0xD8D8D8, 11);
                 create_text(parent, 8, 54, "Hold card near reader, let it auth.", 0xD8D8D8, 11);
                 create_text(parent, 8, 70, "Press Enter when auth captured.", 0x8DB6FF, 11);
@@ -2494,16 +2636,15 @@ private:
                 break;
             }
             case 2: {
-                // Step 3: Cracking
-                const int pct = service_.hw_mfkey_progress();
-                char buf[48];
-                std::snprintf(buf, sizeof(buf), "Cracking... %d%%", pct);
-                create_text(parent, 8, 22, "Step 3/3  Calculating keys", 0xF7A600, 11);
-                create_text(parent, 8, 38, buf, 0xF7A600, 12);
+                const int pct64 = service_.hw_mfkey_progress();
+                char buf64[48];
+                std::snprintf(buf64, sizeof(buf64), "Cracking... %d%%", pct64);
+                create_text(parent, 8, 22, "(3) Calculating keys", 0xF7A600, 11);
+                create_text(parent, 8, 38, buf64, 0xF7A600, 12);
                 create_text(parent, 8, 56, "Running mfkey64 on captured auth...", 0xD8D8D8, 11);
                 break;
             }
-            default: // step 3 = results
+            default:
                 render_mfkey_results(parent);
                 break;
             }
@@ -2544,6 +2685,15 @@ private:
             std::snprintf(val, sizeof(val), "%s", kd.c_str());
             create_text(row, 4, 1, col, sel ? 0x000000 : 0xFFFFFF, 10);
             create_text(row, 80, 1, val, sel ? 0x2F2F2F : 0x8DB6FF, 10);
+        }
+        create_text(parent, 6, 92, "Enter:import  S:save all  R:retry  ESC:back", 0x7A7A7A, 10);
+        // Save-to-file filename input overlay
+        if (mfkey_save_mode_) {
+            lv_obj_t *box = create_panel(parent, 16, 26, 288, 62, 0x131320);
+            create_text(box, 6, 4, "Save all keys to file (.dic added):", 0xD0D0D0, 11);
+            const std::string disp = mfkey_save_filename_.empty() ? "_" : mfkey_save_filename_ + "_";
+            create_text(box, 6, 20, disp.c_str(), 0xFFFF00, 12);
+            create_text(box, 6, 44, "Enter:confirm  ESC:cancel", 0x7A7A7A, 10);
         }
     }
 
@@ -2591,17 +2741,59 @@ private:
                         const bool sel = (idx == key_file_idx_);
                         lv_obj_t *row = lv_obj_create(parent);
                         lv_obj_remove_style_all(row);
-                        lv_obj_set_size(row, 164, 18);
+                        lv_obj_set_size(row, 306, 18);
                         lv_obj_set_pos(row, 6, 20 + r * 18);
                         lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0x00D2FF : 0x181818), LV_PART_MAIN | LV_STATE_DEFAULT);
                         lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
                         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-                        create_text(row, 4, 4, to_compact(key_files_[static_cast<size_t>(idx)], 20).c_str(), sel ? 0x000000 : 0xD0D0D0, 10);
+                        const int cnt = (idx < static_cast<int>(key_file_counts_.size())) ? key_file_counts_[static_cast<size_t>(idx)] : 0;
+                        const std::string left = to_compact(key_files_[static_cast<size_t>(idx)], 24);
+                        const std::string right = std::to_string(cnt) + " keys";
+                        create_text(row, 4, 4, left.c_str(), sel ? 0x000000 : 0xD0D0D0, 10);
+                        create_text(row, 210, 4, right.c_str(), sel ? 0x1A1A1A : 0x8DB6FF, 10);
                     }
                 }
                 create_text(parent, 6, 92, "U/D select  Enter:load file  ESC back", 0x7A7A7A, 10);
             } else {
-                // Show keys from loaded file
+                if (key_file_editing_) {
+                    const int total = std::max(1, static_cast<int>(key_file_keys_.size()));
+                    if (key_file_key_idx_ >= total) key_file_key_idx_ = total - 1;
+                    if (key_file_key_idx_ < 0) key_file_key_idx_ = 0;
+
+                    const std::string fname = key_file_idx_ < static_cast<int>(key_files_.size())
+                        ? key_files_[static_cast<size_t>(key_file_idx_)] : "";
+                    create_text(parent, 6, 16, to_compact(fname, 28).c_str(), 0x00D2FF, 10);
+                    create_text(parent, 190, 16, key_file_dirty_ ? "*dirty" : "saved", key_file_dirty_ ? 0xF7A600 : 0x6A6A6A, 10);
+
+                    constexpr int visible = 4;
+                    int offset = key_file_key_idx_ - 1;
+                    if (offset < 0) offset = 0;
+                    if (offset > total - visible) offset = total - visible;
+                    if (offset < 0) offset = 0;
+                    for (int r = 0; r < visible; ++r) {
+                        const int idx = offset + r;
+                        if (idx >= total) break;
+                        const bool sel = (idx == key_file_key_idx_);
+                        lv_obj_t *row = lv_obj_create(parent);
+                        lv_obj_remove_style_all(row);
+                        lv_obj_set_size(row, 306, 16);
+                        lv_obj_set_pos(row, 6, 28 + r * 16);
+                        lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0x00D2FF : 0x181818), LV_PART_MAIN | LV_STATE_DEFAULT);
+                        lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+                        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+                        const std::string key_hex = idx < static_cast<int>(key_file_keys_.size()) ? key_file_keys_[static_cast<size_t>(idx)] : "";
+                        const std::string disp = key_hex + (sel ? "_" : "");
+                        char idx_buf[8];
+                        std::snprintf(idx_buf, sizeof(idx_buf), "%03d", idx + 1);
+                        create_text(row, 4, 3, idx_buf, sel ? 0x000000 : 0x7A7A7A, 10);
+                        create_text(row, 40, 3, to_compact(disp, 24).c_str(), sel ? 0x000000 : 0x8DB6FF, 10);
+                    }
+                    create_text(parent, 6, 92, "Hex edit  Enter:+line  Del:line  S:save", 0x7A7A7A, 10);
+                    create_text(parent, 6, 104, "U/D line  Bsp:erase  ESC back", 0x7A7A7A, 10);
+                    return;
+                }
+
+                // Show keys from loaded file (browse mode)
                 const int total = static_cast<int>(key_file_keys_.size());
                 constexpr int visible = 4;
                 int offset = key_file_key_idx_ - 1;
@@ -2618,7 +2810,7 @@ private:
                     const bool sel = (idx == key_file_key_idx_);
                     lv_obj_t *row = lv_obj_create(parent);
                     lv_obj_remove_style_all(row);
-                    lv_obj_set_size(row, 164, 16);
+                    lv_obj_set_size(row, 306, 16);
                     lv_obj_set_pos(row, 6, 26 + r * 16);
                     lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0x00D2FF : 0x181818), LV_PART_MAIN | LV_STATE_DEFAULT);
                     lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -2628,7 +2820,7 @@ private:
                 char countbuf[32];
                 std::snprintf(countbuf, sizeof(countbuf), "%d keys", total);
                 create_text(parent, 6, 92, countbuf, 0x7A7A7A, 10);
-                create_text(parent, 50, 92, "  Enter:add to Built-in  Bsp:back", 0x7A7A7A, 10);
+                create_text(parent, 50, 92, "  Enter:edit file  Bsp:back", 0x7A7A7A, 10);
             }
             return;
         }
@@ -2862,7 +3054,8 @@ private:
 
     void create_footer(lv_obj_t *parent, const std::string &text)
     {
-        lv_obj_t *footer = create_panel(parent, 0, 106, 320, 14, 0x0A0A0A);
+        const int footer_y = std::max(0, static_cast<int>(lv_obj_get_height(parent)) - 14);
+        lv_obj_t *footer = create_panel(parent, 0, footer_y, 320, 14, 0x0A0A0A);
         create_text(footer, 4, 1, to_compact(text, 52).c_str(), 0x7FA5C9, 10);
     }
 
@@ -2917,10 +3110,18 @@ private:
         return text.substr(0, max_len - 3) + "...";
     }
 
+    // For text-input fields: show tail so the cursor "_" is always visible.
+    static std::string to_tail_compact(const std::string &text, size_t max_len)
+    {
+        if (text.size() <= max_len) return text;
+        if (max_len < 4) return text.substr(text.size() - max_len);
+        return "..." + text.substr(text.size() - (max_len - 3));
+    }
+
     static const char *tool_name(int index)
     {
-        static const char *TOOLS[5] = {"Mifare Keys", "UID Changer", "Tag Formater", "MFKey32v2", "MFkey64"};
-        if (index < 0 || index >= 5) return TOOLS[0];
+        static const char *TOOLS[4] = {"MIFARE Keys", "UID Changer", "MFKey32v2", "MFKey64"};
+        if (index < 0 || index >= 4) return TOOLS[0];
         return TOOLS[index];
     }
 
@@ -3342,7 +3543,7 @@ private:
         const bool nfc_unit_mode = (dev_kind == nfc_app::DeviceKind::NFCUnit);
         const int emu_slot = nfc_unit_mode ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
-        const int n_opts = pn532_ndef_menu ? 2 : (nfc_unit_mode ? (dump_ready ? 3 : 2) : (dump_ready ? 4 : 3));
+        const int n_opts = pn532_ndef_menu ? 3 : (nfc_unit_mode ? (dump_ready ? 3 : 2) : (dump_ready ? 4 : 3));
         switch (key) {
         case KEY_UP:
         case KEY_F:    modal_idx_ = (modal_idx_ + n_opts - 1) % n_opts; break;
@@ -3356,11 +3557,36 @@ private:
             }
             if (pn532_ndef_menu) {
                 if (modal_idx_ == 0) {
-                    modal_ = Modal::Pn532NdefInput;
+                    // Start NDEF Emu with current URI directly
+                    std::string err;
+                    if (service_.start_pn532_ndef_emulation(pn532_ndef_uri_, &err)) {
+                        ui_message_ = "PN532 NDEF emulation running";
+                    } else {
+                        ui_message_ = err.empty() ? "NDEF start failed" : err;
+                    }
+                    modal_ = Modal::None;
                     modal_idx_ = 0;
                     break;
                 }
                 if (modal_idx_ == 1) {
+                    // Edit URI: parse existing URI to pre-fill type + body
+                    static const char *PFXS[] = {"https://", "http://", "tel:", "mailto:"};
+                    pn532_ndef_type_idx_ = 4; // default: custom
+                    pn532_ndef_body_ = pn532_ndef_uri_;
+                    for (int i = 0; i < 4; ++i) {
+                        const size_t plen = strlen(PFXS[i]);
+                        if (pn532_ndef_uri_.size() >= plen &&
+                            pn532_ndef_uri_.substr(0, plen) == PFXS[i]) {
+                            pn532_ndef_type_idx_ = i;
+                            pn532_ndef_body_ = pn532_ndef_uri_.substr(plen);
+                            break;
+                        }
+                    }
+                    modal_ = Modal::Pn532NdefInput;
+                    modal_idx_ = 0;
+                    break;
+                }
+                if (modal_idx_ == 2) {
                     service_.stop_pn532_ndef_emulation();
                     ui_message_ = "PN532 NDEF emulation stopped";
                     modal_ = Modal::None;
@@ -3553,104 +3779,244 @@ private:
     void handle_uid_changer_tool_key(uint32_t key)
     {
         if (key == KEY_ESC) {
-            modal_ = Modal::None;
+            if (uid_changer_step_ > 0) {
+                --uid_changer_step_;
+                uid_changer_field_idx_ = 0;
+            } else {
+                modal_ = Modal::None;
+            }
             return;
         }
 
-        const bool editing_input = (uid_changer_field_idx_ == 3);
-
-        if ((key == KEY_UP || (!editing_input && key == KEY_F))) {
-            uid_changer_field_idx_ = (uid_changer_field_idx_ + 4) % 5;
+        if (uid_changer_step_ == 0) {
+            // [S] key: scan UID from card at any time
+            if (key == KEY_S) {
+                std::string scanned_uid, scan_err;
+                if (service_.scan_uid_once(&scanned_uid, &scan_err)) {
+                    uid_changer_uid_input_ = uid_changer_normalize_hex(scanned_uid, 14);
+                    if (uid_changer_uid_input_.size() == 8)  uid_changer_uid_len_idx_ = 0;
+                    else if (uid_changer_uid_input_.size() == 14) uid_changer_uid_len_idx_ = 1;
+                    uid_changer_fix_generation_for_uid_len();
+                    // Auto-rebuild Block 0 from scanned UID
+                    uid_changer_block0_manual_ = false;
+                    const std::string uid_hex_s = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+                    uid_changer_block0_input_ = uid_changer_build_block0_from_uid(uid_hex_s);
+                    ui_message_ = "UID scanned";
+                } else {
+                    ui_message_ = scan_err.empty() ? "Scan UID failed" : scan_err;
+                }
+                return;
+            }
+            const int field_count = 3; // 0=Len, 1=UID input, 2=Block 0
+            if (key == KEY_UP || key == KEY_F) {
+                uid_changer_field_idx_ = (uid_changer_field_idx_ + field_count - 1) % field_count;
+                return;
+            }
+            if (key == KEY_DOWN || (uid_changer_field_idx_ != 2 && key == KEY_X)) {
+                uid_changer_field_idx_ = (uid_changer_field_idx_ + 1) % field_count;
+                return;
+            }
+            if (key == KEY_LEFT || key == KEY_RIGHT) {
+                const int delta = (key == KEY_LEFT) ? -1 : 1;
+                if (uid_changer_field_idx_ == 0) {
+                    uid_changer_uid_len_idx_ = (uid_changer_uid_len_idx_ + delta + 2) % 2;
+                    uid_changer_fix_generation_for_uid_len();
+                    uid_changer_uid_input_ = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+                    if (!uid_changer_block0_manual_) {
+                        const std::string uid_hex_s = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+                        uid_changer_block0_input_ = uid_changer_build_block0_from_uid(uid_hex_s);
+                    }
+                }
+                return;
+            }
+            if (uid_changer_field_idx_ == 1) {
+                if (key == KEY_BACKSPACE) {
+                    if (!uid_changer_uid_input_.empty()) uid_changer_uid_input_.pop_back();
+                    if (!uid_changer_block0_manual_) {
+                        const std::string uid_hex_s = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+                        uid_changer_block0_input_ = uid_changer_build_block0_from_uid(uid_hex_s);
+                    }
+                    return;
+                }
+                const char ch = keycode_to_hex_char(key);
+                if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F')) {
+                    const size_t max_uid = static_cast<size_t>(uid_changer_uid_hex_len());
+                    if (uid_changer_uid_input_.size() < max_uid) uid_changer_uid_input_.push_back(ch);
+                    if (!uid_changer_block0_manual_) {
+                        const std::string uid_hex_s = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+                        uid_changer_block0_input_ = uid_changer_build_block0_from_uid(uid_hex_s);
+                    }
+                    return;
+                }
+            }
+            if (uid_changer_field_idx_ == 2) {
+                if (key == KEY_BACKSPACE) {
+                    if (!uid_changer_block0_input_.empty()) {
+                        uid_changer_block0_input_.pop_back();
+                        uid_changer_block0_manual_ = true;
+                    }
+                    return;
+                }
+                const char ch = keycode_to_hex_char(key);
+                if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F')) {
+                    if (uid_changer_block0_input_.size() < 32) {
+                        uid_changer_block0_input_.push_back(ch);
+                        uid_changer_block0_manual_ = true;
+                    }
+                    return;
+                }
+            }
+            if (key == KEY_ENTER) {
+                const std::string uid_hex = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+                if (uid_hex.size() != static_cast<size_t>(uid_changer_uid_hex_len())) {
+                    ui_message_ = "UID incomplete - type or [S] scan";
+                    return;
+                }
+                // BCC validation for 4B UID
+                const std::string b0 = uid_changer_normalize_hex(uid_changer_block0_input_, 32);
+                if (b0.size() == 32 && uid_changer_uid_len_idx_ == 0) {
+                    auto hb = [&](int i) -> uint8_t {
+                        auto d = [](char c) -> uint8_t {
+                            return (c >= '0' && c <= '9') ? static_cast<uint8_t>(c - '0') : static_cast<uint8_t>(c - 'A' + 10);
+                        };
+                        return static_cast<uint8_t>((d(b0[i * 2]) << 4) | d(b0[i * 2 + 1]));
+                    };
+                    const uint8_t expected_bcc = hb(0) ^ hb(1) ^ hb(2) ^ hb(3);
+                    const uint8_t got_bcc = hb(4);
+                    if (expected_bcc != got_bcc) {
+                        char buf[48];
+                        std::snprintf(buf, sizeof(buf), "Block 0 BCC: got %02X expect %02X", got_bcc, expected_bcc);
+                        ui_message_ = buf;
+                        return;
+                    }
+                }
+                uid_changer_step_ = 1;
+                uid_changer_field_idx_ = 0;
+            }
             return;
         }
-        if ((key == KEY_DOWN || (!editing_input && key == KEY_X))) {
-            uid_changer_field_idx_ = (uid_changer_field_idx_ + 1) % 5;
-            return;
-        }
 
-        if (key == KEY_LEFT || key == KEY_RIGHT) {
-            const int delta = (key == KEY_LEFT) ? -1 : 1;
-            if (uid_changer_field_idx_ == 0) {
+        if (uid_changer_step_ == 1) {
+            const int field_count = 2;
+            if (key == KEY_UP || key == KEY_F) {
+                uid_changer_field_idx_ = (uid_changer_field_idx_ + field_count - 1) % field_count;
+                return;
+            }
+            if (key == KEY_DOWN || key == KEY_X) {
+                uid_changer_field_idx_ = (uid_changer_field_idx_ + 1) % field_count;
+                return;
+            }
+            if ((key == KEY_LEFT || key == KEY_RIGHT) && uid_changer_field_idx_ == 0) {
+                const int delta = (key == KEY_LEFT) ? -1 : 1;
                 int next = uid_changer_generation_idx_;
                 for (int i = 0; i < 4; ++i) {
                     next = (next + delta + 4) % 4;
                     if (uid_changer_generation_allowed(next, uid_changer_uid_len_idx_)) break;
                 }
                 uid_changer_generation_idx_ = next;
-            } else if (uid_changer_field_idx_ == 1) {
-                uid_changer_uid_len_idx_ = (uid_changer_uid_len_idx_ + delta + 2) % 2;
-                uid_changer_fix_generation_for_uid_len();
-                uid_changer_uid_input_ = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
-            } else if (uid_changer_field_idx_ == 2) {
-                uid_changer_write_block0_ = !uid_changer_write_block0_;
-            }
-            return;
-        }
-
-        if (key == KEY_ENTER) {
-            if (uid_changer_field_idx_ == 4) {
-                const auto conn = service_.connection_state();
-                if (!conn.connected ||
-                    (conn.device_kind != nfc_app::DeviceKind::PN532 &&
-                     conn.device_kind != nfc_app::DeviceKind::PN532Killer)) {
-                    ui_message_ = "Connect PN532/PN532Killer first";
-                    return;
-                }
-
-                std::string uid_hex;
-                std::string block0_hex;
-                if (!uid_changer_write_block0_) {
-                    uid_hex = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
-                    if (uid_hex.size() != static_cast<size_t>(uid_changer_uid_hex_len())) {
-                        ui_message_ = "Invalid UID length";
-                        return;
-                    }
-                    block0_hex = uid_changer_build_block0_from_uid(uid_hex);
-                    if (block0_hex.size() != 32) {
-                        ui_message_ = "Block0 build failed";
-                        return;
-                    }
-                } else {
-                    block0_hex = uid_changer_normalize_hex(uid_changer_block0_input_, 32);
-                    if (block0_hex.size() != 32) {
-                        ui_message_ = "Block0 must be 32 hex";
-                        return;
-                    }
-                    const int uid_len = uid_changer_uid_hex_len();
-                    uid_hex = block0_hex.substr(0, static_cast<size_t>(uid_len));
-                }
-
-                std::string err;
-                if (service_.write_magic_uid(uid_changer_generation(), uid_hex, block0_hex, &err)) {
-                    ui_message_ = "UID write success";
-                } else {
-                    ui_message_ = err.empty() ? "UID write failed" : err;
-                }
                 return;
             }
-            uid_changer_field_idx_ = (uid_changer_field_idx_ + 1) % 5;
-            return;
-        }
-
-        if (key == KEY_BACKSPACE && uid_changer_field_idx_ == 3) {
-            if (uid_changer_write_block0_) {
-                if (!uid_changer_block0_input_.empty()) uid_changer_block0_input_.pop_back();
-            } else {
-                if (!uid_changer_uid_input_.empty()) uid_changer_uid_input_.pop_back();
-            }
-            return;
-        }
-
-        if (uid_changer_field_idx_ == 3) {
-            const char ch = keycode_to_hex_char(key);
-            if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F')) {
-                if (uid_changer_write_block0_) {
-                    if (uid_changer_block0_input_.size() < 32) uid_changer_block0_input_.push_back(ch);
+            if (key == KEY_ENTER) {
+                if (uid_changer_field_idx_ == 1) {
+                    uid_changer_step_ = 2;
+                    uid_changer_field_idx_ = 0;
                 } else {
-                    const size_t max_uid = static_cast<size_t>(uid_changer_uid_hex_len());
-                    if (uid_changer_uid_input_.size() < max_uid) uid_changer_uid_input_.push_back(ch);
+                    uid_changer_field_idx_ = (uid_changer_field_idx_ + 1) % field_count;
                 }
             }
+            return;
+        }
+
+        int field_count = 0;
+        int keya_field = -1;
+        int pwd_field = -1;
+        int execute_field = -1;
+        if (uid_changer_generation_idx_ == 1) {
+            keya_field = field_count++;
+        } else if (uid_changer_generation_idx_ == 3) {
+            pwd_field = field_count++;
+        }
+        execute_field = field_count++;
+
+        const bool editing_hex = (uid_changer_field_idx_ == keya_field ||
+                                  uid_changer_field_idx_ == pwd_field);
+        if (key == KEY_UP || (!editing_hex && key == KEY_F)) {
+            uid_changer_field_idx_ = (uid_changer_field_idx_ + field_count - 1) % field_count;
+            return;
+        }
+        if (key == KEY_DOWN || (!editing_hex && key == KEY_X)) {
+            uid_changer_field_idx_ = (uid_changer_field_idx_ + 1) % field_count;
+            return;
+        }
+
+        if (key == KEY_BACKSPACE) {
+            if (uid_changer_field_idx_ == keya_field && !uid_changer_gen2_keya_input_.empty()) {
+                uid_changer_gen2_keya_input_.pop_back();
+            } else if (uid_changer_field_idx_ == pwd_field && !uid_changer_gen4_pwd_input_.empty()) {
+                uid_changer_gen4_pwd_input_.pop_back();
+            }
+            return;
+        }
+
+        const char ch = keycode_to_hex_char(key);
+        if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F')) {
+            if (uid_changer_field_idx_ == keya_field) {
+                if (uid_changer_gen2_keya_input_.size() < 12) uid_changer_gen2_keya_input_.push_back(ch);
+                return;
+            }
+            if (uid_changer_field_idx_ == pwd_field) {
+                if (uid_changer_gen4_pwd_input_.size() < 8) uid_changer_gen4_pwd_input_.push_back(ch);
+                return;
+            }
+        }
+
+        if (key != KEY_ENTER) return;
+
+        if (uid_changer_field_idx_ != execute_field) {
+            uid_changer_field_idx_ = (uid_changer_field_idx_ + 1) % field_count;
+            return;
+        }
+
+        const auto conn = service_.connection_state();
+        if (!conn.connected ||
+            (conn.device_kind != nfc_app::DeviceKind::PN532 &&
+             conn.device_kind != nfc_app::DeviceKind::PN532Killer)) {
+            ui_message_ = "Connect PN532/PN532Killer first";
+            return;
+        }
+
+        std::string uid_hex = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+        if (uid_hex.size() != static_cast<size_t>(uid_changer_uid_hex_len())) {
+            ui_message_ = "Invalid UID length";
+            return;
+        }
+
+        // Use Block 0 from step 0 (uid_changer_block0_input_), fall back to build from UID
+        std::string block0_hex = uid_changer_normalize_hex(uid_changer_block0_input_, 32);
+        if (block0_hex.size() != 32) {
+            block0_hex = uid_changer_build_block0_from_uid(uid_hex);
+        }
+        if (block0_hex.size() != 32) {
+            ui_message_ = "Block 0 build failed";
+            return;
+        }
+
+        const std::string key_a = uid_changer_normalize_hex(uid_changer_gen2_keya_input_, 12);
+        if (key_a.size() != 12) {
+            ui_message_ = "KeyA must be 12 hex";
+            return;
+        }
+        const std::string gen4_pwd = uid_changer_normalize_hex(uid_changer_gen4_pwd_input_, 8);
+        if (gen4_pwd.size() != 8) {
+            ui_message_ = "Gen4 password must be 8 hex";
+            return;
+        }
+
+        std::string err;
+        if (service_.write_magic_uid(uid_changer_generation(), uid_hex, block0_hex, gen4_pwd, key_a, &err)) {
+            ui_message_ = "UID write success";
+        } else {
+            ui_message_ = err.empty() ? "UID write failed" : err;
         }
     }
 
@@ -3716,12 +4082,19 @@ private:
         const int total_rows = static_cast<int>(mifare_keys_.size()) + 1;
         if (key == KEY_ESC) {
             if (mifare_keys_file_mode_) {
-                if (!key_file_keys_.empty()) {
-                    // Go back to file list
+                if (key_file_editing_) {
+                    // Skip browse mode: go directly back to file list
+                    key_file_editing_ = false;
+                    key_file_dirty_ = false;
                     key_file_keys_.clear();
+                    key_file_key_idx_ = 0;
+                } else if (!key_file_keys_.empty()) {
+                    // Back to file list from browse mode
+                    key_file_keys_.clear();
+                    key_file_key_idx_ = 0;
                 } else {
-                    // Exit file mode
-                    mifare_keys_file_mode_ = false;
+                    // Exit tool from file list
+                    modal_ = Modal::None;
                 }
             } else {
                 modal_ = Modal::None;
@@ -3731,13 +4104,13 @@ private:
         // TAB: switch between built-in and file mode
         if (key == KEY_TAB) {
             if (!mifare_keys_file_mode_) {
-                // Entering file mode: also try to toggle key if on a key row (for power users)
-                // Actually just switch mode; TAB-as-toggle is confusing when file mode is active
                 mifare_keys_file_mode_ = true;
-                key_files_ = service_.list_key_files();
+                refresh_key_files_with_counts();
                 key_file_idx_ = 0;
                 key_file_keys_.clear();
                 key_file_key_idx_ = 0;
+                key_file_editing_ = false;
+                key_file_dirty_ = false;
             } else {
                 mifare_keys_file_mode_ = false;
             }
@@ -3755,34 +4128,77 @@ private:
                 } else if (key == KEY_ENTER && fn > 0 && key_file_idx_ < fn) {
                     key_file_keys_ = service_.load_key_file(key_files_[static_cast<size_t>(key_file_idx_)]);
                     key_file_key_idx_ = 0;
+                    key_file_editing_ = !key_file_keys_.empty(); // enter edit directly
+                    key_file_dirty_ = false;
                     if (key_file_keys_.empty()) ui_message_ = "File is empty";
                 }
-            } else {
+            } else if (!key_file_editing_) {
                 // Key list navigation within loaded file
                 const int kt = static_cast<int>(key_file_keys_.size());
-                if (key == KEY_UP) {
+                if (key == KEY_UP && kt > 0) {
                     key_file_key_idx_ = (key_file_key_idx_ - 1 + kt) % kt;
-                } else if (key == KEY_DOWN) {
+                } else if (key == KEY_DOWN && kt > 0) {
                     key_file_key_idx_ = (key_file_key_idx_ + 1) % kt;
                 } else if (key == KEY_BACKSPACE) {
                     key_file_keys_.clear();
                     key_file_key_idx_ = 0;
                 } else if (key == KEY_ENTER && key_file_key_idx_ < kt) {
-                    // Add selected key to built-in list
-                    const std::string &hex = key_file_keys_[static_cast<size_t>(key_file_key_idx_)];
-                    nfc_app::MifareKeyRecord rec{};
-                    rec.key_hex = hex;
-                    const std::string fname = key_file_idx_ < fn ? key_files_[static_cast<size_t>(key_file_idx_)] : "";
-                    // Derive a short label from filename without extension
-                    rec.label = fname.empty() ? "from_file" : fname.substr(0, fname.rfind('.'));
-                    rec.created_at = nfc_app::iso8601_now();
-                    rec.enabled = true;
+                    key_file_editing_ = true;
+                    key_file_dirty_ = false;
+                }
+            } else {
+                // Dump-style key file editor
+                int kt = static_cast<int>(key_file_keys_.size());
+                if (kt == 0) {
+                    key_file_keys_.push_back("");
+                    kt = 1;
+                    key_file_key_idx_ = 0;
+                }
+                if (key == KEY_UP && kt > 0) {
+                    key_file_key_idx_ = (key_file_key_idx_ - 1 + kt) % kt;
+                } else if (key == KEY_DOWN && kt > 0) {
+                    key_file_key_idx_ = (key_file_key_idx_ + 1) % kt;
+                } else if (key == KEY_ENTER) {
+                    const int insert_at = std::min(key_file_key_idx_ + 1, kt);
+                    key_file_keys_.insert(key_file_keys_.begin() + insert_at, std::string());
+                    key_file_key_idx_ = insert_at;
+                    key_file_dirty_ = true;
+                } else if (key == KEY_BACKSPACE) {
+                    auto &line = key_file_keys_[static_cast<size_t>(key_file_key_idx_)];
+                    if (!line.empty()) {
+                        line.pop_back();
+                        key_file_dirty_ = true;
+                    }
+                } else if (key == KEY_DELETE) {
+                    if (!key_file_keys_.empty()) {
+                        key_file_keys_.erase(key_file_keys_.begin() + key_file_key_idx_);
+                        if (key_file_key_idx_ >= static_cast<int>(key_file_keys_.size())) {
+                            key_file_key_idx_ = std::max(0, static_cast<int>(key_file_keys_.size()) - 1);
+                        }
+                        if (key_file_keys_.empty()) key_file_keys_.push_back("");
+                        key_file_dirty_ = true;
+                    }
+                } else if (key == KEY_S) {
                     std::string err;
-                    if (service_.upsert_mifare_key(-1, rec, &err)) {
-                        refresh_mifare_keys();
-                        show_toast("Imported");
+                    const std::string fname = (key_file_idx_ < fn) ? key_files_[static_cast<size_t>(key_file_idx_)] : "";
+                    if (fname.empty()) {
+                        ui_message_ = "Missing filename";
+                    } else if (service_.save_key_file(fname, key_file_keys_, &err)) {
+                        key_file_dirty_ = false;
+                        key_file_editing_ = false;
+                        refresh_key_files_with_counts();
+                        ui_message_ = "Key file saved";
                     } else {
-                        ui_message_ = err;
+                        ui_message_ = err.empty() ? "Save failed" : err;
+                    }
+                } else {
+                    char ch = keycode_to_hex_char(key);
+                    if (ch && ch != ' ' && ch != ':') {
+                        auto &line = key_file_keys_[static_cast<size_t>(key_file_key_idx_)];
+                        if (line.size() < 12) {
+                            line.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+                            key_file_dirty_ = true;
+                        }
                     }
                 }
             }
@@ -3964,6 +4380,40 @@ private:
     void handle_mfkey_results_key(uint32_t key)
     {
         const bool with_card = (active_tool_idx_ == 4);
+        // Save-to-file overlay input handling
+        if (mfkey_save_mode_) {
+            if (key == KEY_ESC) {
+                mfkey_save_mode_ = false;
+                mfkey_save_filename_.clear();
+            } else if (key == KEY_ENTER) {
+                if (mfkey_save_filename_.empty()) {
+                    ui_message_ = "Filename required";
+                } else {
+                    std::vector<std::string> keys;
+                    for (const auto &r : mfkey_results_) {
+                        if (!r.key_hex.empty()) keys.push_back(r.key_hex);
+                    }
+                    std::string fname = mfkey_save_filename_;
+                    if (fname.find('.') == std::string::npos) fname += ".dic";
+                    std::string err;
+                    if (service_.save_key_file(fname, keys, &err)) {
+                        ui_message_ = "Saved to " + fname;
+                        mfkey_save_mode_ = false;
+                        mfkey_save_filename_.clear();
+                    } else {
+                        ui_message_ = err.empty() ? "Save failed" : err;
+                    }
+                }
+            } else if (key == KEY_BACKSPACE) {
+                if (!mfkey_save_filename_.empty()) mfkey_save_filename_.pop_back();
+            } else {
+                char ch = keycode_to_char(key);
+                if (ch && ch != ' ' && ch != ',' && mfkey_save_filename_.size() < 24) {
+                    mfkey_save_filename_ += ch;
+                }
+            }
+            return;
+        }
         switch (key) {
         case KEY_ENTER: {
             if (!mfkey_results_.empty() &&
@@ -4002,6 +4452,12 @@ private:
         case KEY_X:
             if (!mfkey_results_.empty())
                 mfkey_result_idx_ = (mfkey_result_idx_ + 1) % static_cast<int>(mfkey_results_.size());
+            break;
+        case KEY_S:
+            if (!mfkey_results_.empty()) {
+                mfkey_save_mode_ = true;
+                mfkey_save_filename_.clear();
+            }
             break;
         default: break;
         }
