@@ -32,7 +32,9 @@ docker run --rm \
     set -e
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq python3 python3-pip g++-aarch64-linux-gnu > /dev/null
+    apt-get install -y -qq \
+      python3 python3-pip g++-aarch64-linux-gnu \
+      pkg-config libfreetype6-dev libpng-dev zlib1g-dev > /dev/null
     pip3 install scons parse --quiet
     cd /work/projects/APPLaunch
     CONFIG_REPO_AUTOMATION=1 CardputerZero=y python3 -m SCons -j\$(nproc)

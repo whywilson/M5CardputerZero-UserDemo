@@ -227,6 +227,13 @@ private:
     {
         lv_obj_add_event_cb(ui_root, UINfcPage::static_lvgl_handler, LV_EVENT_ALL, this);
     }
+    int read_log_visible_lines() const
+    {
+        const auto scan = service_.scan_state();
+        if (!scan.has_result) return 10;
+        const auto endpoint = service_.current_endpoint();
+        return (endpoint.kind == nfc_app::TransportKind::I2cBus) ? 7 : 8;
+    }
 
     static void static_lvgl_handler(lv_event_t *e)
     {
@@ -250,7 +257,7 @@ private:
                     // Jump directly to top or bottom
                     const bool to_bottom = (self->held_scroll_key_ == KEY_DOWN);
                     if (is_read_scroll) {
-                        const int max_scroll = std::max(0, (int)self->scan_log_lines_.size() - LOG_VISIBLE_LINES);
+                        const int max_scroll = std::max(0, (int)self->scan_log_lines_.size() - self->read_log_visible_lines());
                         self->log_scroll_offset_ = to_bottom ? max_scroll : 0;
                     } else {
                         const int total = nfc_app::NfcHexLog::get().total_lines();
@@ -266,7 +273,7 @@ private:
                         const int step  = (held_ms > 1500) ? 3 : 1;
                         const int delta = dir * step;
                         if (is_read_scroll) {
-                            const int max_scroll = std::max(0, (int)self->scan_log_lines_.size() - LOG_VISIBLE_LINES);
+                            const int max_scroll = std::max(0, (int)self->scan_log_lines_.size() - self->read_log_visible_lines());
                             self->log_scroll_offset_ = std::max(0, std::min(max_scroll, self->log_scroll_offset_ + delta));
                         } else {
                             const int total = nfc_app::NfcHexLog::get().total_lines();
@@ -346,7 +353,7 @@ private:
                 if (self->scan_log_lines_.size() > 2000)
                     self->scan_log_lines_.erase(self->scan_log_lines_.begin(),
                         self->scan_log_lines_.begin() + (int)self->scan_log_lines_.size() - 2000);
-                self->log_scroll_offset_ = std::max(0, (int)self->scan_log_lines_.size() - LOG_VISIBLE_LINES);
+                self->log_scroll_offset_ = std::max(0, (int)self->scan_log_lines_.size() - self->read_log_visible_lines());
                 if (done) self->uart_test_result_ = result;
             }
             self->last_uart_test_running_ = test_running_now;
@@ -584,7 +591,7 @@ private:
         switch (current_tab_) {
         case Tab::Read:
             {
-                const int max_scroll = std::max(0, (int)scan_log_lines_.size() - LOG_VISIBLE_LINES);
+                const int max_scroll = std::max(0, (int)scan_log_lines_.size() - read_log_visible_lines());
                 log_scroll_offset_ = std::max(0, std::min(max_scroll, log_scroll_offset_ + delta));
             }
             break;
@@ -917,7 +924,7 @@ private:
             auto lines = service_.drain_pending_log();
             for (auto &l : lines) {
                 scan_log_lines_.push_back(std::move(l));
-                log_scroll_offset_ = std::max(0, (int)scan_log_lines_.size() - LOG_VISIBLE_LINES);
+                log_scroll_offset_ = std::max(0, (int)scan_log_lines_.size() - read_log_visible_lines());
             }
         }
 
@@ -925,9 +932,9 @@ private:
         const bool now_running = scan.running;
         if (!now_running && last_scan_running_) {
             if (!scan.has_result) {
-                scan_log_lines_.push_back(std::string("ERR ") + (scan.error.empty() ? "no tag" : to_compact(scan.error, 22)));
+                scan_log_lines_.push_back(std::string("ERR ") + (scan.error.empty() ? "no tag" : to_compact(scan.error, 52)));
             }
-            log_scroll_offset_ = std::max(0, (int)scan_log_lines_.size() - LOG_VISIBLE_LINES);
+            log_scroll_offset_ = std::max(0, (int)scan_log_lines_.size() - read_log_visible_lines());
         }
         last_scan_running_ = now_running;
         // Keep a larger history so long dumps can still be reviewed with scrolling.

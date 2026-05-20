@@ -1153,9 +1153,9 @@ public:
         if (tag->tag_type.find("Mifare Classic") != std::string::npos) {
             tag->protocol = ProtocolKind::MifareClassic;
         }
-        tag->identity_fields["atqa"] = byte_hex(atqa1) + byte_hex(atqa2);
-        tag->identity_fields["sak"] = byte_hex(sak);
-        tag->identity_fields["uid_len"] = std::to_string(uid_len);
+        tag->identity_fields["ATQA"] = byte_hex(atqa1) + byte_hex(atqa2);
+        tag->identity_fields["SAK"] = byte_hex(sak);
+        tag->identity_fields["UID_LEN"] = std::to_string(uid_len);
         tag->raw_data.push_back(bytes_to_hex(data));
         if (error) error->clear();
         target_listed_ = true;  // Tg=1 is now listed in the PN532

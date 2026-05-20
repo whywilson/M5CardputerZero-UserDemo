@@ -1174,12 +1174,18 @@ public:
             return false;
         }
         if (connection_.endpoint.kind == TransportKind::I2cBus) {
-            if (connection_.device_kind == DeviceKind::NFCUnit) {
-                if (error) *error = "NFC Unit dump not supported yet";
-            } else {
-                if (error) *error = "I2C dump not supported yet";
+            if (!i2c_device_ || !i2c_device_->is_open()) {
+                if (error) *error = "I2C device not open";
+                return false;
             }
-            return false;
+            const auto p = scan_.last_record.tag.protocol;
+            if (p != ProtocolKind::MifareClassic &&
+                p != ProtocolKind::Iso14443A &&
+                p != ProtocolKind::Iso15693) {
+                if (error) *error = "I2C dump supports MFC/MFU/ISO15693 only";
+                return false;
+            }
+            return true;
         }
         if (connection_.device_kind == DeviceKind::PN532 &&
             scan_.last_record.tag.protocol == ProtocolKind::Iso15693) {
@@ -1774,6 +1780,80 @@ private:
     void perform_scan()
     {
         NfcHexLog::get().log_event("scan", "start scan");
+        auto equals_ci = [](const std::string &a, const char *b) {
+            if (!b || a.size() != std::strlen(b)) return false;
+            for (size_t i = 0; i < a.size(); ++i) {
+                const char ca = static_cast<char>(std::toupper(static_cast<unsigned char>(a[i])));
+                const char cb = static_cast<char>(std::toupper(static_cast<unsigned char>(b[i])));
+                if (ca != cb) return false;
+            }
+            return true;
+        };
+
+        auto to_upper = [](std::string s) {
+            for (char &ch : s) {
+                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            }
+            return s;
+        };
+
+        auto normalize_identity_hex = [&](std::string value) {
+            value = to_upper(std::move(value));
+            std::string out;
+            out.reserve(value.size());
+            for (char ch : value) {
+                if (std::isxdigit(static_cast<unsigned char>(ch))) out.push_back(ch);
+            }
+            return out;
+        };
+
+        auto find_identity = [&](const TagInfo &tag, const char *key) -> std::string {
+            for (const auto &kv : tag.identity_fields) {
+                if (equals_ci(kv.first, key)) return kv.second;
+            }
+            return {};
+        };
+
+        auto extract_detail_field_hex = [&](const std::string &detail, const char *key) -> std::string {
+            if (!key || !*key || detail.empty()) return {};
+            const std::string key_token = std::string(key) + ":";
+            const std::string detail_up = to_upper(detail);
+            const size_t pos = detail_up.find(to_upper(key_token));
+            if (pos == std::string::npos) return {};
+            size_t start = pos + key_token.size();
+            while (start < detail_up.size() && std::isspace(static_cast<unsigned char>(detail_up[start]))) ++start;
+            std::string out;
+            while (start < detail_up.size()) {
+                const char ch = detail_up[start];
+                if (!std::isxdigit(static_cast<unsigned char>(ch))) break;
+                out.push_back(ch);
+                ++start;
+            }
+            return out;
+        };
+
+        auto emit_scan_summary = [&](const std::string &protocol,
+                                     const std::string &uid,
+                                     const std::string &type,
+                                     const std::string &atqa,
+                                     const std::string &sak,
+                                     const std::string &magic_type) {
+            push_log("Result: Tag Found");
+            push_log(std::string("Protocol: ") + protocol);
+            push_log("UID: " + uid);
+            if (!type.empty()) push_log("Type: " + type);
+
+            const std::string atqa_norm = normalize_identity_hex(atqa);
+            const std::string sak_norm = normalize_identity_hex(sak);
+            push_log(std::string("ATQA: ") + (atqa_norm.empty() ? "-" : atqa_norm));
+            push_log(std::string("SAK: ") + (sak_norm.empty() ? "-" : sak_norm));
+            push_log(std::string("MAGIC: ") + (magic_type.empty() ? "None" : magic_type));
+        };
+
+        auto emit_scan_tail = [&]() {
+            push_log("=====================");
+        };
+
         // Snapshot connection under lock, then release so UI can call scan_state() freely.
         TransportEndpoint endpoint;
         DeviceKind device_kind = DeviceKind::Unknown;
@@ -1818,19 +1898,29 @@ private:
                 tag.uid = uid_norm.empty() ? card.uid : uid_norm;
                 tag.protocol = i2c_protocol_to_kind(card.protocol);
                 tag.tag_type = i2c_protocol_to_tag_type(card.protocol);
+                tag.magic_type = card.magic_type;
                 tag.raw_data.clear();
+                if (!card.atqa_hex.empty()) tag.identity_fields["ATQA"] = card.atqa_hex;
+                if (!card.sak_hex.empty()) tag.identity_fields["SAK"] = card.sak_hex;
 
-                push_log("Result: Tag Found");
-                push_log(std::string("Protocol: ") + to_string(tag.protocol));
-                push_log("UID: " + tag.uid);
-                if (!tag.tag_type.empty()) push_log("Type: " + tag.tag_type);
-                if (!card.detail.empty()) push_log("  detail: " + card.detail);
+                const std::string detail_atqa = !card.atqa_hex.empty()
+                    ? card.atqa_hex : extract_detail_field_hex(card.detail, "ATQA");
+                const std::string detail_sak = !card.sak_hex.empty()
+                    ? card.sak_hex : extract_detail_field_hex(card.detail, "SAK");
+                emit_scan_summary(to_string(tag.protocol),
+                                  tag.uid,
+                                  tag.tag_type,
+                                  detail_atqa,
+                                  detail_sak,
+                                  tag.magic_type);
+                emit_scan_tail();
 
                 const std::string src = dev->is_nfc_unit() ? "nfc_unit" : "grovenfc";
                 record = make_record_from_tag(tag, endpoint, false, src);
                 success = true;
             } else {
                 push_log("No card detected");
+                emit_scan_tail();
                 error = card_ok ? "no card present" : card.detail;
             }
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1844,6 +1934,15 @@ private:
 
         if (endpoint.kind == TransportKind::Mock) {
             record = build_mock_record(endpoint);
+            const std::string atqa = find_identity(record.tag, "ATQA");
+            const std::string sak = find_identity(record.tag, "SAK");
+            emit_scan_summary(to_string(record.tag.protocol),
+                              record.tag.uid,
+                              record.tag.tag_type,
+                              atqa,
+                              sak,
+                              record.tag.magic_type);
+            emit_scan_tail();
             success = true;
         } else {
             if (!transport_raw) {
@@ -1885,16 +1984,52 @@ private:
                 if (!real_ok) error = err15;
             }
             if (real_ok) {
-                push_log("Result: Tag Found");
-                push_log(std::string("Protocol: ") + to_string(tag.protocol));
-                push_log("UID: " + tag.uid);
-                if (!tag.tag_type.empty())
-                    push_log("Type: " + tag.tag_type);
-                for (const auto &kv : tag.identity_fields)
+                auto is_mfc_like = [&]() {
+                    if (tag.protocol == ProtocolKind::MifareClassic) return true;
+                    const std::string type_up = to_upper(tag.tag_type);
+                    if (type_up.find("MIFARE CLASSIC") != std::string::npos) return true;
+                    std::string sak = normalize_identity_hex(find_identity(tag, "SAK"));
+                    if (sak.size() >= 2) {
+                        if (sak == "08" || sak == "09" || sak == "18") return true;
+                    }
+                    return false;
+                };
+
+                const bool can_magic_probe =
+                    (tag.protocol == ProtocolKind::MifareClassic ||
+                     tag.protocol == ProtocolKind::Iso14443A ||
+                     is_mfc_like());
+
+                if (can_magic_probe) {
+                    std::string magic_err;
+                    if (client.is_gen1a(&magic_err)) {
+                        tag.magic_type = "Gen1A";
+                    } else if (client.is_gen3(&magic_err)) {
+                        tag.magic_type = "Gen3";
+                    } else if (client.is_gen4("00000000", &magic_err)) {
+                        tag.magic_type = "Gen4";
+                    }
+                }
+
+                const std::string atqa = find_identity(tag, "ATQA");
+                const std::string sak = find_identity(tag, "SAK");
+                emit_scan_summary(to_string(tag.protocol),
+                                  tag.uid,
+                                  tag.tag_type,
+                                  atqa,
+                                  sak,
+                                  tag.magic_type);
+
+                for (const auto &kv : tag.identity_fields) {
+                    if (equals_ci(kv.first, "ATQA") || equals_ci(kv.first, "SAK") ||
+                        equals_ci(kv.first, "UID_LEN") || equals_ci(kv.first, "UIDLEN")) continue;
                     push_log("  " + kv.first + ": " + kv.second);
+                }
+                emit_scan_tail();
                 client.release_target_if_listed();
             } else {
                 push_log(std::string("ERR ") + (error.empty() ? "no card" : error.substr(0, 22)));
+                emit_scan_tail();
             }
 
             if (real_ok) {
@@ -1921,12 +2056,14 @@ private:
         TransportEndpoint endpoint;
         DeviceKind device_kind = DeviceKind::Unknown;
         INfcTransport *transport_raw = nullptr;
+        I2cGroveNfcDevice *i2c_dev = nullptr;
         SavedRecord base_record;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             endpoint = connection_.endpoint;
             device_kind = connection_.device_kind;
             transport_raw = transport_.get();
+            i2c_dev = i2c_device_.get();
             base_record = scan_.last_record;
         }
 
@@ -1938,13 +2075,100 @@ private:
         std::string error;
         bool success = false;
 
-        if (endpoint.kind == TransportKind::I2cBus) {
-            if (device_kind == DeviceKind::NFCUnit) {
-                error = "NFC Unit dump not supported yet";
-            } else {
-                error = "I2C dump not supported yet";
+        auto emit_compact_lines = [this](const std::vector<std::string> &lines,
+                                         int head, int tail) {
+            const int total = static_cast<int>(lines.size());
+            if (total <= head + tail + 1) {
+                for (const auto &line : lines) push_log(line);
+                return;
             }
-            push_log(std::string("ERR ") + error);
+            for (int i = 0; i < head && i < total; ++i) push_log(lines[i]);
+            push_log(".....");
+            const int start_tail = std::max(head, total - tail);
+            for (int i = start_tail; i < total; ++i) push_log(lines[i]);
+        };
+
+        if (endpoint.kind == TransportKind::I2cBus) {
+            if (!i2c_dev || !i2c_dev->is_open()) {
+                error = "I2C device not open";
+                push_log(std::string("ERR ") + error);
+            } else {
+                const bool is_mfc = (record.tag.protocol == ProtocolKind::MifareClassic);
+                push_log(std::string("> Dumping I2C ") + (is_mfc ? "MFC" :
+                    (record.tag.protocol == ProtocolKind::Iso15693 ? "ISO15693" : "MFU/NTAG")) + "...");
+
+                std::vector<std::string> mfc_default_keys;
+                if (is_mfc) {
+                    std::set<std::string> uniq;
+                    auto append_key = [&](const std::string &raw_hex) {
+                        std::string key;
+                        key.reserve(12);
+                        for (char c : raw_hex) {
+                            if (std::isxdigit(static_cast<unsigned char>(c))) {
+                                key.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+                                if (key.size() == 12) break;
+                            }
+                        }
+                        if (key.size() != 12) return;
+                        if (uniq.insert(key).second) mfc_default_keys.push_back(key);
+                    };
+
+                    const auto json_keys = storage_.load_mifare_keys();
+                    for (const auto &k : json_keys) {
+                        if (!k.enabled) continue;
+                        append_key(k.key_hex);
+                    }
+
+                    const auto key_files = storage_.list_key_files();
+                    for (const auto &fn : key_files) {
+                        const auto file_keys = storage_.load_key_file(fn);
+                        for (const auto &k : file_keys) append_key(k);
+                    }
+
+                    char key_msg[48];
+                    std::snprintf(key_msg, sizeof(key_msg), "MFC keys loaded: %d", static_cast<int>(mfc_default_keys.size()));
+                    push_log(key_msg);
+                }
+
+                std::vector<std::string> dump_lines;
+                std::string i2c_magic_type;
+                std::string dump_err;
+                if (i2c_dev->dumpCard(record.tag.protocol,
+                                      record.tag.uid,
+                                      record.tag.tag_type,
+                                      is_mfc ? &mfc_default_keys : nullptr,
+                                      &i2c_magic_type,
+                                      dump_lines,
+                                      &dump_err)) {
+                    record.tag.raw_data = dump_lines;
+                    if (!i2c_magic_type.empty()) {
+                        record.tag.magic_type = i2c_magic_type;
+                        push_log(std::string("MAGIC: ") + i2c_magic_type);
+                    }
+
+                    if (record.tag.protocol == ProtocolKind::MifareClassic) {
+                        record.mifare_dump = MifareClassicDump{};
+                        const int block_count = static_cast<int>(dump_lines.size());
+                        record.mifare_dump->block_count = block_count;
+                        record.mifare_dump->sector_count = (block_count >= 256) ? 40 :
+                                                           (block_count >= 64)  ? 16 :
+                                                           (block_count >= 20)  ? 5 : 0;
+                        record.mifare_dump->blocks_hex = dump_lines;
+                        record.mifare_dump->attack.method = AttackMethod::DefaultKeys;
+                        record.mifare_dump->attack.status = AttackStatus::Success;
+                        record.mifare_dump->attack.dump_obtained = !dump_lines.empty();
+                        emit_compact_lines(dump_lines, 8, 6);
+                    } else {
+                        emit_compact_lines(dump_lines, 16, 8);
+                    }
+
+                    push_log("Tip: Save this dump, full data is in Saved.");
+                    success = !record.tag.raw_data.empty();
+                } else {
+                    error = dump_err.empty() ? "I2C dump failed" : dump_err;
+                    push_log(std::string("ERR ") + error);
+                }
+            }
         } else if (endpoint.kind == TransportKind::Mock) {
             record = build_mock_record(endpoint);
             success = true;
@@ -1963,19 +2187,6 @@ private:
                 } else {
                     card_ok = client.in_list_passive_target_iso14443a(&live_tag, &error);
                 }
-
-                auto emit_compact_lines = [this](const std::vector<std::string> &lines,
-                                                 int head, int tail) {
-                    const int total = static_cast<int>(lines.size());
-                    if (total <= head + tail + 1) {
-                        for (const auto &line : lines) push_log(line);
-                        return;
-                    }
-                    for (int i = 0; i < head && i < total; ++i) push_log(lines[i]);
-                    push_log(".....");
-                    const int start_tail = std::max(head, total - tail);
-                    for (int i = start_tail; i < total; ++i) push_log(lines[i]);
-                };
 
                 auto bytes_to_hex = [](const std::vector<uint8_t> &bytes) {
                     std::string out;
@@ -2060,17 +2271,17 @@ private:
                                 std::string magic_err;
                                 if (client.is_gen1a(&magic_err)) {
                                     record.tag.magic_type = "Gen1A";
-                                    push_log("MAGIC:Gen1A");
+                                    push_log("MAGIC: Gen1A");
                                     push_log("> Reading Gen1A blocks...");
                                     client.read_gen1a_full(nullptr, &record.tag.block_log, &magic_err,
                                         [this](const std::string &line) { push_log(line); },
                                         (device_kind == DeviceKind::PN532Killer) ? 5 : 0);
                                 } else if (client.is_gen3(&magic_err)) {
                                     record.tag.magic_type = "Gen3";
-                                    push_log("MAGIC:Gen3");
+                                    push_log("MAGIC: Gen3");
                                 } else if (client.is_gen4("00000000", &magic_err)) {
                                     record.tag.magic_type = "Gen4";
-                                    push_log("MAGIC:Gen4");
+                                    push_log("MAGIC: Gen4");
                                 }
                             }
 
@@ -2373,8 +2584,8 @@ private:
             tag.protocol = ProtocolKind::MifareClassic;
             tag.tag_type = "Mifare Classic 1K";
             tag.uid = "DE AD BE EF";
-            tag.identity_fields["atqa"] = "0004";
-            tag.identity_fields["sak"]  = "08";
+            tag.identity_fields["ATQA"] = "0004";
+            tag.identity_fields["SAK"]  = "08";
             tag.identity_fields["capacity"] = "1K";
             tag.raw_data = {
                 "Block0:  DE AD BE EF 21 08 04 00 46 49 4C 4C 45 44 4B 45",
@@ -2385,8 +2596,8 @@ private:
             tag.protocol = ProtocolKind::Iso14443A;
             tag.tag_type = "NFC-A Type 4 (NTAG213)";
             tag.uid = "04 B3 7C 2A";
-            tag.identity_fields["atqa"] = "0044";
-            tag.identity_fields["sak"]  = "00";
+            tag.identity_fields["ATQA"] = "0044";
+            tag.identity_fields["SAK"]  = "00";
             tag.identity_fields["type"] = "NTAG213 144B";
             tag.raw_data = {
                 "UID: 04 B3 7C 2A",
