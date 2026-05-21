@@ -710,22 +710,17 @@ public:
         return true;
     }
 
-    // Detect Gen1a magic card: send unlock sequence (0x40 7-bit, then 0x43).
-    // Gen1A ("magic") card detection.
-    //
-    // Strategy (verified against Bruce pn532external.cpp UartDeviceAdapter):
-    //   1. Card already selected by InListPassiveTarget (target_listed_=true).
-    //   2. HALT without CRC-A via ICT (Bruce's halt(): resetRegister + ICT no-CRC).
-    //   3. WriteRegister(0x633D, 0x07) sets CIU TxLastBits=7.
-    //   4. ICT({0x40}) — 7-bit frame.  Gen1A card responds with 4-bit 0x0A ACK.
-    //      PN532 firmware may report this as framing-error (0x05), timeout (0x01),
-    //      or success (0x00) depending on firmware.  If 0x00 → check data[0]==0x0A.
-    //      If error, still try step 5 (card may have unlocked despite PN532 confusion).
-    //   5. ICT({0x43}) — unlock2.
-    //   6. Confirm Gen1A by ICT({0x30,0x00,crc_h,crc_l}) without prior auth —
-    //      if 16 bytes returned, card is confirmed Gen1A.
+    // Detect Gen1A magic card using Bruce-compatible handshake only:
+    // send7bit(0x40) ACK(0x0A) + send(0x43) ACK(0x0A).
+    // Do not use unauthenticated READ(0x30) as confirmation because Gen3/Gen4
+    // may also respond and cause false Gen1A positives.
     bool is_gen1a(std::string *error)
     {
+        auto has_ack_0a = [](const std::vector<uint8_t> &resp) {
+            // in_communicate_thru_raw returns [status, data...].
+            return resp.size() >= 2 && resp[1] == 0x0A;
+        };
+
         for (int attempt = 0; attempt < 3; ++attempt) {
             // ── Step 1: resetRegister (clear CommIEn/DivIEn, like Bruce) ───
             {
@@ -768,17 +763,7 @@ public:
             usleep(10000);
 #endif
 
-            // ── Step 6: Confirm — ICT(ReadBlock 0) without auth ──────────
-            // Gen1A mode allows reading ANY block without Mifare authentication.
-            // Normal cards would fail with auth error status 0x14.
-            uint8_t rd[4] = {0x30, 0x00, 0, 0};
-            compute_crc_a(rd, 2, &rd[2], &rd[3]);
-            std::vector<uint8_t> rd_resp;
-            in_communicate_thru_raw(rd, 4, &rd_resp, nullptr);
-
-            // rd_resp[0]=status, rd_resp[1..16]=block data if success
-            if (rd_resp.size() >= 17 && rd_resp[0] == 0x00) {
-                // Successfully read block 0 without auth → Gen1A confirmed!
+            if (has_ack_0a(resp1) && has_ack_0a(resp2)) {
                 target_listed_ = true;
                 return true;
             }
@@ -786,6 +771,7 @@ public:
             usleep(20000);
 #endif
         }
+        if (error) *error = "Gen1A unlock ACK not observed";
         return false;
     }
 
@@ -877,17 +863,143 @@ public:
         *out_hi = (uint8_t)((crc >> 8) & 0xFF);
     }
 
-    // Detect Gen3 magic card: re-select then read block 0 without auth.
-    // Reference: Bruce pn532external.cpp isGen3() – plain 0x30 read responds if magic.
+    // Detect Gen3 magic card via manual ISO14443-A anticollision+select+READ.
+    // Reference: pn532-python isGen3() sequence.
+    // Key insight: InListPassiveTarget leaves the card in a PN532-managed state
+    // where raw ICT READ fails (status 0x01). Must use the full manual RF path:
+    // HALT -> 7-bit WUPA -> anticollision -> select -> ICT READ block0.
     bool is_gen3(std::string *error)
     {
         TagInfo tag;
         if (!in_list_passive_target_iso14443a(&tag, error)) return false;
-        uint8_t cmd[4] = {0x30, 0x00, 0, 0};
-        compute_crc_a(cmd, 2, &cmd[2], &cmd[3]);
-        std::vector<uint8_t> resp;
-        if (!in_communicate_thru_raw(cmd, 4, &resp, error)) return false;
-        return resp.size() >= 16;
+
+        auto is_mfc_like = [&]() {
+            if (tag.protocol == ProtocolKind::MifareClassic) return true;
+
+            std::string type_upper = tag.tag_type;
+            for (char &ch : type_upper) {
+                if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - ('a' - 'A'));
+            }
+            if (type_upper.find("MIFARE CLASSIC") != std::string::npos) return true;
+
+            auto it = tag.identity_fields.find("SAK");
+            if (it == tag.identity_fields.end()) return false;
+
+            std::string sak_hex;
+            sak_hex.reserve(it->second.size());
+            for (char ch : it->second) {
+                const bool digit = (ch >= '0' && ch <= '9');
+                const bool lower_hex = (ch >= 'a' && ch <= 'f');
+                const bool upper_hex = (ch >= 'A' && ch <= 'F');
+                if (!digit && !lower_hex && !upper_hex) continue;
+                if (lower_hex) ch = static_cast<char>(ch - ('a' - 'A'));
+                sak_hex.push_back(ch);
+            }
+            if (sak_hex.size() < 2) return false;
+
+            const std::string sak = sak_hex.substr(sak_hex.size() - 2);
+            return sak == "08" || sak == "09" || sak == "18" ||
+                   sak == "28" || sak == "38";
+        };
+
+        if (!is_mfc_like()) return false;
+
+        // ── Manual RF probe (pn532-python path) ─────────────────────────────
+        // 1. Reset registers (clear CommIEn/DivIEn)
+        {
+            const std::vector<uint8_t> frame =
+                Pn532FrameCodec::build_command(0x08, {0x63, 0x02, 0x00, 0x63, 0x03, 0x00});
+            transport_->write_bytes(frame.data(), frame.size(), nullptr);
+            std::vector<uint8_t> rx;
+            collect_response(&rx, nullptr);
+        }
+        // 2. HALT (no CRC, per pn532-python / Bruce)
+        {
+            const std::vector<uint8_t> frame =
+                Pn532FrameCodec::build_command(0x42, {0x50, 0x00});
+            transport_->write_bytes(frame.data(), frame.size(), nullptr);
+            std::vector<uint8_t> rx;
+            collect_response(&rx, nullptr); // timeout expected
+        }
+#ifndef _WIN32
+        usleep(10000);
+#endif
+        // 3. 7-bit WUPA (0x52): wake card from HALT
+        write_register(0x633D, 0x07, nullptr);
+#ifndef _WIN32
+        usleep(5000);
+#endif
+        const uint8_t wupa = 0x52;
+        std::vector<uint8_t> atqa_resp;
+        in_communicate_thru_raw(&wupa, 1, &atqa_resp, nullptr);
+        write_register(0x633D, 0x00, nullptr);
+#ifndef _WIN32
+        usleep(5000);
+#endif
+        if (atqa_resp.empty() || atqa_resp[0] != 0x00) {
+            if (error && error->empty()) *error = "Gen3 WUPA no ATQA";
+            return false;
+        }
+
+        // 4. Anticollision cascade 1: ICT(0x93, 0x20) -> [status, uid0..3, bcc]
+        const uint8_t ac1_cmd[] = {0x93, 0x20};
+        std::vector<uint8_t> ac1;
+        in_communicate_thru_raw(ac1_cmd, sizeof(ac1_cmd), &ac1, nullptr);
+        if (ac1.size() < 6 || ac1[0] != 0x00) {
+            if (error && error->empty()) *error = "Gen3 anticol1 failed";
+            return false;
+        }
+
+        // 5. Select cascade 1: ICT(0x93, 0x70, uid0..3, bcc, crc_a, crc_b)
+        {
+            uint8_t sel1[9] = {0x93, 0x70, ac1[1], ac1[2], ac1[3], ac1[4], ac1[5], 0, 0};
+            compute_crc_a(sel1, 7, &sel1[7], &sel1[8]);
+            std::vector<uint8_t> sak1;
+            in_communicate_thru_raw(sel1, sizeof(sel1), &sak1, nullptr);
+            if (sak1.size() < 2 || sak1[0] != 0x00) {
+                if (error && error->empty()) *error = "Gen3 sel1 failed";
+                return false;
+            }
+
+            // 6. Cascade 2 for 7-byte UIDs (uid0 == 0x88 cascade tag)
+            if (ac1[1] == 0x88) {
+                const uint8_t ac2_cmd[] = {0x95, 0x20};
+                std::vector<uint8_t> ac2;
+                in_communicate_thru_raw(ac2_cmd, sizeof(ac2_cmd), &ac2, nullptr);
+                if (ac2.size() < 6 || ac2[0] != 0x00) {
+                    if (error && error->empty()) *error = "Gen3 anticol2 failed";
+                    return false;
+                }
+                uint8_t sel2[9] = {0x95, 0x70, ac2[1], ac2[2], ac2[3], ac2[4], ac2[5], 0, 0};
+                compute_crc_a(sel2, 7, &sel2[7], &sel2[8]);
+                std::vector<uint8_t> sak2;
+                in_communicate_thru_raw(sel2, sizeof(sel2), &sak2, nullptr);
+                if (sak2.size() < 2 || sak2[0] != 0x00) {
+                    if (error && error->empty()) *error = "Gen3 sel2 failed";
+                    return false;
+                }
+            }
+        }
+
+        // 7. ICT READ block0 without auth -- Gen3 responds, normal MFC cards refuse
+        uint8_t rd[4] = {0x30, 0x00, 0, 0};
+        compute_crc_a(rd, 2, &rd[2], &rd[3]);
+        std::vector<uint8_t> rd_resp;
+        in_communicate_thru_raw(rd, sizeof(rd), &rd_resp, nullptr);
+
+        // Success: [status=0x00] + 16 data bytes (+ optional CRC)
+        if ((rd_resp.size() >= 17 && rd_resp[0] == 0x00) || rd_resp.size() >= 16) {
+            target_listed_ = false; // selected via raw ICT, not InListPassiveTarget
+            return true;
+        }
+
+        if (error && error->empty()) {
+            char b[72];
+            std::snprintf(b, sizeof(b), "Gen3 READ short: %zu bytes (status 0x%02X)",
+                          rd_resp.size(), rd_resp.empty() ? 0xFFu : (unsigned)rd_resp[0]);
+            *error = b;
+        }
+        return false;
     }
 
     // Detect Gen4 (GDM) magic card: re-select then send Gen4 GetVersion command.
@@ -1150,6 +1262,11 @@ public:
         tag->protocol = ProtocolKind::Iso14443A;
         tag->uid = to_hex(data.data() + 8, uid_len);
         tag->tag_type = detect_mifare_classic(sak, uid_len);
+
+        if (sak == 0x00) {
+            tag->tag_type = classify_type2_tag();
+        }
+
         if (tag->tag_type.find("Mifare Classic") != std::string::npos) {
             tag->protocol = ProtocolKind::MifareClassic;
         }
@@ -1459,6 +1576,36 @@ public:
 
     // ── NTAG / Mifare Ultralight dump ────────────────────────────────────────
 
+    // Read 4 Type2 pages (16 bytes) using READ (0x30), with PN532Killer raw fallback.
+    bool type2_read_four_pages(uint8_t start_page, std::vector<uint8_t> *out16)
+    {
+        if (!out16) return false;
+
+        std::vector<uint8_t> resp;
+        if (in_data_exchange(0x01, {0x30, start_page}, &resp, nullptr) && resp.size() >= 16) {
+            out16->assign(resp.begin(), resp.begin() + 16);
+            return true;
+        }
+
+        // Compatibility fallback for firmware variants that reject InDataExchange
+        // for Type2 READ but accept raw 14A transceive.
+        uint8_t raw_cmd[4] = {0x30, start_page, 0x00, 0x00};
+        compute_crc_a(raw_cmd, 2, &raw_cmd[2], &raw_cmd[3]);
+        std::vector<uint8_t> raw_resp;
+        if (!in_communicate_thru_raw(raw_cmd, sizeof(raw_cmd), &raw_resp, nullptr)) return false;
+        if (raw_resp.size() < 17 || raw_resp[0] != 0x00) return false;
+
+        out16->assign(raw_resp.begin() + 1, raw_resp.begin() + 17);
+        return true;
+    }
+
+    // Probe whether a Type2 page exists by issuing READ on that page address.
+    bool type2_has_page(uint8_t page)
+    {
+        std::vector<uint8_t> chunk;
+        return type2_read_four_pages(page, &chunk);
+    }
+
     // GET_VERSION (0x60) for NTAG/Ultralight chips (NXP-specific command).
     // Returns the version payload bytes on success, empty vector on failure.
     // Mifare Ultralight (original / C) will NAK → empty returned.
@@ -1481,15 +1628,56 @@ public:
         return {};
     }
 
+    // GroveNFC-style Type2 classification flow:
+    // 1) GET_VERSION (0x60) first
+    // 2) If unknown/fail, probe high pages to differentiate NTAG213/215/216
+    // 3) Finally use page 0x29 heuristic for MFUL-C vs NTAG203-like cards
+    std::string classify_type2_tag()
+    {
+        const std::vector<uint8_t> ver = ntag_get_version();
+        const std::string known = ntag_type_from_version(ver);
+        if (!known.empty()) return known;
+
+        // High-page probe avoids collapsing NTAG213/216 into generic Ultralight.
+        if (type2_has_page(0x2C)) {
+            if (type2_has_page(0x86)) {
+                if (type2_has_page(0xE6)) return "NTAG216";
+                return "NTAG215";
+            }
+            return "NTAG213";
+        }
+
+        // GroveNFC fallback: page 0x29 readable usually indicates UL-C path.
+        if (type2_has_page(0x29)) {
+            return "MIFARE Ultralight C";
+        }
+
+        // If GET_VERSION responded but unknown, keep family-level hint.
+        if (ver.size() >= 8) {
+            const uint8_t ic_type = ver[2];
+            const uint8_t storage = ver[6];
+            if (ic_type == 0x04) {
+                if (storage == 0x12) return "NTAG203";
+                return "NTAG";
+            }
+            if (ic_type == 0x03) return "MIFARE Ultralight";
+            return "ISO14443A Type2";
+        }
+        return "NTAG/Ultralight";
+    }
+
     // Identify NTAG variant from GET_VERSION response bytes (NXP AN10609).
-    // ver[5] = storage size indicator:
+    // ver[6] = storage size indicator:
     //   0x0F → NTAG213 (45 pages), 0x11 → NTAG215 (135 pages), 0x13 → NTAG216 (231 pages)
     static std::string ntag_type_from_version(const std::vector<uint8_t> &ver)
     {
-        if (ver.size() < 7) return "";
-        switch (ver[5]) {
+        if (ver.size() < 8) return "";
+        switch (ver[6]) {
+        case 0x0B: return "MIFARE Ultralight EV1 (UL11)";
+        case 0x0E: return "MIFARE Ultralight EV1 (UL21)";
         case 0x0F: return "NTAG213";
         case 0x11: return "NTAG215";
+        case 0x12: return "NTAG203";
         case 0x13: return "NTAG216";
         default:   return "";
         }
@@ -1498,6 +1686,10 @@ public:
     // Total page count for known NTAG types (4 bytes per page).
     static int ntag_page_count_for_type(const std::string &type)
     {
+        if (type == "MIFARE Ultralight EV1 (UL11)") return 20;
+        if (type == "MIFARE Ultralight EV1 (UL21)") return 41;
+        if (type == "MIFARE Ultralight C") return 48;
+        if (type == "NTAG203") return 42;
         if (type == "NTAG213") return 45;
         if (type == "NTAG215") return 135;
         if (type == "NTAG216") return 231;
@@ -1515,28 +1707,10 @@ public:
     {
         auto emit = [&](const std::string &s) { if (on_line) on_line(s); };
 
-        auto read_four_pages = [&](uint8_t start_page, std::vector<uint8_t> *out16) -> bool {
-            std::vector<uint8_t> resp;
-            if (in_data_exchange(0x01, {0x30, start_page}, &resp, nullptr) && resp.size() >= 16) {
-                out16->assign(resp.begin(), resp.begin() + 16);
-                return true;
-            }
-
-            // Compatibility fallback for PN532Killer firmware variants that reject
-            // InDataExchange for MFU/NTAG read but accept raw 14A transceive.
-            uint8_t raw_cmd[4] = {0x30, start_page, 0x00, 0x00};
-            compute_crc_a(raw_cmd, 2, &raw_cmd[2], &raw_cmd[3]);
-            std::vector<uint8_t> raw_resp;
-            if (!in_communicate_thru_raw(raw_cmd, sizeof(raw_cmd), &raw_resp, nullptr)) return false;
-            if (raw_resp.size() < 17 || raw_resp[0] != 0x00) return false;
-            out16->assign(raw_resp.begin() + 1, raw_resp.begin() + 17);
-            return true;
-        };
-
-        // Identify chip via GET_VERSION; fall back to generic Ultralight on failure.
-        auto ver = ntag_get_version();
-        std::string type = ntag_type_from_version(ver);
-        if (type.empty()) type = "Ultralight";
+        // Identify chip via GET_VERSION + GroveNFC-style page probes.
+        std::string type = classify_type2_tag();
+        if (type == "NTAG") type = "NTAG213"; // conservative Type2 default size
+        if (type == "NTAG/Ultralight") type = "MIFARE Ultralight";
         if (type_out) *type_out = type;
 
         const int total_pages = ntag_page_count_for_type(type);
@@ -1551,7 +1725,7 @@ public:
 
         for (int p = 0; p < total_pages; p += 4) {
             std::vector<uint8_t> chunk16;
-            if (!read_four_pages(static_cast<uint8_t>(p), &chunk16)) {
+            if (!type2_read_four_pages(static_cast<uint8_t>(p), &chunk16)) {
                 char buf[24];
                 std::snprintf(buf, sizeof(buf), "ERR page%02d", p);
                 emit(buf);
@@ -1563,7 +1737,7 @@ public:
                     (*pages_out)[p + i] = pg;
                 ++ok;
                 char buf[24];
-                std::snprintf(buf, sizeof(buf), "%02d: %02X%02X%02X%02X",
+                std::snprintf(buf, sizeof(buf), "%02d:%02X%02X%02X%02X",
                     p + i, pg[0], pg[1], pg[2], pg[3]);
                 emit(buf);
             }
@@ -1606,7 +1780,7 @@ public:
             if (blocks_out) blocks_out->push_back(resp);
             ++ok;
             char buf[40];
-            int pos = std::snprintf(buf, sizeof(buf), "%02d: ", b);
+            int pos = std::snprintf(buf, sizeof(buf), "%02d:", b);
             for (uint8_t byte : resp) {
                 if (pos < static_cast<int>(sizeof(buf)) - 3)
                     pos += std::snprintf(buf + pos, sizeof(buf) - pos, "%02X", byte);

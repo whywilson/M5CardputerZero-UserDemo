@@ -982,12 +982,14 @@ public:
                          std::string *error = nullptr)
     {
         INfcTransport *transport_raw = nullptr;
+        I2cGroveNfcDevice *i2c_dev = nullptr;
         DeviceKind kind = DeviceKind::Unknown;
         bool busy = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             busy = scan_.running;
             transport_raw = transport_.get();
+            i2c_dev = i2c_device_.get();
             kind = connection_.device_kind;
         }
 
@@ -995,15 +997,6 @@ public:
             if (error) *error = "Scan/dump running";
             return false;
         }
-        if (!transport_raw || !transport_raw->is_open()) {
-            if (error) *error = "Device not connected";
-            return false;
-        }
-        if (kind != DeviceKind::PN532 && kind != DeviceKind::PN532Killer) {
-            if (error) *error = "PN532/PN532Killer required";
-            return false;
-        }
-
         std::vector<uint8_t> uid;
         std::vector<uint8_t> block0;
         if (!parse_hex_bytes(uid_hex, &uid)) {
@@ -1020,21 +1013,49 @@ public:
         }
 
         std::vector<uint8_t> gen2_key_a;
-        if (!parse_hex_bytes(gen2_sector0_key_a, &gen2_key_a) || gen2_key_a.size() != 6) {
-            if (error) *error = "Sector0 KeyA must be 12 hex";
-            return false;
+        if (generation == UidMagicGeneration::Gen2) {
+            if (!parse_hex_bytes(gen2_sector0_key_a, &gen2_key_a) || gen2_key_a.size() != 6) {
+                if (error) *error = "Sector0 KeyA must be 12 hex";
+                return false;
+            }
         }
 
         std::string gen4_pw;
-        for (char c : gen4_password) {
-            if (!std::isspace(static_cast<unsigned char>(c))) {
-                gen4_pw.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        if (generation == UidMagicGeneration::Gen4) {
+            for (char c : gen4_password) {
+                if (!std::isspace(static_cast<unsigned char>(c))) {
+                    gen4_pw.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+                }
+            }
+            if (gen4_pw.size() != 8 ||
+                !std::all_of(gen4_pw.begin(), gen4_pw.end(),
+                             [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); })) {
+                if (error) *error = "Gen4 password must be 8 hex";
+                return false;
             }
         }
-        if (gen4_pw.size() != 8 ||
-            !std::all_of(gen4_pw.begin(), gen4_pw.end(),
-                         [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); })) {
-            if (error) *error = "Gen4 password must be 8 hex";
+
+        if (kind == DeviceKind::NFCUnit) {
+            if (!i2c_dev || !i2c_dev->is_open()) {
+                if (error) *error = "NFC Unit not connected";
+                return false;
+            }
+            if (generation == UidMagicGeneration::Gen1A) {
+                return i2c_dev->writeNFCUnitGen1ABlock0(block0, error);
+            }
+            if (generation == UidMagicGeneration::Gen3) {
+                return i2c_dev->writeNFCUnitGen3Block0(uid, block0, error);
+            }
+            if (error) *error = "NFC Unit supports Gen1A and Gen3 only";
+            return false;
+        }
+
+        if (!transport_raw || !transport_raw->is_open()) {
+            if (error) *error = "Device not connected";
+            return false;
+        }
+        if (kind != DeviceKind::PN532 && kind != DeviceKind::PN532Killer) {
+            if (error) *error = "PN532/PN532Killer/NFC Unit required";
             return false;
         }
 
@@ -1070,12 +1091,14 @@ public:
     bool scan_uid_once(std::string *uid_hex, std::string *error)
     {
         INfcTransport *transport_raw = nullptr;
+        I2cGroveNfcDevice *i2c_dev = nullptr;
         DeviceKind kind = DeviceKind::Unknown;
         bool busy = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             busy = scan_.running;
             transport_raw = transport_.get();
+            i2c_dev = i2c_device_.get();
             kind = connection_.device_kind;
         }
 
@@ -1083,12 +1106,38 @@ public:
             if (error) *error = "Scan/dump running";
             return false;
         }
+        if (kind == DeviceKind::NFCUnit || kind == DeviceKind::GroveNFC) {
+            if (!i2c_dev || !i2c_dev->is_open()) {
+                if (error) *error = "I2C device not connected";
+                return false;
+            }
+            I2cCardInfo card;
+            if (!i2c_dev->readCard(card) || !card.valid) {
+                if (error) *error = "no card";
+                return false;
+            }
+            std::string normalized;
+            normalized.reserve(card.uid.size());
+            for (char ch : card.uid) {
+                if (std::isxdigit(static_cast<unsigned char>(ch))) {
+                    normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+                }
+            }
+            if (normalized.empty()) {
+                if (error) *error = "invalid UID";
+                return false;
+            }
+            if (uid_hex) *uid_hex = normalized;
+            if (error) error->clear();
+            return true;
+        }
+
         if (!transport_raw || !transport_raw->is_open()) {
             if (error) *error = "Device not connected";
             return false;
         }
         if (kind != DeviceKind::PN532 && kind != DeviceKind::PN532Killer) {
-            if (error) *error = "PN532/PN532Killer required";
+            if (error) *error = "PN532/PN532Killer/NFC Unit required";
             return false;
         }
 
@@ -1847,7 +1896,23 @@ private:
             const std::string sak_norm = normalize_identity_hex(sak);
             push_log(std::string("ATQA: ") + (atqa_norm.empty() ? "-" : atqa_norm));
             push_log(std::string("SAK: ") + (sak_norm.empty() ? "-" : sak_norm));
-            push_log(std::string("MAGIC: ") + (magic_type.empty() ? "None" : magic_type));
+
+            std::string type_up = to_upper(type);
+            std::string proto_up = to_upper(protocol);
+            const bool is_mfc_family =
+                (type_up.find("MIFARE CLASSIC") != std::string::npos) ||
+                (type_up.find("MFC1K") != std::string::npos) ||
+                (type_up.find("MFC4K") != std::string::npos) ||
+                (type_up.find("MFCMINI") != std::string::npos) ||
+                (sak_norm == "08" || sak_norm == "09" || sak_norm == "18" ||
+                 sak_norm == "28" || sak_norm == "38") ||
+                ((proto_up.find("MIFARE") != std::string::npos || proto_up.find("MFC") != std::string::npos) &&
+                 (type_up.find("1K") != std::string::npos ||
+                  type_up.find("4K") != std::string::npos ||
+                  type_up.find("MINI") != std::string::npos));
+            if (is_mfc_family) {
+                push_log(std::string("MAGIC: ") + (magic_type.empty() ? "Normal" : magic_type));
+            }
         };
 
         auto emit_scan_tail = [&]() {
@@ -1990,15 +2055,13 @@ private:
                     if (type_up.find("MIFARE CLASSIC") != std::string::npos) return true;
                     std::string sak = normalize_identity_hex(find_identity(tag, "SAK"));
                     if (sak.size() >= 2) {
-                        if (sak == "08" || sak == "09" || sak == "18") return true;
+                        if (sak == "08" || sak == "09" || sak == "18" ||
+                            sak == "28" || sak == "38") return true;
                     }
                     return false;
                 };
 
-                const bool can_magic_probe =
-                    (tag.protocol == ProtocolKind::MifareClassic ||
-                     tag.protocol == ProtocolKind::Iso14443A ||
-                     is_mfc_like());
+                const bool can_magic_probe = is_mfc_like();
 
                 if (can_magic_probe) {
                     std::string magic_err;
@@ -2008,6 +2071,10 @@ private:
                         tag.magic_type = "Gen3";
                     } else if (client.is_gen4("00000000", &magic_err)) {
                         tag.magic_type = "Gen4";
+                    } else {
+                        // Explicitly mark MFC cards as Normal when all magic probes fail,
+                        // so UI always shows a MAGIC line under SAK.
+                        tag.magic_type = "Normal";
                     }
                 }
 
@@ -2075,17 +2142,71 @@ private:
         std::string error;
         bool success = false;
 
-        auto emit_compact_lines = [this](const std::vector<std::string> &lines,
-                                         int head, int tail) {
-            const int total = static_cast<int>(lines.size());
-            if (total <= head + tail + 1) {
-                for (const auto &line : lines) push_log(line);
-                return;
+        auto emit_dump_lines = [this](const std::vector<std::string> &lines) {
+            for (const auto &line : lines) push_log(line);
+        };
+
+        auto to_upper_copy = [](std::string s) {
+            for (char &ch : s) {
+                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
             }
-            for (int i = 0; i < head && i < total; ++i) push_log(lines[i]);
-            push_log(".....");
-            const int start_tail = std::max(head, total - tail);
-            for (int i = start_tail; i < total; ++i) push_log(lines[i]);
+            return s;
+        };
+
+        auto normalize_hex = [&](std::string value) {
+            value = to_upper_copy(std::move(value));
+            std::string out;
+            out.reserve(value.size());
+            for (char ch : value) {
+                if (std::isxdigit(static_cast<unsigned char>(ch))) out.push_back(ch);
+            }
+            return out;
+        };
+
+        auto find_identity_field = [&](const TagInfo &tag, const char *key) -> std::string {
+            if (!key || !*key) return {};
+            const std::string key_up = to_upper_copy(key);
+            for (const auto &kv : tag.identity_fields) {
+                if (to_upper_copy(kv.first) == key_up) return kv.second;
+            }
+            return {};
+        };
+
+        auto is_mfc_family = [&](const TagInfo &tag) {
+            if (tag.protocol == ProtocolKind::MifareClassic) return true;
+            const std::string type_up = to_upper_copy(tag.tag_type);
+            if (type_up.find("MIFARE CLASSIC") != std::string::npos) return true;
+            if (type_up.find(" S20") != std::string::npos || type_up.find(" S50") != std::string::npos ||
+                type_up.find(" S70") != std::string::npos) return true;
+            const std::string sak = normalize_hex(find_identity_field(tag, "SAK"));
+            return (sak == "08" || sak == "09" || sak == "18" || sak == "28" || sak == "38");
+        };
+
+        auto is_desfire_family = [&](const TagInfo &tag) {
+            const std::string type_up = to_upper_copy(tag.tag_type);
+            if (type_up.find("DESFIRE") != std::string::npos) return true;
+            const std::string sak = normalize_hex(find_identity_field(tag, "SAK"));
+            return sak == "20";
+        };
+
+        auto emit_desfire_info_only = [&](SavedRecord &target_record) {
+            push_log("> MIFARE DESFire detected");
+            push_log("> Info-only mode (dump not supported)");
+            const std::string uid = target_record.tag.uid.empty() ? "-" : target_record.tag.uid;
+            const std::string atqa = normalize_hex(find_identity_field(target_record.tag, "ATQA"));
+            const std::string sak = normalize_hex(find_identity_field(target_record.tag, "SAK"));
+
+            std::vector<std::string> info_lines;
+            info_lines.push_back(std::string("Type:") +
+                                 (target_record.tag.tag_type.empty() ? "MIFARE DESFire"
+                                                                     : target_record.tag.tag_type));
+            info_lines.push_back(std::string("UID:") + uid);
+            info_lines.push_back(std::string("ATQA:") + (atqa.empty() ? "-" : atqa));
+            info_lines.push_back(std::string("SAK:") + (sak.empty() ? "-" : sak));
+            info_lines.push_back("DESFire dump is not supported yet.");
+
+            emit_dump_lines(info_lines);
+            target_record.tag.raw_data = info_lines;
         };
 
         if (endpoint.kind == TransportKind::I2cBus) {
@@ -2093,12 +2214,26 @@ private:
                 error = "I2C device not open";
                 push_log(std::string("ERR ") + error);
             } else {
-                const bool is_mfc = (record.tag.protocol == ProtocolKind::MifareClassic);
-                push_log(std::string("> Dumping I2C ") + (is_mfc ? "MFC" :
-                    (record.tag.protocol == ProtocolKind::Iso15693 ? "ISO15693" : "MFU/NTAG")) + "...");
+                ProtocolKind dump_protocol = record.tag.protocol;
+                if (dump_protocol == ProtocolKind::Iso14443A) {
+                    if (is_desfire_family(record.tag)) {
+                        emit_desfire_info_only(record);
+                        success = true;
+                    } else if (is_mfc_family(record.tag)) {
+                        dump_protocol = ProtocolKind::MifareClassic;
+                        record.tag.protocol = ProtocolKind::MifareClassic;
+                        if (record.tag.tag_type.empty()) record.tag.tag_type = "MIFARE Classic";
+                    }
+                }
+
+                const bool is_mfc = (dump_protocol == ProtocolKind::MifareClassic);
+                if (!success) {
+                    push_log(std::string("> Dumping I2C ") + (is_mfc ? "MFC" :
+                        (dump_protocol == ProtocolKind::Iso15693 ? "ISO15693" : "MFU/NTAG")) + "...");
+                }
 
                 std::vector<std::string> mfc_default_keys;
-                if (is_mfc) {
+                if (!success && is_mfc) {
                     std::set<std::string> uniq;
                     auto append_key = [&](const std::string &raw_hex) {
                         std::string key;
@@ -2133,20 +2268,21 @@ private:
                 std::vector<std::string> dump_lines;
                 std::string i2c_magic_type;
                 std::string dump_err;
-                if (i2c_dev->dumpCard(record.tag.protocol,
-                                      record.tag.uid,
-                                      record.tag.tag_type,
-                                      is_mfc ? &mfc_default_keys : nullptr,
-                                      &i2c_magic_type,
-                                      dump_lines,
-                                      &dump_err)) {
+                if (!success && i2c_dev->dumpCard(dump_protocol,
+                                                  record.tag.uid,
+                                                  record.tag.tag_type,
+                                                  is_mfc ? &mfc_default_keys : nullptr,
+                                                  &i2c_magic_type,
+                                                  dump_lines,
+                                                  &dump_err)) {
+                    record.tag.protocol = dump_protocol;
                     record.tag.raw_data = dump_lines;
                     if (!i2c_magic_type.empty()) {
                         record.tag.magic_type = i2c_magic_type;
                         push_log(std::string("MAGIC: ") + i2c_magic_type);
                     }
 
-                    if (record.tag.protocol == ProtocolKind::MifareClassic) {
+                    if (dump_protocol == ProtocolKind::MifareClassic) {
                         record.mifare_dump = MifareClassicDump{};
                         const int block_count = static_cast<int>(dump_lines.size());
                         record.mifare_dump->block_count = block_count;
@@ -2157,14 +2293,14 @@ private:
                         record.mifare_dump->attack.method = AttackMethod::DefaultKeys;
                         record.mifare_dump->attack.status = AttackStatus::Success;
                         record.mifare_dump->attack.dump_obtained = !dump_lines.empty();
-                        emit_compact_lines(dump_lines, 8, 6);
+                        emit_dump_lines(dump_lines);
                     } else {
-                        emit_compact_lines(dump_lines, 16, 8);
+                        emit_dump_lines(dump_lines);
                     }
 
-                    push_log("Tip: Save this dump, full data is in Saved.");
+                    push_log("Tip: Press Ctrl+S to save dump.");
                     success = !record.tag.raw_data.empty();
-                } else {
+                } else if (!success) {
                     error = dump_err.empty() ? "I2C dump failed" : dump_err;
                     push_log(std::string("ERR ") + error);
                 }
@@ -2202,16 +2338,40 @@ private:
                 if (!card_ok) {
                     push_log(std::string("ERR ") + (error.empty() ? "no card" : error));
                 } else {
-                    if (live_tag.protocol != base_record.tag.protocol) {
+                    const bool same_or_compatible_protocol =
+                        (live_tag.protocol == base_record.tag.protocol) ||
+                        ((live_tag.protocol == ProtocolKind::Iso14443A || live_tag.protocol == ProtocolKind::MifareClassic) &&
+                         (base_record.tag.protocol == ProtocolKind::Iso14443A || base_record.tag.protocol == ProtocolKind::MifareClassic));
+                    if (!same_or_compatible_protocol) {
                         error = "Card type mismatch, rescan card";
                         push_log(std::string("ERR ") + error);
                     } else {
                         record.tag.uid = live_tag.uid;
+                        if (live_tag.protocol != ProtocolKind::Unknown)
+                            record.tag.protocol = live_tag.protocol;
                         if (!live_tag.tag_type.empty()) record.tag.tag_type = live_tag.tag_type;
                         if (!live_tag.identity_fields.empty())
                             record.tag.identity_fields = live_tag.identity_fields;
 
-                        if (record.tag.protocol == ProtocolKind::Iso15693) {
+                        bool handled = false;
+                        if (record.tag.protocol == ProtocolKind::Iso14443A &&
+                            is_desfire_family(record.tag)) {
+                            emit_desfire_info_only(record);
+                            success = true;
+                            handled = true;
+                        }
+
+                        if (!handled && record.tag.protocol == ProtocolKind::Iso14443A &&
+                            (base_record.tag.protocol == ProtocolKind::MifareClassic || is_mfc_family(record.tag))) {
+                            record.tag.protocol = ProtocolKind::MifareClassic;
+                            if (to_upper_copy(record.tag.tag_type).find("MIFARE CLASSIC") == std::string::npos &&
+                                !base_record.tag.tag_type.empty()) {
+                                record.tag.tag_type = base_record.tag.tag_type;
+                            }
+                            handled = false;
+                        }
+
+                        if (!handled && record.tag.protocol == ProtocolKind::Iso15693) {
                             if (device_kind == DeviceKind::PN532) {
                                 error = "PN532 ISO15693 read not supported";
                                 push_log(std::string("ERR ") + error);
@@ -2229,15 +2389,15 @@ private:
                                     dump_lines.push_back(line);
                                     record.tag.raw_data.push_back(line);
                                 }
-                                emit_compact_lines(dump_lines, 12, 8);
-                                push_log("Tip: Save this dump, full data is in Saved.");
+                                emit_dump_lines(dump_lines);
+                                push_log("Tip: Press Ctrl+S to save dump.");
                                 success = !record.tag.raw_data.empty();
                             } else {
                                 error = dump_err.empty() ? "ISO15693 dump failed" : dump_err;
                                 push_log(std::string("ERR ") + error);
                             }
                             }
-                        } else if (record.tag.protocol == ProtocolKind::Iso14443A) {
+                        } else if (!handled && record.tag.protocol == ProtocolKind::Iso14443A) {
                             push_log("> Dumping NTAG/Ultralight pages...");
                             std::vector<std::vector<uint8_t>> pages;
                             std::string ntag_type;
@@ -2253,15 +2413,15 @@ private:
                                     dump_lines.push_back(line);
                                     record.tag.raw_data.push_back(line);
                                 }
-                                emit_compact_lines(dump_lines, 16, 8);
+                                emit_dump_lines(dump_lines);
                                 if (static_cast<int>(dump_lines.size()) > 24)
-                                    push_log("Tip: Save this dump, full data is in Saved.");
+                                    push_log("Tip: Press Ctrl+S to save dump.");
                                 success = !record.tag.raw_data.empty();
                             } else {
                                 error = dump_err.empty() ? "NTAG dump failed" : dump_err;
                                 push_log(std::string("ERR ") + error);
                             }
-                        } else if (record.tag.protocol == ProtocolKind::MifareClassic) {
+                        } else if (!handled && record.tag.protocol == ProtocolKind::MifareClassic) {
                             std::vector<std::string> mfc_blocks;
                             bool mfc_read_ok = false;
                             const int sc = (record.tag.tag_type.find("4K") != std::string::npos) ? 40 : 16;
@@ -2330,7 +2490,7 @@ private:
                                 record.mifare_dump->attack.reason = error;
                                 push_log(std::string("ERR ") + error);
                             }
-                        } else {
+                        } else if (!handled) {
                             error = "Unsupported protocol for dump";
                             push_log(std::string("ERR ") + error);
                         }

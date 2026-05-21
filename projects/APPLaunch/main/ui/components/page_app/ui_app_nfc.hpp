@@ -171,7 +171,7 @@ private:
     static constexpr int CONTENT_H = 120;
     static constexpr int LOG_VISIBLE_LINES = 9;
     // HexLog overlay: 320×140 content area, 11px per line => ~12 lines
-    static constexpr int LOG_VISIBLE_HEX_LINES = 12;
+    static constexpr int LOG_VISIBLE_HEX_LINES = 11;
 
     void creat_UI()
     {
@@ -984,7 +984,6 @@ private:
             return {
                 ReadMenuAction::Scan,
                 ReadMenuAction::Dump,
-                ReadMenuAction::Save,
                 ReadMenuAction::Clear,
             };
         }
@@ -999,7 +998,6 @@ private:
             return {
                 ReadMenuAction::Scan,
                 ReadMenuAction::Dump,
-                ReadMenuAction::Save,
                 ReadMenuAction::Clear,
             };
         }
@@ -1013,14 +1011,12 @@ private:
             return {
                 ReadMenuAction::Scan,
                 ReadMenuAction::Dump,
-                ReadMenuAction::Save,
                 ReadMenuAction::Clear,
             };
         }
         return {
             ReadMenuAction::Scan,
             ReadMenuAction::Dump,
-            ReadMenuAction::Save,
             ReadMenuAction::Clear,
         };
     }
@@ -1080,34 +1076,90 @@ private:
         }
     }
 
-    // Render one dump line ("BB:HHHH...32hex") with sector-trailer coloring.
-    // unscii_8 is exactly 8px per glyph: positions are in multiples of 8.
-    void render_dump_line_colored(lv_obj_t *parent, int x_base, int y, const std::string &line)
+    // Render one dump line with fixed-width font.
+    // For MFC payloads ("BB:HHHH...32hex"), apply trailer key coloring and
+    // block0 field coloring based on UID length (4-byte / 7-byte UID).
+    void render_dump_line_colored(lv_obj_t *parent, int x_base, int y, const std::string &line, int uid_len)
     {
         constexpr int CW = 8;  // unscii_8 char width in px
-        if (line.size() < 35 || line[2] != ':') {
-            create_text(parent, x_base, y, to_compact(line, 37).c_str(), 0xD8D8D8, 8);
+        constexpr int DUMP_FONT = 7;
+
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos || colon == 0 || colon > 3) {
+            create_text(parent, x_base, y, to_compact(line, 37).c_str(), 0xD8D8D8, 10);
             return;
         }
-        const int block_num = (line[0] - '0') * 10 + (line[1] - '0');
+        for (size_t i = 0; i < colon; ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(line[i]))) {
+                create_text(parent, x_base, y, to_compact(line, 37).c_str(), 0xD8D8D8, 10);
+                return;
+            }
+        }
+
+        const int block_num = std::stoi(line.substr(0, colon), nullptr, 10);
         const bool is_trailer = (block_num % 4 == 3);
 
         // "BB:" prefix in dark gray — use unscii_8 (font_size<8) for fixed 8px/char
-        char prefix[4] = { line[0], line[1], ':', '\0' };
-        create_text(parent, x_base, y, prefix, 0x606060, 7);
+        const std::string prefix = line.substr(0, colon + 1);
+        create_text(parent, x_base, y, prefix.c_str(), 0x606060, DUMP_FONT);
 
-        const int hx = x_base + 3 * CW;  // hex data starts after "BB:"
-        const std::string hex = line.substr(3, 32);
+        const int hx = x_base + static_cast<int>((colon + 1) * CW);  // hex data starts after "BB:"
+        const std::string hex = line.substr(colon + 1);
 
-        // Use font_size=7 → lv_font_unscii_8 (fixed 8px/char), matching CW=8.
-        // montserrat_8 is proportional (~5-7px/char) and breaks position math.
-        constexpr int DUMP_FONT = 7;
+        auto is_all_hex = [](const std::string &s) {
+            if (s.empty()) return false;
+            for (char ch : s) {
+                if (!std::isxdigit(static_cast<unsigned char>(ch))) return false;
+            }
+            return true;
+        };
+
+        auto ascii_from_hex = [](const std::string &s) {
+            std::string out;
+            if ((s.size() % 2) != 0) return out;
+            out.reserve(s.size() / 2);
+            for (size_t i = 0; i + 1 < s.size(); i += 2) {
+                const std::string pair = s.substr(i, 2);
+                const unsigned long v = std::strtoul(pair.c_str(), nullptr, 16);
+                const unsigned char ch = static_cast<unsigned char>(v & 0xFF);
+                out.push_back((ch >= 32 && ch <= 126) ? static_cast<char>(ch) : '.');
+            }
+            return out;
+        };
+
+        // Non-MFC payloads (e.g. MFU/ISO15693) keep index + fixed-width body.
+        if (hex.size() == 8 && is_all_hex(hex)) {
+            // MFU/NTAG page highlighting:
+            //   page0 last byte  = BCC0
+            //   page2 first byte = BCC1
+            if (block_num == 0) {
+                create_text(parent, hx,          y, hex.substr(0, 6).c_str(), 0x00D2FF, DUMP_FONT); // UID[0..2]
+                create_text(parent, hx + 6 * CW, y, hex.substr(6, 2).c_str(), 0xFF66CC, DUMP_FONT); // BCC0
+            } else if (block_num == 1) {
+                create_text(parent, hx, y, hex.c_str(), 0x00D2FF, DUMP_FONT); // UID[3..6]
+            } else if (block_num == 2) {
+                create_text(parent, hx,          y, hex.substr(0, 2).c_str(), 0xFF66CC, DUMP_FONT); // BCC1
+                create_text(parent, hx + 2 * CW, y, hex.substr(2, 6).c_str(), 0xB0B0B0, DUMP_FONT);
+            } else {
+                create_text(parent, hx, y, hex.c_str(), 0xC0C0C0, DUMP_FONT);
+            }
+
+            const std::string ascii = ascii_from_hex(hex);
+            create_text(parent, hx + 10 * CW, y, "|", 0x606060, DUMP_FONT);
+            create_text(parent, hx + 12 * CW, y, ascii.c_str(), 0x8FD0FF, DUMP_FONT);
+            return;
+        }
+
+        if (hex.size() != 32) {
+            create_text(parent, hx, y, to_compact(hex, 34).c_str(), 0xC0C0C0, DUMP_FONT);
+            return;
+        }
 
         if (is_trailer) {
             // Key A (bytes 0-5): hex chars [0..11]
             const std::string keyA = hex.substr(0, 12);
             create_text(parent, hx,               y, keyA.c_str(),
-                        is_default_mfc_key(keyA) ? 0x00CC66u : 0xFF8800u, DUMP_FONT);
+                        (block_num == 3) ? 0x00CC66u : (is_default_mfc_key(keyA) ? 0x00CC66u : 0xFF8800u), DUMP_FONT);
             // Access Conditions + GPB (bytes 6-9): hex chars [12..19]
             const std::string ac = hex.substr(12, 8);
             create_text(parent, hx + 12 * CW,    y, ac.c_str(),   0xF7A600, DUMP_FONT);
@@ -1115,6 +1167,21 @@ private:
             const std::string keyB = hex.substr(20, 12);
             create_text(parent, hx + 20 * CW,    y, keyB.c_str(),
                         is_default_mfc_key(keyB) ? 0x00CC66u : 0xFF8800u, DUMP_FONT);
+        } else if (block_num == 0) {
+            if (uid_len >= 7) {
+                // 7-byte UID block0: UID[0..6] | SAK | ATQA[2] | manufacturer data
+                create_text(parent, hx,          y, hex.substr(0, 14).c_str(), 0x00D2FF, DUMP_FONT);
+                create_text(parent, hx + 14 * CW,y, hex.substr(14, 2).c_str(), 0xFFD166, DUMP_FONT);
+                create_text(parent, hx + 16 * CW,y, hex.substr(16, 4).c_str(), 0x7CFF6B, DUMP_FONT);
+                create_text(parent, hx + 20 * CW,y, hex.substr(20, 12).c_str(), 0xB0B0B0, DUMP_FONT);
+            } else {
+                // 4-byte UID block0: UID[0..3] | BCC | SAK | ATQA[2] | manufacturer data
+                create_text(parent, hx,          y, hex.substr(0, 8).c_str(),  0x00D2FF, DUMP_FONT);
+                create_text(parent, hx + 8 * CW, y, hex.substr(8, 2).c_str(),  0xFF66CC, DUMP_FONT);
+                create_text(parent, hx + 10 * CW,y, hex.substr(10, 2).c_str(), 0xFFD166, DUMP_FONT);
+                create_text(parent, hx + 12 * CW,y, hex.substr(12, 4).c_str(), 0x7CFF6B, DUMP_FONT);
+                create_text(parent, hx + 16 * CW,y, hex.substr(16, 16).c_str(),0xB0B0B0, DUMP_FONT);
+            }
         } else {
             create_text(parent, hx, y, hex.c_str(), 0xC0C0C0, DUMP_FONT);
         }
@@ -1169,32 +1236,34 @@ private:
         int log_h = 100;
         if (scan.has_result) {
             const auto &tag = record.tag;
-            const bool is_i2c = (endpoint.kind == nfc_app::TransportKind::I2cBus);
-            if (is_i2c) {
-                // GroveNFC: two-line display — protocol name then UID without colon separators
-                lv_obj_t *info = create_panel(parent, 0, 20, 320, 24, 0x0C1810);
-                std::string uid_clean;
-                for (char c : tag.uid) { if (c != ':') uid_clean += c; }
-                create_text(info, 4,  2, nfc_app::to_string(tag.protocol), 0x00FF88, 10);
-                create_text(info, 4, 13, to_compact(uid_clean, 52).c_str(), 0x00D2FF, 10);
-                log_y = 45;
-                log_h = 75;
-            } else {
-                const auto &fields = tag.identity_fields;
-                auto it_atqa = fields.find("atqa");
-                auto it_sak  = fields.find("sak");
-                const std::string atqa_str = (it_atqa != fields.end()) ? it_atqa->second : "-";
-                const std::string sak_str  = (it_sak  != fields.end()) ? it_sak->second  : "-";
+            auto find_identity_ci = [&](const char *key) -> std::string {
+                std::string key_up;
+                for (const char *p = key; p && *p; ++p)
+                    key_up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(*p))));
+                for (const auto &kv : tag.identity_fields) {
+                    std::string field_up;
+                    for (char ch : kv.first)
+                        field_up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+                    if (field_up == key_up) return kv.second;
+                }
+                return "-";
+            };
 
-                lv_obj_t *info = create_panel(parent, 0, 20, 320, 13, 0x0C1810);
-                // Single line: Protocol + UID + SAK + ATQA
-                const std::string card_line =
-                    std::string(nfc_app::to_string(tag.protocol)) + " " + tag.uid
-                    + " SAK:" + sak_str + " ATQA:" + atqa_str;
-                create_text(info, 4, 2, to_compact(card_line, 52).c_str(), 0x00FF88, 10);
-                log_y = 34;
-                log_h = 86;
-            }
+            std::string uid_clean;
+            uid_clean.reserve(tag.uid.size());
+            for (char c : tag.uid) if (c != ':') uid_clean.push_back(c);
+
+            const std::string type_text = tag.tag_type.empty() ? nfc_app::to_string(tag.protocol) : tag.tag_type;
+            const std::string atqa_str = find_identity_ci("ATQA");
+            const std::string sak_str  = find_identity_ci("SAK");
+
+            lv_obj_t *info = create_panel(parent, 0, 20, 320, 13, 0x0C1810);
+            // Unified single-line header for all readers: type + uid + SAK + ATQA
+            const std::string card_line =
+                type_text + " " + uid_clean + " SAK:" + sak_str + " ATQA:" + atqa_str;
+            create_text(info, 4, 2, to_compact(card_line, 52).c_str(), 0x00FF88, 10);
+            log_y = 34;
+            log_h = 86;
         }
 
         // ── Log area: always full-width ────────────────────────────────────
@@ -1223,15 +1292,31 @@ private:
                 if (conn.connected)
                     create_text(detail, 4, 68, to_compact(scan.error, 40).c_str(), 0xFF6060, 10);
         } else {
+            int uid_hex_digits = 0;
+            for (char ch : record.tag.uid) {
+                if (std::isxdigit(static_cast<unsigned char>(ch))) ++uid_hex_digits;
+            }
+            const int uid_len = uid_hex_digits / 2;
+
             for (int row = 0; row < visible_lines; ++row) {
                 const int idx = log_scroll_offset_ + row;
                 if (idx >= total_lines) break;
                 const auto &line = scan_log_lines_[idx];
                 const int y = 2 + row * LOG_LINE_H;
 
-                if (line.size() >= 3 && std::isdigit((unsigned char)line[0]) &&
-                    std::isdigit((unsigned char)line[1]) && line[2] == ':') {
-                    render_dump_line_colored(detail, 2, y, line);
+                const size_t colon = line.find(':');
+                bool looks_dump_line = (colon != std::string::npos && colon > 0 && colon <= 3);
+                if (looks_dump_line) {
+                    for (size_t i = 0; i < colon; ++i) {
+                        if (!std::isdigit(static_cast<unsigned char>(line[i]))) {
+                            looks_dump_line = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (looks_dump_line) {
+                    render_dump_line_colored(detail, 2, y, line, uid_len);
                 } else {
                     uint32_t color = 0xD0D0D0;
                     if (line.size() >= 2 && line[0] == 'O' && line[1] == 'K') color = 0x00FF88;
@@ -2464,7 +2549,8 @@ private:
         const auto conn = service_.connection_state();
         const bool supported = conn.connected &&
             (conn.device_kind == nfc_app::DeviceKind::PN532 ||
-             conn.device_kind == nfc_app::DeviceKind::PN532Killer);
+             conn.device_kind == nfc_app::DeviceKind::PN532Killer ||
+             conn.device_kind == nfc_app::DeviceKind::NFCUnit);
 
         const char *gen_labels[4] = {"Gen1A", "Gen2", "Gen3", "Gen4"};
         const char *len_labels[2] = {"4B", "7B"};
@@ -2511,7 +2597,7 @@ private:
                 if (uid_changer_field_idx_ == 2) b0_line += "_";
                 create_text(parent, 6, 68, to_compact(b0_line, 46).c_str(), c2, 10);
             }
-            create_text(parent, 6, 82, "[S] Scan card from PN532/PN532Killer", 0x00FF88, 10);
+            create_text(parent, 6, 82, "[S] Scan card from PN532/Killer/NFC Unit", 0x00FF88, 10);
             create_text(parent, 6, 95, "U/D:field Bsp:del [S]:scan Enter:next", 0x666666, 10);
             return;
         }
@@ -2560,7 +2646,7 @@ private:
 
         execute_field = field_idx++;
         draw_row("[ Enter ] Confirm Write", uid_changer_field_idx_ == execute_field ? 0x00FF88 : 0x8DB6FF);
-        draw_row(supported ? "Target ready" : "Connect PN532/PN532Killer first", supported ? 0x00FF88 : 0xFF8888);
+        draw_row(supported ? "Target ready" : "Connect PN532/Killer/NFC Unit first", supported ? 0x00FF88 : 0xFF8888);
         draw_row("U/D field  ESC back", 0x666666);
     }
 
@@ -3904,6 +3990,10 @@ private:
         }
 
         if (uid_changer_step_ == 1) {
+            const auto conn = service_.connection_state();
+            if (conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+                uid_changer_generation_idx_ = 0;
+            }
             const int field_count = 2;
             if (key == KEY_UP || key == KEY_F) {
                 uid_changer_field_idx_ = (uid_changer_field_idx_ + field_count - 1) % field_count;
@@ -3914,6 +4004,10 @@ private:
                 return;
             }
             if ((key == KEY_LEFT || key == KEY_RIGHT) && uid_changer_field_idx_ == 0) {
+                if (conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+                    ui_message_ = "NFC Unit supports Gen1A only";
+                    return;
+                }
                 const int delta = (key == KEY_LEFT) ? -1 : 1;
                 int next = uid_changer_generation_idx_;
                 for (int i = 0; i < 4; ++i) {
@@ -3987,8 +4081,15 @@ private:
         const auto conn = service_.connection_state();
         if (!conn.connected ||
             (conn.device_kind != nfc_app::DeviceKind::PN532 &&
-             conn.device_kind != nfc_app::DeviceKind::PN532Killer)) {
-            ui_message_ = "Connect PN532/PN532Killer first";
+             conn.device_kind != nfc_app::DeviceKind::PN532Killer &&
+             conn.device_kind != nfc_app::DeviceKind::NFCUnit)) {
+            ui_message_ = "Connect PN532/Killer/NFC Unit first";
+            return;
+        }
+
+        if (conn.device_kind == nfc_app::DeviceKind::NFCUnit &&
+            uid_changer_generation() != nfc_app::UidMagicGeneration::Gen1A) {
+            ui_message_ = "NFC Unit supports Gen1A only";
             return;
         }
 

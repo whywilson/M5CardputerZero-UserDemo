@@ -236,14 +236,207 @@ public:
         switch (protocol) {
         case ProtocolKind::Iso15693:
             return dumpNFCUnitISO15693(uid_hint, out_lines, error);
-        case ProtocolKind::Iso14443A:
-            return dumpNFCUnitMFU(uid_hint, out_lines, error);
+        case ProtocolKind::Iso14443A: {
+            std::string mfu_err;
+            if (dumpNFCUnitMFU(uid_hint, out_lines, &mfu_err)) {
+                if (error) error->clear();
+                return true;
+            }
+            // Some Gen1A/Magic MFC cards may be scanned as generic ISO14443A.
+            // If MFU path fails, fall back to MFC dump path automatically.
+            std::string mfc_err;
+            std::string detected_magic;
+            if (dumpNFCUnitMFC(uid_hint, tag_type, mfc_key_hex, &detected_magic, out_lines, &mfc_err)) {
+                if (magic_type && !detected_magic.empty()) *magic_type = detected_magic;
+                if (error) error->clear();
+                return true;
+            }
+            if (error) {
+                *error = mfu_err.empty() ? (mfc_err.empty() ? "ISO14443A dump failed" : mfc_err)
+                                         : mfu_err;
+            }
+            return false;
+        }
         case ProtocolKind::MifareClassic:
             return dumpNFCUnitMFC(uid_hint, tag_type, mfc_key_hex, magic_type, out_lines, error);
         default:
             if (error) *error = "Unsupported protocol for I2C dump";
             return false;
         }
+    }
+
+    // Write block 0 for Gen1A magic card on NFC Unit (ST25R3916B).
+    // block0 must be exactly 16 bytes and already contain UID/BCC/SAK/ATQA bytes.
+    bool writeNFCUnitGen1ABlock0(const std::vector<uint8_t> &block0,
+                                 std::string *error = nullptr)
+    {
+        if (!is_open()) {
+            if (error) *error = "I2C device not open";
+            return false;
+        }
+        if (!is_nfc_unit()) {
+            if (error) *error = "Only NFC Unit supports this operation";
+            return false;
+        }
+        if (block0.size() != 16) {
+            if (error) *error = "block0 must be 16 bytes";
+            return false;
+        }
+
+#ifndef _WIN32
+        if (!st25r_init_nfca_reader()) {
+            if (error) *error = "NFCA init failed";
+            return false;
+        }
+
+        auto parse_ack = [](const uint8_t *rx, uint8_t rx_len) {
+            if (!rx || rx_len == 0) return false;
+            const uint8_t lo = static_cast<uint8_t>(rx[0] & 0x0F);
+            const uint8_t hi = static_cast<uint8_t>((rx[0] >> 4) & 0x0F);
+            return (lo == 0x0A) || (hi == 0x0A) || (rx[0] == 0x0A);
+        };
+
+        auto write_step = [&](const uint8_t *tx, uint8_t tx_len, const char *name) {
+            uint8_t ack_len = 4;
+            uint8_t ack[4] = {0};
+            if (!st25r_nfca_transceive(tx, tx_len, true, ack, ack_len, 60, 0x00, true, 0)) {
+                if (error) *error = std::string(name) + " timeout";
+                return false;
+            }
+            if (!parse_ack(ack, ack_len)) {
+                if (error) *error = std::string(name) + " no ACK";
+                return false;
+            }
+            return true;
+        };
+
+        // Reuse proven unlock path; success implies card is in Gen1A unlocked mode.
+        if (!st25r_is_gen1a_magic("")) {
+            st25r_write_reg(0x02, 0x80);
+            if (error) *error = "not Gen1A";
+            return false;
+        }
+
+        const uint8_t write_cmd[2] = {0xA0, 0x00};
+        if (!write_step(write_cmd, sizeof(write_cmd), "write cmd") ||
+            !write_step(block0.data(), static_cast<uint8_t>(block0.size()), "write data")) {
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+
+        std::array<uint8_t, 16> verify{};
+        const bool verify_ok = st25r_mfc_read_plain_block(0, verify) &&
+                               std::equal(verify.begin(), verify.end(), block0.begin());
+        st25r_write_reg(0x02, 0x80);
+        if (!verify_ok) {
+            if (error) *error = "verify block0 failed";
+            return false;
+        }
+        if (error) error->clear();
+        return true;
+#else
+        (void)block0;
+        if (error) *error = "Unsupported platform";
+        return false;
+#endif
+    }
+
+    // Write block 0 for Gen3 (CUID) magic card on NFC Unit (ST25R3916B).
+    // uid must be 4 or 7 bytes; block0 must be exactly 16 bytes.
+    // Protocol: select → plain READ block0 (Gen3 check) → UID-set cmd → block0-write cmd.
+    bool writeNFCUnitGen3Block0(const std::vector<uint8_t> &uid,
+                                const std::vector<uint8_t> &block0,
+                                std::string *error = nullptr)
+    {
+        if (!is_open()) {
+            if (error) *error = "I2C device not open";
+            return false;
+        }
+        if (!is_nfc_unit()) {
+            if (error) *error = "Only NFC Unit supports this operation";
+            return false;
+        }
+        if (uid.size() != 4 && uid.size() != 7) {
+            if (error) *error = "uid must be 4 or 7 bytes";
+            return false;
+        }
+        if (block0.size() != 16) {
+            if (error) *error = "block0 must be 16 bytes";
+            return false;
+        }
+
+#ifndef _WIN32
+        // Full ISO14443-A select (includes RF reset inside st25r_nfca_select_uid).
+        std::vector<uint8_t> sel_uid;
+        uint8_t sak = 0;
+        if (!st25r_nfca_select_uid(sel_uid, sak)) {
+            if (error) *error = "card select failed";
+            return false;
+        }
+
+        // Verify Mifare Classic / Mifare Plus SL2 by SAK.
+        if (!(sak == 0x08 || sak == 0x09 || sak == 0x18 || sak == 0x28 || sak == 0x38 ||
+              sak == 0x1C)) {
+            st25r_write_reg(0x02, 0x80);
+            if (error) *error = "not Mifare Classic (SAK mismatch)";
+            return false;
+        }
+
+        // Gen3 check: block 0 must be readable without authentication.
+        std::array<uint8_t, 16> blk0_read{};
+        if (!st25r_mfc_read_plain_block(0, blk0_read)) {
+            st25r_write_reg(0x02, 0x80);
+            if (error) *error = "not Gen3: block0 plain read failed";
+            return false;
+        }
+
+        // ACK parser (same logic as Gen1A write).
+        auto parse_ack = [](const uint8_t *rx, uint8_t rx_len) -> bool {
+            if (!rx || rx_len == 0) return false;
+            const uint8_t lo = static_cast<uint8_t>(rx[0] & 0x0F);
+            const uint8_t hi = static_cast<uint8_t>((rx[0] >> 4) & 0x0F);
+            return (lo == 0x0A) || (hi == 0x0A) || (rx[0] == 0x0A);
+        };
+
+        auto send_gen3_cmd = [&](const std::vector<uint8_t> &cmd, const char *name) -> bool {
+            uint8_t ack[4] = {0};
+            uint8_t ack_len = sizeof(ack);
+            if (!st25r_nfca_transceive(cmd.data(), static_cast<uint8_t>(cmd.size()),
+                                       true, ack, ack_len, 80, 0x00, true, 0)) {
+                if (error) *error = std::string(name) + " timeout";
+                return false;
+            }
+            if (!parse_ack(ack, ack_len)) {
+                if (error) *error = std::string(name) + " no ACK";
+                return false;
+            }
+            return true;
+        };
+
+        // Gen3 UID-set command: {0x90, 0xFB, 0xCC, 0xCC, 0x07, uid...}
+        std::vector<uint8_t> uid_cmd = {0x90, 0xFB, 0xCC, 0xCC, 0x07};
+        uid_cmd.insert(uid_cmd.end(), uid.begin(), uid.end());
+        if (!send_gen3_cmd(uid_cmd, "Gen3 UID set")) {
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+
+        // Gen3 block0-write command: {0x90, 0xF0, 0xCC, 0xCC, 0x10, block0...}
+        std::vector<uint8_t> blk0_cmd = {0x90, 0xF0, 0xCC, 0xCC, 0x10};
+        blk0_cmd.insert(blk0_cmd.end(), block0.begin(), block0.end());
+        if (!send_gen3_cmd(blk0_cmd, "Gen3 block0 write")) {
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+
+        st25r_write_reg(0x02, 0x80);
+        if (error) error->clear();
+        return true;
+#else
+        (void)uid; (void)block0;
+        if (error) *error = "Unsupported platform";
+        return false;
+#endif
     }
 
     // ── Emulation (GroveNFC 0x48 only, NFC Unit returns false) ───────────────
@@ -1308,6 +1501,17 @@ private:
         return true;
     }
 
+    // Type 2 tags support READ(page) for 4 consecutive pages (16 bytes).
+    // We probe specific high pages to distinguish NTAG203 vs NTAG21x reliably.
+    bool st25r_type2_has_page(uint8_t page, int timeout_ms = 40)
+    {
+        uint8_t rx_len = 20;
+        uint8_t rx[20] = {0};
+        const uint8_t cmd[2] = {0x30, page};
+        return st25r_nfca_transceive(cmd, 2, true, rx, rx_len, timeout_ms, 0x00, false, 0) &&
+               rx_len >= 16;
+    }
+
     bool st25r_gen1a_backdoor_ack(uint8_t cmd, uint8_t tx_last_bits)
     {
         uint8_t rx_len = 4;
@@ -1343,20 +1547,10 @@ private:
 
                 const bool ack2 = st25r_gen1a_backdoor_ack(0x43, 0);
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-                // Some cards/reader states do not expose 4-bit ACK reliably; keep legacy no-rx fallback.
-                if (!ack1 && !ack2) {
-                    const uint8_t unlock1 = 0x40;
-                    (void)st25r_nfca_transmit_only(&unlock1, 1, false, 0x00, 7, 25);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-                    const uint8_t unlock2 = 0x43;
-                    (void)st25r_nfca_transmit_only(&unlock2, 1, false, 0x00, 0, 25);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
-
-                std::array<uint8_t, 16> block0{};
-                if (st25r_mfc_read_plain_block(0, block0)) {
+                // Bruce-compatible Gen1A confirmation: unlock1 ACK + unlock2 ACK.
+                // Avoid read-without-auth fallback here, otherwise Gen3/Gen4 can
+                // be misclassified as Gen1A.
+                if (ack1 && ack2) {
                     return true;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -1373,15 +1567,42 @@ private:
 
     bool st25r_is_gen3_magic(const std::string &selected_uid)
     {
+        auto &hexlog = NfcHexLog::get();
+        hexlog.log_event("GEN3", "probe start");
+
         std::vector<uint8_t> uid;
         uint8_t sak = 0;
-        if (!st25r_nfca_select_uid(uid, sak)) return false;
+        if (!st25r_nfca_select_uid(uid, sak)) {
+            hexlog.log_event("GEN3", "select FAILED");
+            return false;
+        }
+
+        {
+            char sak_msg[32];
+            std::snprintf(sak_msg, sizeof(sak_msg), "SAK=0x%02X", sak);
+            hexlog.log_event("GEN3", sak_msg);
+        }
+
+        // Only Mifare Classic / Mifare Plus SL2 can be Gen3 magic.
+        if (!(sak == 0x08 || sak == 0x09 || sak == 0x18 || sak == 0x28 || sak == 0x38 ||
+              sak == 0x1C)) {
+            hexlog.log_event("GEN3", "SAK not MFC");
+            return false;
+        }
 
         const std::string uid_hex = hex_compact(uid.data(), uid.size());
-        if (!selected_uid.empty() && uid_hex != selected_uid) return false;
+        if (!selected_uid.empty() && uid_hex != selected_uid) {
+            char mm[64];
+            std::snprintf(mm, sizeof(mm), "UID mismatch got=%s want=%s",
+                          uid_hex.c_str(), selected_uid.c_str());
+            hexlog.log_event("GEN3", mm);
+            return false;
+        }
 
         std::array<uint8_t, 16> block0{};
-        return st25r_mfc_read_plain_block(0, block0);
+        const bool ok = st25r_mfc_read_plain_block(0, block0);
+        hexlog.log_event("GEN3", ok ? "plain_read OK → Gen3" : "plain_read FAILED");
+        return ok;
     }
 
     bool st25r_is_gen4_magic(const std::string &selected_uid)
@@ -1389,6 +1610,12 @@ private:
         std::vector<uint8_t> uid;
         uint8_t sak = 0;
         if (!st25r_nfca_select_uid(uid, sak)) return false;
+
+        // Only Mifare Classic / Mifare Plus SL2 can be Gen4 magic.
+        if (!(sak == 0x08 || sak == 0x09 || sak == 0x18 || sak == 0x28 || sak == 0x38 ||
+              sak == 0x1C)) {
+            return false;
+        }
 
         const std::string uid_hex = hex_compact(uid.data(), uid.size());
         if (!selected_uid.empty() && uid_hex != selected_uid) return false;
@@ -1409,13 +1636,16 @@ private:
 
     std::string st25r_detect_magic_type(const std::string &selected_uid)
     {
-        // Probe twice to tolerate analog/RF timing variance on ST25R scans.
+        // Probe order: Gen3 first, then Gen1A, then Gen4.
+        // Gen3 detection uses plain READ(block0) without auth — it must run
+        // BEFORE Gen1A probing, which sends 7-bit backdoor frames (0x40/0x43)
+        // that can leave the ST25R in a state where subsequent plain READ fails.
         for (int pass = 0; pass < 2; ++pass) {
+            if (st25r_is_gen3_magic(selected_uid)) return "Gen3";
+            if (!selected_uid.empty() && st25r_is_gen3_magic("")) return "Gen3";
             if (st25r_is_gen1a_magic(selected_uid)) return "Gen1A";
             // Some ST25R UID reads may differ during re-select; retry without UID pinning.
             if (!selected_uid.empty() && st25r_is_gen1a_magic("")) return "Gen1A";
-            if (st25r_is_gen3_magic(selected_uid)) return "Gen3";
-            if (!selected_uid.empty() && st25r_is_gen3_magic("")) return "Gen3";
             if (st25r_is_gen4_magic(selected_uid)) return "Gen4";
             if (!selected_uid.empty() && st25r_is_gen4_magic("")) return "Gen4";
         }
@@ -1463,7 +1693,9 @@ private:
         if (sak_len < 1) return false;
         sak = sak_buf[0];
 
-        const bool cascade = (cl1[0] == 0x88) && (sak & 0x04);
+        // GroveNFC behavior: CT(0x88) means cascade UID.
+        // Some readers/cards may not present SAK cascade bit reliably in this step.
+        const bool cascade = (cl1[0] == 0x88);
         if (!cascade) {
             uid.assign(cl1, cl1 + 4);
             return true;
@@ -1547,11 +1779,36 @@ private:
         {
             const uint8_t get_ver[1] = {0x60};
             if (st25r_nfca_transceive(get_ver, 1, true, ver, ver_len, 40, 0x00, false, 0) && ver_len >= 8) {
+                const uint8_t ic_type = ver[2];
                 const uint8_t storage_sz = ver[6];
-                if      (storage_sz == 0x0F) last_page = 44;   // NTAG213
-                else if (storage_sz == 0x11) last_page = 134;  // NTAG215
-                else if (storage_sz == 0x13) last_page = 230;  // NTAG216
-                else                         last_page = 63;
+                if (ic_type == 0x04) {
+                    if      (storage_sz == 0x0F) last_page = 44;   // NTAG213
+                    else if (storage_sz == 0x11) last_page = 134;  // NTAG215
+                    else if (storage_sz == 0x13) last_page = 230;  // NTAG216
+                    else if (storage_sz == 0x12) {
+                        // Ambiguous reports appear on some clones/firmware paths.
+                        // Probe high pages to avoid falsely truncating NTAG213 to NTAG203.
+                        const bool has_page44 = st25r_type2_has_page(0x2C);
+                        if (has_page44) {
+                            const bool has_page134 = st25r_type2_has_page(0x86);
+                            const bool has_page230 = has_page134 && st25r_type2_has_page(0xE6);
+                            if (has_page230) last_page = 230;
+                            else if (has_page134) last_page = 134;
+                            else last_page = 44;
+                        } else {
+                            last_page = 41;  // NTAG203 max page
+                        }
+                    } else {
+                        last_page = 63;
+                    }
+                } else if (ic_type == 0x03) {
+                    if      (storage_sz == 0x0B) last_page = 19;   // Ultralight EV1 UL11
+                    else if (storage_sz == 0x0E) last_page = 40;   // Ultralight EV1 UL21
+                    else if (storage_sz == 0x06) last_page = 15;   // Ultralight 64B
+                    else                         last_page = 63;
+                } else {
+                    last_page = 63;
+                }
             }
         }
 
@@ -1906,6 +2163,20 @@ private:
             hexlog.log_event("NFC-I2C", irq_msg);
         }
         if (!(irq & 0x10)) {
+            // Some Mifare Classic cards need a second short-frame wakeup after
+            // RF field stabilization. Retry once before falling back to ISO15693.
+            st25r_cmd(0xDB);
+            st25r_cmd(0xC7);
+            irq = st25r_wait_irq(0x10 | 0x04, 40);
+            {
+                char irq_retry_msg[48];
+                std::snprintf(irq_retry_msg, sizeof(irq_retry_msg),
+                              "WUPA retry irq=0x%02X (rxe=%d col=%d)",
+                              irq, !!(irq & 0x10), !!(irq & 0x04));
+                hexlog.log_event("NFC-I2C", irq_retry_msg);
+            }
+        }
+        if (!(irq & (0x10 | 0x04))) {
             hexlog.log_event("NFC-I2C", "WUPA: no rxe → try ISO15693 SubCarrierStream");
             // ── ISO15693 INVENTORY (SubCarrierStream mode) ────────────────
             // ST25R3916B has no native ISO15693 mode.  It uses SubCarrierStream
@@ -2008,24 +2279,29 @@ private:
             return true;
         }
 
-        // Read ATQA (2 bytes) from FIFO via OP_READ_FIFO (0x9F).
+        // Read ATQA when rxe is present. If collision-only IRQ happened, still
+        // continue anticollision with ATQA unknown to avoid false "no card".
         uint8_t fifo_cnt = 0;
-        st25r_read_reg(0x1E, fifo_cnt);
-        if (fifo_cnt < 2) {
-            hexlog.log_event("NFC-I2C", "ATQA: FIFO too short (<2 bytes)");
-            st25r_write_reg(0x02, 0x80);
-            return false;
-        }
         uint8_t atqa[2] = {0, 0};
-        if (!st25r_fifo_read(atqa, 2)) {
-            hexlog.log_event("NFC-I2C", "ATQA: FIFO read failed");
-            st25r_write_reg(0x02, 0x80);
-            return false;
-        }
-        // Drain any extra FIFO bytes beyond the 2 ATQA bytes.
-        if (fifo_cnt > 2) {
-            uint8_t drain[8];
-            st25r_fifo_read(drain, (uint8_t)(fifo_cnt - 2));
+        if (irq & 0x10) {
+            st25r_read_reg(0x1E, fifo_cnt);
+            if (fifo_cnt < 2) {
+                hexlog.log_event("NFC-I2C", "ATQA: FIFO too short (<2 bytes)");
+                st25r_write_reg(0x02, 0x80);
+                return false;
+            }
+            if (!st25r_fifo_read(atqa, 2)) {
+                hexlog.log_event("NFC-I2C", "ATQA: FIFO read failed");
+                st25r_write_reg(0x02, 0x80);
+                return false;
+            }
+            // Drain any extra FIFO bytes beyond the 2 ATQA bytes.
+            if (fifo_cnt > 2) {
+                uint8_t drain[8];
+                st25r_fifo_read(drain, (uint8_t)(fifo_cnt - 2));
+            }
+        } else {
+            hexlog.log_event("NFC-I2C", "WUPA collision-only IRQ, continue with anticollision");
         }
         // Clear IRQ before next step.
         { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }
@@ -2101,6 +2377,7 @@ private:
         // Write only 7 data bytes to FIFO (NOT 9); chip adds CRC to make 9 bytes on air.
         hexlog.log_event("NFC-I2C", "SELECT CL1: ISO14443A_NFC=0x00, 7 bytes, cmd 0xC4 (auto-CRC)");
         st25r_write_reg(0x05, 0x00);  // clear antcl for SELECT (normal framing + parity)
+        st25r_set_aux_crc_mode(false); // ensure CRC stripped so FIFO has only SAK (1 byte)
         st25r_cmd(0xDB);
         {
             const uint8_t sel1[7] = {0x93, 0x70, cl1[0], cl1[1], cl1[2], cl1[3], cl1[4]};
@@ -2110,11 +2387,14 @@ private:
         { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }  // clear IRQ
         st25r_cmd(0xC4);  // TRANSMIT_WITH_CRC: TX the 7 bytes + auto CRC, then RX
 
-        irq = st25r_wait_irq(0x10 | 0x08, 50);
+        // Wait for rxe (0x10) or col (0x04) — NOT txe (0x08).
+        // 0xC4 is transceive: txe fires before card responds (~300µs later).
+        // Using 0x08 in mask causes early return before rxe → sak stays 0 → misclassified as Ultralight.
+        irq = st25r_wait_irq(0x10 | 0x04, 50);
         uint8_t sak = 0;
         {
             char irq_msg[40];
-            std::snprintf(irq_msg, sizeof(irq_msg), "SELECT CL1 irq=0x%02X (rxe=%d txe=%d)", irq, !!(irq & 0x10), !!(irq & 0x08));
+            std::snprintf(irq_msg, sizeof(irq_msg), "SELECT CL1 irq=0x%02X (rxe=%d col=%d)", irq, !!(irq & 0x10), !!(irq & 0x04));
             hexlog.log_event("NFC-I2C", irq_msg);
         }
         if (irq & 0x10) {
@@ -2139,7 +2419,8 @@ private:
         }
 
         // UID cascade: if uid[0]==CT(0x88) AND SAK bit2 set → more levels.
-        const bool cascade = (cl1[0] == 0x88) && (sak & 0x04);
+        // Keep consistent with GroveNFC: rely on CT byte for cascade decision.
+        const bool cascade = (cl1[0] == 0x88);
 
         uint8_t uid_buf[10] = {0};
         size_t uid_len = 0;
@@ -2180,7 +2461,15 @@ private:
                             st25r_set_ntx(7);
                             { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }
                             st25r_cmd(0xC4);  // TRANSMIT_WITH_CRC (auto-CRC)
-                            irq = st25r_wait_irq(0x10 | 0x08, 50);
+                            // Same fix: wait for rxe/col, not txe
+                            irq = st25r_wait_irq(0x10 | 0x04, 50);
+                            {
+                                char cl2_irq_msg[48];
+                                std::snprintf(cl2_irq_msg, sizeof(cl2_irq_msg),
+                                             "SELECT CL2 irq=0x%02X (rxe=%d col=%d)",
+                                             irq, !!(irq & 0x10), !!(irq & 0x04));
+                                hexlog.log_event("NFC-I2C", cl2_irq_msg);
+                            }
                             if (irq & 0x10) {
                                 st25r_read_reg(0x1E, fifo_cnt);
                                 if (fifo_cnt >= 1) {
@@ -2205,11 +2494,10 @@ private:
             }
         }
 
-        // Turn off RF field (keep oscillator on for fast next poll).
-        // TX_CTRL stays at 0x03; it's set before OP_CONTROL each scan so is always safe.
-        st25r_write_reg(0x02, 0x80);
-
-        if (uid_len == 0) return false;
+        if (uid_len == 0) {
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
 
         // Format UID (no colon separators, consistent with GroveNFC path).
         std::string uid_str;
@@ -2242,25 +2530,107 @@ private:
             card.protocol = "MFPlus";
             char buf[32]; std::snprintf(buf, sizeof(buf), "MIFARE Plus (SAK:%02X)", sak);
             card.detail = buf;
-        } else if (sak == 0x20 || sak == 0x28) {
+        } else if (sak == 0x20) {
             card.protocol = "DESFire";
             char buf[32]; std::snprintf(buf, sizeof(buf), "DESFire/JCOP (SAK:%02X)", sak);
             card.detail = buf;
+        } else if (sak == 0x28) {
+            card.protocol = "MFC1K";
+            card.detail = "MIFARE Classic 1K (7-byte UID, SAK:28)";
+        } else if (sak == 0x38) {
+            card.protocol = "MFC4K";
+            card.detail = "MIFARE Classic 4K (7-byte UID, SAK:38)";
+        } else if (sak == 0x1C) {
+            card.protocol = "MFCPlus";
+            card.detail = "MIFARE Plus SL2 (SAK:1C, MFC-compatible)";
         } else if (sak == 0x00) {
-            // NTAG / Ultralight
+            // NTAG / Ultralight: follow GroveNFC flow, classify with GET_VERSION.
             card.protocol = "NTAG";
             card.detail = "NTAG/Ultralight (SAK:00)";
+
+            uint8_t ver_len = 24;
+            uint8_t ver[24] = {0};
+            const uint8_t get_ver[1] = {0x60};
+            if (st25r_nfca_transceive(get_ver, 1, true, ver, ver_len, 40, 0x00, false, 0) && ver_len >= 8) {
+                const uint8_t ic_type = ver[2];     // 0x03=UL, 0x04=NTAG
+                const uint8_t storage = ver[6];     // storage size marker
+                if (ic_type == 0x04) {
+                    if      (storage == 0x0F) { card.protocol = "NTAG213"; card.detail = "NTAG213 144B (SAK:00)"; }
+                    else if (storage == 0x11) { card.protocol = "NTAG215"; card.detail = "NTAG215 504B (SAK:00)"; }
+                    else if (storage == 0x13) { card.protocol = "NTAG216"; card.detail = "NTAG216 888B (SAK:00)"; }
+                    else if (storage == 0x12) {
+                        // NTAG203 vs NTAG21x disambiguation:
+                        // NTAG213+ can read page 44 (0x2C), while NTAG203 cannot.
+                        const bool has_page44 = st25r_type2_has_page(0x2C);
+                        if (has_page44) {
+                            const bool has_page134 = st25r_type2_has_page(0x86);
+                            const bool has_page230 = has_page134 && st25r_type2_has_page(0xE6);
+                            if (has_page230) {
+                                card.protocol = "NTAG216";
+                                card.detail = "NTAG216 888B (probe, SAK:00)";
+                            } else if (has_page134) {
+                                card.protocol = "NTAG215";
+                                card.detail = "NTAG215 504B (probe, SAK:00)";
+                            } else {
+                                card.protocol = "NTAG213";
+                                card.detail = "NTAG213 144B (probe, SAK:00)";
+                            }
+                        } else {
+                            card.protocol = "NTAG203";
+                            card.detail = "NTAG203 (SAK:00)";
+                        }
+                    }
+                    else {
+                        card.protocol = "NTAG";
+                        char buf[40];
+                        std::snprintf(buf, sizeof(buf), "NTAG stor=0x%02X (SAK:00)", storage);
+                        card.detail = buf;
+                    }
+                } else if (ic_type == 0x03) {
+                    if      (storage == 0x0B) { card.protocol = "MFUL11"; card.detail = "MIFARE Ultralight EV1 (48B, SAK:00)"; }
+                    else if (storage == 0x0E) { card.protocol = "MFUL21"; card.detail = "MIFARE Ultralight EV1 (128B, SAK:00)"; }
+                    else if (storage == 0x06) { card.protocol = "MFUL";   card.detail = "MIFARE Ultralight (64B, SAK:00)"; }
+                    else {
+                        card.protocol = "MFUL";
+                        char buf[44];
+                        std::snprintf(buf, sizeof(buf), "Ultralight stor=0x%02X (SAK:00)", storage);
+                        card.detail = buf;
+                    }
+                }
+            } else {
+                // GET_VERSION failed: keep conservative and avoid forcing NTAG203.
+                uint8_t probe_len = 20;
+                uint8_t probe[20] = {0};
+                const uint8_t rd29[2] = {0x30, 0x29};
+                if (st25r_nfca_transceive(rd29, 2, true, probe, probe_len, 40, 0x00, false, 0) && probe_len >= 16) {
+                    card.protocol = "MFUL-C";
+                    card.detail = "MIFARE Ultralight C (SAK:00)";
+                } else {
+                    if (st25r_type2_has_page(0x2C)) {
+                        card.protocol = "NTAG";
+                        card.detail = "NTAG21x (GET_VERSION fail, SAK:00)";
+                    } else {
+                        card.protocol = "MFUL";
+                        card.detail = "MIFARE Ultralight/NTAG (SAK:00)";
+                    }
+                }
+            }
         } else {
             card.protocol = "ISO14443A";
             char buf[32]; std::snprintf(buf, sizeof(buf), "ISO14443A (SAK:%02X)", sak);
             card.detail = buf;
         }
 
+        // Turn off RF field (keep oscillator on for fast next poll).
+        // Done HERE (after SAK classification) so that GET_VERSION / page-probe
+        // for SAK=0x00 cards can run while RF is still active.
+        st25r_write_reg(0x02, 0x80);
+
         const bool magic_probe_candidate =
-            (sak == 0x08 || sak == 0x09 || sak == 0x18 || sak == 0x00 ||
+            (sak == 0x08 || sak == 0x09 || sak == 0x18 || sak == 0x28 || sak == 0x38 ||
+             sak == 0x1C ||
              card.protocol == "MFC1K" || card.protocol == "MFC4K" ||
-             card.protocol == "MFCMini" || card.protocol == "ISO14443A" ||
-             card.protocol == "NTAG");
+             card.protocol == "MFCMini" || card.protocol == "MFCPlus");
 
         if (magic_probe_candidate) {
             card.magic_type = st25r_detect_magic_type(uid_str);
@@ -2270,6 +2640,7 @@ private:
                 hexlog.log_event("NFC-I2C", "Magic detect done: None");
             }
         }
+
         return true;
 #else
         card.valid = false;
@@ -2667,8 +3038,12 @@ inline std::string i2c_protocol_to_tag_type(const std::string &proto)
     if (proto == "NTAG213")  return "NTAG213";
     if (proto == "NTAG215")  return "NTAG215";
     if (proto == "NTAG216")  return "NTAG216";
+    if (proto == "NTAG203")  return "NTAG203";
     if (proto == "NTAG")     return "NTAG";
+    if (proto == "MFUL11")   return "MIFARE Ultralight EV1 (UL11)";
+    if (proto == "MFUL21")   return "MIFARE Ultralight EV1 (UL21)";
     if (proto == "MFUL")     return "MIFARE Ultralight";
+    if (proto == "MFUL-C")   return "MIFARE Ultralight C";
     if (proto == "ISO14443A") return "ISO14443A";
     if (proto == "ISO14443B") return "ISO14443B";
     if (proto == "ISO15693")  return "ISO15693";
