@@ -721,46 +721,46 @@ public:
             return resp.size() >= 2 && resp[1] == 0x0A;
         };
 
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            // ── Step 1: resetRegister (clear CommIEn/DivIEn, like Bruce) ───
-            {
-                const std::vector<uint8_t> frame =
-                    Pn532FrameCodec::build_command(0x08, {0x63, 0x02, 0x00, 0x63, 0x03, 0x00});
-                transport_->write_bytes(frame.data(), frame.size(), nullptr);
-                std::vector<uint8_t> rx;
-                collect_response(&rx, nullptr);
-            }
-
-            // ── Step 2: HALT without CRC (Bruce sends {0x50, 0x00} via ICT, no CRC) ─
-            {
-                const std::vector<uint8_t> frame =
-                    Pn532FrameCodec::build_command(0x42, {0x50, 0x00});
-                transport_->write_bytes(frame.data(), frame.size(), nullptr);
-                std::vector<uint8_t> rx;
-                collect_response(&rx, nullptr); // timeout is normal
-            }
+        // Session pre-step: clear register state and HALT the tag once.
+        // Avoid repeating HALT on every retry; only retry unlock handshakes.
+        {
+            const std::vector<uint8_t> frame =
+                Pn532FrameCodec::build_command(0x08, {0x63, 0x02, 0x00, 0x63, 0x03, 0x00});
+            transport_->write_bytes(frame.data(), frame.size(), nullptr);
+            std::vector<uint8_t> rx;
+            collect_response(&rx, nullptr);
+        }
+        {
+            const std::vector<uint8_t> frame =
+                Pn532FrameCodec::build_command(0x42, {0x50, 0x00});
+            transport_->write_bytes(frame.data(), frame.size(), nullptr);
+            std::vector<uint8_t> rx;
+            collect_response(&rx, nullptr); // timeout is normal
+        }
 #ifndef _WIN32
-            usleep(10000);
+        usleep(10000);
 #endif
+
+        for (int attempt = 0; attempt < 3; ++attempt) {
 
             // ── Step 3 & 4: send7bit(0x40) via WriteReg(0x633D,7) + ICT + WriteReg(0x633D,0) ─
             write_register(0x633D, 0x07, nullptr); // CIU TxLastBits=7 (Bruce uses 0x633D)
 #ifndef _WIN32
-            usleep(10000);
+            usleep(5000);
 #endif
             const uint8_t u1 = 0x40;
             std::vector<uint8_t> resp1;
             in_communicate_thru_raw(&u1, 1, &resp1, nullptr);
             write_register(0x633D, 0x00, nullptr);
 #ifndef _WIN32
-            usleep(10000);
+            usleep(5000);
 #endif
             // ── Step 5: ICT({0x43}) — unlock2 ─────────────────────────────
             const uint8_t u2 = 0x43;
             std::vector<uint8_t> resp2;
             in_communicate_thru_raw(&u2, 1, &resp2, nullptr);
 #ifndef _WIN32
-            usleep(10000);
+            usleep(5000);
 #endif
 
             if (has_ack_0a(resp1) && has_ack_0a(resp2)) {
@@ -768,7 +768,7 @@ public:
                 return true;
             }
 #ifndef _WIN32
-            usleep(20000);
+            usleep(10000);
 #endif
         }
         if (error) *error = "Gen1A unlock ACK not observed";
@@ -868,10 +868,14 @@ public:
     // Key insight: InListPassiveTarget leaves the card in a PN532-managed state
     // where raw ICT READ fails (status 0x01). Must use the full manual RF path:
     // HALT -> 7-bit WUPA -> anticollision -> select -> ICT READ block0.
-    bool is_gen3(std::string *error)
+    bool is_gen3(std::string *error, const TagInfo *detected_tag = nullptr)
     {
         TagInfo tag;
-        if (!in_list_passive_target_iso14443a(&tag, error)) return false;
+        if (detected_tag) {
+            tag = *detected_tag;
+        } else {
+            if (!in_list_passive_target_iso14443a(&tag, error)) return false;
+        }
 
         auto is_mfc_like = [&]() {
             if (tag.protocol == ProtocolKind::MifareClassic) return true;
@@ -898,7 +902,7 @@ public:
             if (sak_hex.size() < 2) return false;
 
             const std::string sak = sak_hex.substr(sak_hex.size() - 2);
-            return sak == "08" || sak == "09" || sak == "18" ||
+            return sak == "08" || sak == "09" || sak == "18" || sak == "1C" ||
                    sak == "28" || sak == "38";
         };
 

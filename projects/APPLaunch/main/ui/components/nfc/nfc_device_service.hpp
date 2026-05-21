@@ -2065,10 +2065,11 @@ private:
 
                 if (can_magic_probe) {
                     std::string magic_err;
-                    if (client.is_gen1a(&magic_err)) {
-                        tag.magic_type = "Gen1A";
-                    } else if (client.is_gen3(&magic_err)) {
+                    // Probe Gen3 first to avoid redundant HALT(0x50 0x00) on Gen3 cards.
+                    if (client.is_gen3(&magic_err, &tag)) {
                         tag.magic_type = "Gen3";
+                    } else if (client.is_gen1a(&magic_err)) {
+                        tag.magic_type = "Gen1A";
                     } else if (client.is_gen4("00000000", &magic_err)) {
                         tag.magic_type = "Gen4";
                     } else {
@@ -2429,16 +2430,17 @@ private:
                             if (device_kind == DeviceKind::PN532 ||
                                 device_kind == DeviceKind::PN532Killer) {
                                 std::string magic_err;
-                                if (client.is_gen1a(&magic_err)) {
+                                // Keep the same probe order as scan path to reduce duplicate HALT logs.
+                                if (client.is_gen3(&magic_err, &live_tag)) {
+                                    record.tag.magic_type = "Gen3";
+                                    push_log("MAGIC: Gen3");
+                                } else if (client.is_gen1a(&magic_err)) {
                                     record.tag.magic_type = "Gen1A";
                                     push_log("MAGIC: Gen1A");
                                     push_log("> Reading Gen1A blocks...");
                                     client.read_gen1a_full(nullptr, &record.tag.block_log, &magic_err,
                                         [this](const std::string &line) { push_log(line); },
                                         (device_kind == DeviceKind::PN532Killer) ? 5 : 0);
-                                } else if (client.is_gen3(&magic_err)) {
-                                    record.tag.magic_type = "Gen3";
-                                    push_log("MAGIC: Gen3");
                                 } else if (client.is_gen4("00000000", &magic_err)) {
                                     record.tag.magic_type = "Gen4";
                                     push_log("MAGIC: Gen4");

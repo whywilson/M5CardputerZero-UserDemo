@@ -49,14 +49,16 @@ public:
     void log_tx(const char *tag, const uint8_t *data, size_t len)
     {
         if (!data || len == 0) return;
-        push(format_hex_line(tag, "=>", data, len));
+        const std::string line = format_hex_line(tag, "=>", data, len);
+        if (!line.empty()) push(line);
     }
 
     // Log incoming bytes (device → host)
     void log_rx(const char *tag, const uint8_t *data, size_t len)
     {
         if (!data || len == 0) return;
-        push(format_hex_line(tag, "<=", data, len));
+        const std::string line = format_hex_line(tag, "<=", data, len);
+        if (!line.empty()) push(line);
     }
 
     // Log a plain text event (timestamp + optional tag + message)
@@ -203,8 +205,51 @@ private:
         return std::string(log_dir) + "/" + fname;
     }
 
+    static bool extract_pn532_payload_after_tfi(const uint8_t *data,
+                                                size_t len,
+                                                uint8_t expected_tfi,
+                                                std::vector<uint8_t> &payload)
+    {
+        payload.clear();
+        for (size_t i = 0; i + 7 < len; ++i) {
+            if (data[i] != 0x00 || data[i + 1] != 0x00 || data[i + 2] != 0xFF) continue;
+
+            const uint8_t frame_len = data[i + 3];
+            const uint8_t lcs = data[i + 4];
+            if (static_cast<uint8_t>(frame_len + lcs) != 0x00) continue;
+
+            if (frame_len == 0) {
+                // ACK frame: 00 00 FF 00 FF 00
+                if (i + 6 <= len) {
+                    i += 5;
+                    continue;
+                }
+                continue;
+            }
+
+            if (i + 5 + frame_len + 2 > len) continue;
+
+            const size_t data_start = i + 5;
+            const size_t data_end = data_start + frame_len;
+            uint8_t sum = 0;
+            for (size_t cursor = data_start; cursor < data_end; ++cursor) {
+                sum = static_cast<uint8_t>(sum + data[cursor]);
+            }
+            const uint8_t dcs = data[data_end];
+            if (static_cast<uint8_t>(sum + dcs) != 0x00) continue;
+            if (data_start >= data_end) continue;
+
+            if (data[data_start] == expected_tfi) {
+                payload.assign(data + data_start + 1, data + data_end);
+                return true;
+            }
+            i = data_end + 1;
+        }
+        return false;
+    }
+
     static std::string format_hex_line(const char *tag, const char *arrow,
-                                        const uint8_t *data, size_t len)
+                                       const uint8_t *data, size_t len)
     {
         // [HH:MM:SS.mmm] tag => xxyyzz...
         std::string out;
@@ -215,14 +260,43 @@ private:
         else
             std::snprintf(hdr, sizeof(hdr), "[%s] %s ", timestamp().c_str(), arrow);
         out = hdr;
+        std::vector<uint8_t> display;
+        display.reserve(len);
+        if (std::strcmp(arrow, "=>") == 0) {
+            if (!extract_pn532_payload_after_tfi(data, len, 0xD4, display)) {
+                display.assign(data, data + len);
+            }
+        } else if (std::strcmp(arrow, "<=") == 0) {
+            if (!extract_pn532_payload_after_tfi(data, len, 0xD5, display)) {
+                // For PN532 ACK-only replies (00 00 FF 00 FF 00), hide noisy line.
+                std::vector<uint8_t> ack_filtered;
+                if (extract_pn532_payload_after_tfi(data, len, 0xD4, ack_filtered)) {
+                    display.assign(data, data + len);
+                } else {
+                    bool looks_like_ack_only = false;
+                    for (size_t i = 0; i + 5 < len; ++i) {
+                        if (data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0xFF &&
+                            data[i + 3] == 0x00 && data[i + 4] == 0xFF && data[i + 5] == 0x00) {
+                            looks_like_ack_only = true;
+                            break;
+                        }
+                    }
+                    if (looks_like_ack_only) return {};
+                    display.assign(data, data + len);
+                }
+            }
+        } else {
+            display.assign(data, data + len);
+        }
+
         char h[3];
         constexpr size_t MAX_BYTES = 64; // cap per line to keep it readable
-        const size_t show = len > MAX_BYTES ? MAX_BYTES : len;
+        const size_t show = display.size() > MAX_BYTES ? MAX_BYTES : display.size();
         for (size_t i = 0; i < show; ++i) {
-            std::snprintf(h, sizeof(h), "%02x", data[i]);
+            std::snprintf(h, sizeof(h), "%02x", display[i]);
             out += h;
         }
-        if (len > MAX_BYTES) out += "...";
+        if (display.size() > MAX_BYTES) out += "...";
         return out;
     }
 
