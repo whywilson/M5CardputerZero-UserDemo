@@ -46,6 +46,10 @@ class UINfcPage : public app_base
         ConnectDevice,
         PortSettings,
         Scan,
+        ScanOnceUHF,
+        StartUHFContinuous,
+        StopUHFContinuous,
+        ExportUHFCsv,
         Dump,
         Save,
         Clear,
@@ -99,6 +103,8 @@ private:
     // Read tab scan log
     std::vector<std::string> scan_log_lines_;
     int log_scroll_offset_ = 0;
+    std::vector<nfc_app::NfcDeviceService::UhfTableRow> uhf_table_rows_;
+    int uhf_table_scroll_offset_ = 0;
     bool last_scan_running_ = false;
     int  app_info_scroll_ = 0;  // AppInfo modal scroll offset (line index)
     // Long-press scroll tracking
@@ -142,6 +148,8 @@ private:
     int usb_select_idx_ = 0;
     // Cached USB endpoint list for UsbSelect modal
     std::vector<nfc_app::TransportEndpoint> usb_select_list_;
+    bool pending_usb_connect_ = false;
+    std::string pending_usb_connect_path_;
     // I2C device selection (index into i2c_select_list_)
     int i2c_select_idx_ = 0;
     // Cached I2C endpoint list for I2cSelect modal
@@ -235,6 +243,26 @@ private:
         return (endpoint.kind == nfc_app::TransportKind::I2cBus) ? 7 : 8;
     }
 
+    int read_uhf_visible_rows() const
+    {
+        return 8;
+    }
+
+    bool read_uses_uhf_table() const
+    {
+        const auto conn = service_.connection_state();
+        return (conn.connected && conn.device_kind == nfc_app::DeviceKind::UHFReader) ||
+               !uhf_table_rows_.empty();
+    }
+
+    int read_scroll_max_offset() const
+    {
+        if (read_uses_uhf_table()) {
+            return std::max(0, static_cast<int>(uhf_table_rows_.size()) - read_uhf_visible_rows());
+        }
+        return std::max(0, static_cast<int>(scan_log_lines_.size()) - read_log_visible_lines());
+    }
+
     static void static_lvgl_handler(lv_event_t *e)
     {
         UINfcPage *self = static_cast<UINfcPage *>(lv_event_get_user_data(e));
@@ -245,6 +273,9 @@ private:
     {
         UINfcPage *self = static_cast<UINfcPage *>(lv_timer_get_user_data(timer));
         if (!self) return;
+        if (self->pending_usb_connect_) {
+            self->perform_pending_usb_connect();
+        }
         // Long-press scroll: hold 400ms→scroll, hold 1500ms→fast scroll, hold 2000ms→jump to top/bottom
         // Works for Read tab scan log AND for HexLog modal
         if (self->held_scroll_key_ != 0) {
@@ -257,8 +288,9 @@ private:
                     // Jump directly to top or bottom
                     const bool to_bottom = (self->held_scroll_key_ == KEY_DOWN);
                     if (is_read_scroll) {
-                        const int max_scroll = std::max(0, (int)self->scan_log_lines_.size() - self->read_log_visible_lines());
+                        const int max_scroll = self->read_scroll_max_offset();
                         self->log_scroll_offset_ = to_bottom ? max_scroll : 0;
+                        self->uhf_table_scroll_offset_ = to_bottom ? max_scroll : 0;
                     } else {
                         const int total = nfc_app::NfcHexLog::get().total_lines();
                         const int max_scroll = std::max(0, total - LOG_VISIBLE_HEX_LINES);
@@ -273,8 +305,12 @@ private:
                         const int step  = (held_ms > 1500) ? 3 : 1;
                         const int delta = dir * step;
                         if (is_read_scroll) {
-                            const int max_scroll = std::max(0, (int)self->scan_log_lines_.size() - self->read_log_visible_lines());
-                            self->log_scroll_offset_ = std::max(0, std::min(max_scroll, self->log_scroll_offset_ + delta));
+                            const int max_scroll = self->read_scroll_max_offset();
+                            if (self->read_uses_uhf_table()) {
+                                self->uhf_table_scroll_offset_ = std::max(0, std::min(max_scroll, self->uhf_table_scroll_offset_ + delta));
+                            } else {
+                                self->log_scroll_offset_ = std::max(0, std::min(max_scroll, self->log_scroll_offset_ + delta));
+                            }
                         } else {
                             const int total = nfc_app::NfcHexLog::get().total_lines();
                             const int max_scroll = std::max(0, total - LOG_VISIBLE_HEX_LINES);
@@ -482,45 +518,33 @@ private:
             }
             break;
         case KEY_S:
-            if (current_tab_ == Tab::Read) {                std::string error;
-                if (service_.save_last_scan(&error)) {
-                    refresh_saved_records();
-                    show_toast("Saved");
-                    ui_message_ = "Record saved to JSON";
-                } else {
-                    ui_message_ = error;
-                }
+            if (current_tab_ == Tab::Read) {
+                trigger_read_scan_shortcut();
                 render_all();
             }
             break;
         case KEY_R:
-            // Quick scan shortcut on Read tab: connect if needed, then scan
+            // Keep R as an alias for scan.
             if (current_tab_ == Tab::Read) {
-                const auto scan = service_.scan_state();
-                if (!scan.running) {
-                    scan_log_lines_.clear();
-                    log_scroll_offset_ = 0;
-                    const auto conn = service_.connection_state();
-                    const auto ep   = service_.current_endpoint();
-                    if (!conn.connected) {
-                        scan_log_lines_.push_back("> Connect " + ep.label.substr(0, 22) + "...");
-                        render_all();
-                        const bool ok = service_.connect_current();
-                        const auto conn2 = service_.connection_state();
-                        if (!ok) {
-                            scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
-                            ui_message_ = "Connect failed";
-                            render_all();
-                            break;
-                        }
-                        scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
-                        scan_log_lines_.push_back(supported_protocols_text());
+                trigger_read_scan_shortcut();
+                render_all();
+            }
+            break;
+        case KEY_P:
+            if (current_tab_ == Tab::Read) {
+                const auto conn_state = service_.connection_state();
+                if (conn_state.connected && conn_state.device_kind == nfc_app::DeviceKind::UHFReader) {
+                    std::string error;
+                    if (service_.stop_uhf_continuous_scan(&error)) {
+                        scan_log_lines_.push_back("> Inventory stopped");
+                        ui_message_ = "Inventory stopped";
+                    } else {
+                        ui_message_ = error.empty() ? "UHF stop failed" : error;
                     }
-                    scan_log_lines_.push_back("> Scan card...");
-                    service_.start_scan();
-                    ui_message_ = "Scanning...";
-                    render_all();
+                } else {
+                    ui_message_ = "P: stop inventory";
                 }
+                render_all();
             }
             break;
         case KEY_ESC:
@@ -539,6 +563,76 @@ private:
         case KEY_X: return KEY_DOWN;
         case KEY_C: return KEY_RIGHT;
         default: return key;
+        }
+    }
+
+    void trigger_read_scan_shortcut()
+    {
+        const auto scan = service_.scan_state();
+        if (scan.running) {
+            ui_message_ = service_.is_current_device_uhf() ? "Inventory running" : "Scanning...";
+            return;
+        }
+
+        const auto endpoint = service_.current_endpoint();
+        const auto conn = service_.connection_state();
+        if (!conn.connected) {
+            if (endpoint.kind == nfc_app::TransportKind::UsbSerial) {
+                service_.refresh_endpoints();
+                usb_select_list_ = service_.usb_endpoints();
+                if (usb_select_list_.empty()) {
+                    ui_message_ = "No USB device";
+                    return;
+                }
+                usb_select_idx_ = 0;
+                modal_ = Modal::UsbSelect;
+                modal_idx_ = 0;
+                return;
+            }
+            if (endpoint.kind == nfc_app::TransportKind::I2cBus) {
+                i2c_select_list_ = service_.scan_i2c_devices();
+                if (i2c_select_list_.empty()) {
+                    ui_message_ = "No I2C device";
+                    return;
+                }
+                if (i2c_select_list_.size() > 1) {
+                    i2c_select_idx_ = 0;
+                    modal_ = Modal::I2cSelect;
+                    modal_idx_ = 0;
+                    return;
+                }
+                service_.select_i2c_endpoint(i2c_select_list_[0]);
+            }
+
+            const auto connect_ep = service_.current_endpoint();
+            scan_log_lines_.push_back("> Connect " + connect_ep.label.substr(0, 22) + "...");
+            const bool ok = service_.connect_current();
+            const auto conn2 = service_.connection_state();
+            if (!ok) {
+                scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
+                ui_message_ = "Connect failed";
+                return;
+            }
+            scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
+            scan_log_lines_.push_back(supported_protocols_text());
+        }
+
+        const bool is_uhf = service_.is_current_device_uhf();
+        scan_log_lines_.push_back(is_uhf ? "> Start inventory..." : "> Scan card...");
+        if (is_uhf) {
+            std::string error;
+            if (service_.start_uhf_continuous_scan(&error)) {
+                ui_message_ = "Inventory running";
+            } else {
+                ui_message_ = error.empty() ? "Inventory start failed" : error;
+            }
+        } else {
+            if (service_.start_scan()) {
+                ui_message_ = "Scanning...";
+            } else {
+                const auto state = service_.scan_state();
+                ui_message_ = state.error.empty() ? "Scan failed" : state.error;
+            }
         }
     }
 
@@ -591,8 +685,12 @@ private:
         switch (current_tab_) {
         case Tab::Read:
             {
-                const int max_scroll = std::max(0, (int)scan_log_lines_.size() - read_log_visible_lines());
-                log_scroll_offset_ = std::max(0, std::min(max_scroll, log_scroll_offset_ + delta));
+                const int max_scroll = read_scroll_max_offset();
+                if (read_uses_uhf_table()) {
+                    uhf_table_scroll_offset_ = std::max(0, std::min(max_scroll, uhf_table_scroll_offset_ + delta));
+                } else {
+                    log_scroll_offset_ = std::max(0, std::min(max_scroll, log_scroll_offset_ + delta));
+                }
             }
             break;
         case Tab::Saved:
@@ -606,12 +704,10 @@ private:
                 const auto info = service_.emu_slot_info(
                     service_.current_emulator_protocol(), hw_emu_slot_);
                 if (info.dump_loaded && !info.dump_lines.empty()) {
-                    // Dump is visible: UP/DOWN scroll through blocks
                     const int total = static_cast<int>(info.dump_lines.size());
                     const int max_scroll = std::max(0, total - 7);
                     emu_dump_scroll_ = std::max(0, std::min(max_scroll, emu_dump_scroll_ + delta));
                 } else {
-                    // No dump: UP/DOWN cycle hardware slot
                     hw_emu_slot_ = (hw_emu_slot_ + delta + 8) % 8;
                     emu_dump_scroll_ = 0;
                     const auto proto = service_.current_emulator_protocol();
@@ -645,15 +741,11 @@ private:
                 if (!scan.running) {
                     const auto ep = service_.current_endpoint();
                     if (ep.kind == nfc_app::TransportKind::UartSerial) {
-                        // UART mode: show unified Read menu
                         uart_edit_buf_ = service_.uart_config();
                         port_settings_field_ = 0;
                         modal_ = Modal::ReadMenu;
                         modal_idx_ = 0;
                     } else if (ep.kind == nfc_app::TransportKind::UsbSerial) {
-                        // USB mode: match I2C UX.
-                        // Connected: open action menu.
-                        // Not connected: always show USB device selector first.
                         const auto conn = service_.connection_state();
                         if (conn.connected) {
                             modal_ = Modal::ReadMenu;
@@ -670,9 +762,6 @@ private:
                             }
                         }
                     } else if (ep.kind == nfc_app::TransportKind::I2cBus) {
-                        // I2C mode: keep old UX.
-                        // Not connected: press OK to scan buses and show device selector first.
-                        // Connected: press OK to open Scan/Dump/Save/Clear menu.
                         const auto conn = service_.connection_state();
                         if (conn.connected) {
                             modal_ = Modal::ReadMenu;
@@ -696,7 +785,6 @@ private:
             break;
         case Tab::Emulator:
             {
-                // Unified connect/reconnect for all transports before EMU action
                 const auto conn0 = service_.connection_state();
                 const bool ep0_unidentified =
                     (conn0.device_kind == nfc_app::DeviceKind::Unknown ||
@@ -919,10 +1007,20 @@ private:
 
     void update_scan_log()
     {
+        uhf_table_rows_ = service_.uhf_table_rows();
+        {
+            const int max_scroll = std::max(0, static_cast<int>(uhf_table_rows_.size()) - read_uhf_visible_rows());
+            uhf_table_scroll_offset_ = std::max(0, std::min(max_scroll, uhf_table_scroll_offset_));
+        }
+
         // Always drain real-time block lines pushed during Gen1A dump
         {
             auto lines = service_.drain_pending_log();
             for (auto &l : lines) {
+                // UHF scan hits can be very frequent; the table view already shows live counts.
+                if (l.size() >= 4 && l[0] == 'E' && l[1] == 'P' && l[2] == 'C' && l[3] == ' ') {
+                    continue;
+                }
                 scan_log_lines_.push_back(std::move(l));
                 log_scroll_offset_ = std::max(0, (int)scan_log_lines_.size() - read_log_visible_lines());
             }
@@ -938,8 +1036,8 @@ private:
         }
         last_scan_running_ = now_running;
         // Keep a larger history so long dumps can still be reviewed with scrolling.
-        if (scan_log_lines_.size() > 2000) {
-            const int trim = static_cast<int>(scan_log_lines_.size() - 2000);
+        if (scan_log_lines_.size() > 600) {
+            const int trim = static_cast<int>(scan_log_lines_.size() - 600);
             scan_log_lines_.erase(scan_log_lines_.begin(), scan_log_lines_.begin() + trim);
             log_scroll_offset_ = std::max(0, log_scroll_offset_ - trim);
         }
@@ -974,12 +1072,27 @@ private:
     {
         const auto ep = service_.current_endpoint();
         const auto conn = service_.connection_state();
+        const bool uhf_running = service_.uhf_continuous_scan_running();
+        const bool has_uhf_data = !service_.uhf_table_rows().empty();
+
+        auto make_uhf_actions = [&](bool include_port_settings) {
+            std::vector<ReadMenuAction> actions;
+            actions.push_back(uhf_running ? ReadMenuAction::StopUHFContinuous
+                                          : ReadMenuAction::StartUHFContinuous);
+            if (has_uhf_data) actions.push_back(ReadMenuAction::ExportUHFCsv);
+            if (include_port_settings) actions.push_back(ReadMenuAction::PortSettings);
+            actions.push_back(ReadMenuAction::Clear);
+            return actions;
+        };
 
         if (ep.kind == nfc_app::TransportKind::UsbSerial) {
             if (!conn.connected) {
                 return {
                     ReadMenuAction::ConnectDevice,
                 };
+            }
+            if (conn.device_kind == nfc_app::DeviceKind::UHFReader) {
+                return make_uhf_actions(false);
             }
             return {
                 ReadMenuAction::Scan,
@@ -994,6 +1107,9 @@ private:
                     ReadMenuAction::ConnectDevice,
                     ReadMenuAction::PortSettings,
                 };
+            }
+            if (conn.device_kind == nfc_app::DeviceKind::UHFReader) {
+                return make_uhf_actions(true);
             }
             return {
                 ReadMenuAction::Scan,
@@ -1014,6 +1130,11 @@ private:
                 ReadMenuAction::Clear,
             };
         }
+
+        if (conn.connected && conn.device_kind == nfc_app::DeviceKind::UHFReader) {
+            return make_uhf_actions(false);
+        }
+
         return {
             ReadMenuAction::Scan,
             ReadMenuAction::Dump,
@@ -1035,6 +1156,11 @@ private:
 
     std::string supported_protocols_text() const
     {
+        const auto conn = service_.connection_state();
+        if (conn.connected && conn.device_kind == nfc_app::DeviceKind::UHFReader) {
+            return "Protocols: UHF EPC Gen2";
+        }
+
         const auto supported = service_.supported_protocols_for_current_device();
         if (supported.empty()) return "Protocols: (none)";
 
@@ -1050,9 +1176,9 @@ private:
     {
         switch (kind) {
         case nfc_app::TransportKind::UsbSerial:
-            return "PN532, PN532Killer";
+            return "PN532, PN532Killer, UHFReader";
         case nfc_app::TransportKind::UartSerial:
-            return "PN532, PN532Killer";
+            return "PN532, PN532Killer, UHFReader";
         case nfc_app::TransportKind::I2cBus:
             return "NFC Unit, GroveNFC";
         default:
@@ -1069,6 +1195,10 @@ private:
         }
         case ReadMenuAction::PortSettings: return "Port Settings";
         case ReadMenuAction::Scan:         return "Scan";
+        case ReadMenuAction::ScanOnceUHF:  return "Scan Once (UHF)";
+        case ReadMenuAction::StartUHFContinuous: return "Start Inventory";
+        case ReadMenuAction::StopUHFContinuous:  return "Stop Inventory";
+        case ReadMenuAction::ExportUHFCsv: return "Export CSV";
         case ReadMenuAction::Dump:         return "Dump";
         case ReadMenuAction::Save:         return "Save";
         case ReadMenuAction::Clear:        return "Clear";
@@ -1193,6 +1323,7 @@ private:
         const auto endpoint = service_.current_endpoint();
         const auto conn = service_.connection_state();
         const nfc_app::SavedRecord &record = scan.last_record;
+        const bool use_uhf_table = read_uses_uhf_table();
 
         // ── Top summary bar: transport mode pills + device label ──────────
         lv_obj_t *summary = create_panel(parent, 0, 0, 320, 18, 0x161616);
@@ -1234,7 +1365,7 @@ private:
         // ── Card info header (shown when a result exists) ─────────────────
         int log_y = 20;
         int log_h = 100;
-        if (scan.has_result) {
+        if (scan.has_result && !use_uhf_table) {
             const auto &tag = record.tag;
             auto find_identity_ci = [&](const char *key) -> std::string {
                 std::string key_up;
@@ -1273,13 +1404,62 @@ private:
 
         lv_obj_t *detail = create_panel(parent, 0, log_y, 320, log_h, 0x0A0A0A);
 
-        if (!scan.running && !scan.has_result && scan_log_lines_.empty()) {
+        if (use_uhf_table) {
+            const int idx_x = 4;
+            const int epc_x = 34;
+            const int cnt_x = 276; // right-aligned 5-char count column near panel edge
+            create_text(detail, idx_x, 2, "#", 0x7FBFFF, 7);
+            create_text(detail, epc_x, 2, "EPC", 0x7FBFFF, 7);
+            char cnt_hdr[8];
+            std::snprintf(cnt_hdr, sizeof(cnt_hdr), "%5s", "CNT");
+            create_text(detail, cnt_x, 2, cnt_hdr, 0x7FBFFF, 7);
+
+            const int row_y = 14;
+            const int row_h = 10;
+            const int visible_rows = std::max(1, (log_h - row_y - 2) / row_h);
+            const int total_rows = static_cast<int>(uhf_table_rows_.size());
+            const int scroll = std::max(0, std::min(uhf_table_scroll_offset_,
+                                                    std::max(0, total_rows - visible_rows)));
+
+            if (total_rows == 0) {
+                create_text(detail, 4, 24,
+                            scan.running ? "Scanning UHF tags..." : "No UHF tag yet (S:Scan / P:Stop)",
+                            0x9E9E9E, 10);
+            } else {
+                for (int row = 0; row < visible_rows; ++row) {
+                    const int idx = scroll + row;
+                    if (idx >= total_rows) break;
+                    const auto &item = uhf_table_rows_[static_cast<size_t>(idx)];
+
+                    const int epc_max_chars = std::max(8, (cnt_x - epc_x) / 8 - 1);
+                    std::string epc = item.epc;
+                    if (static_cast<int>(epc.size()) > epc_max_chars) {
+                        if (epc_max_chars > 14) {
+                            const int tail_len = epc_max_chars - 14;
+                            epc = epc.substr(0, 12) + ".." + epc.substr(epc.size() - tail_len);
+                        } else {
+                            epc = epc.substr(0, static_cast<size_t>(epc_max_chars));
+                        }
+                    }
+
+                    char idx_text[8];
+                    std::snprintf(idx_text, sizeof(idx_text), "%d", idx + 1);
+                    char cnt_text[8];
+                    std::snprintf(cnt_text, sizeof(cnt_text), "%5d", item.read_count);
+
+                    const int y = row_y + row * row_h;
+                    create_text(detail, idx_x, y, idx_text, 0xD6F0FF, 7);
+                    create_text(detail, epc_x, y, epc.c_str(), 0xD6F0FF, 7);
+                    create_text(detail, cnt_x, y, cnt_text, 0xD6F0FF, 7);
+                }
+            }
+        } else if (!scan.running && !scan.has_result && scan_log_lines_.empty()) {
             // Idle — nothing scanned yet
             create_text(detail, 4, 10,
                         conn.connected ? "Ready" : "Device not connected",
                         0x9E9E9E, 11);
             create_text(detail, 4, 28, "OK: Menu", 0xF7A600, 10);
-            create_text(detail, 4, 42, "Tab: mode", 0xD8D8D8, 10);
+            create_text(detail, 4, 42, "Tab: mode  S: scan  P: stop", 0xD8D8D8, 10);
 
             if (conn.connected) {
                 create_text(detail, 4, 56, to_compact(supported_protocols_text(), 52).c_str(), 0x8DB6FF, 10);
@@ -1822,6 +2002,7 @@ private:
         const bool can_dump = service_.can_dump_last_scan(&dump_error);
         std::string save_error;
         const bool can_save = service_.can_save_last_dump(&save_error);
+        const bool uhf_cont_running = service_.uhf_continuous_scan_running();
         const int card_h = 34 + n_opts * 20;
 
         lv_obj_t *card = make_modal_card(overlay, 220, card_h, 0x00D2FF);
@@ -1834,7 +2015,9 @@ private:
             const auto action = actions[i];
             const bool enabled =
                 (action == ReadMenuAction::Dump) ? can_dump :
-                (action == ReadMenuAction::Save) ? can_save : true;
+                (action == ReadMenuAction::Save) ? can_save :
+                (action == ReadMenuAction::StartUHFContinuous) ? !uhf_cont_running :
+                (action == ReadMenuAction::StopUHFContinuous) ? uhf_cont_running : true;
             lv_obj_t *row = lv_obj_create(card);
             lv_obj_remove_style_all(row);
             lv_obj_set_size(row, 204, 18);
@@ -1869,6 +2052,8 @@ private:
                 modal_idx_ = 0;
                 scan_log_lines_.clear();
                 log_scroll_offset_ = 0;
+                uhf_table_rows_.clear();
+                uhf_table_scroll_offset_ = 0;
 
                 if (ep.kind == nfc_app::TransportKind::UsbSerial) {
                     service_.refresh_endpoints();
@@ -2001,6 +2186,59 @@ private:
                 }
                 break;
             }
+            case ReadMenuAction::ScanOnceUHF: {
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                scan_log_lines_.clear();
+                log_scroll_offset_ = 0;
+                scan_log_lines_.push_back("> UHF scan once...");
+                std::string error;
+                if (service_.start_uhf_scan_once(&error)) {
+                    ui_message_ = "UHF scanning...";
+                } else {
+                    ui_message_ = error.empty() ? "UHF scan failed" : error;
+                }
+                break;
+            }
+            case ReadMenuAction::StartUHFContinuous: {
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                scan_log_lines_.clear();
+                log_scroll_offset_ = 0;
+                scan_log_lines_.push_back("> UHF inventory start...");
+                std::string error;
+                if (service_.start_uhf_continuous_scan(&error)) {
+                    ui_message_ = "Inventory running";
+                } else {
+                    ui_message_ = error.empty() ? "Inventory start failed" : error;
+                }
+                break;
+            }
+            case ReadMenuAction::StopUHFContinuous: {
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                std::string error;
+                if (service_.stop_uhf_continuous_scan(&error)) {
+                    scan_log_lines_.push_back("> Inventory stopped");
+                    ui_message_ = "Inventory stopped";
+                } else {
+                    ui_message_ = error.empty() ? "Inventory stop failed" : error;
+                }
+                break;
+            }
+            case ReadMenuAction::ExportUHFCsv: {
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                std::string path;
+                std::string error;
+                if (service_.export_uhf_csv(&path, &error)) {
+                    show_toast(std::string("CSV: ") + path);
+                    ui_message_ = std::string("CSV: ") + to_compact(path, 40);
+                } else {
+                    ui_message_ = error.empty() ? "CSV export failed" : error;
+                }
+                break;
+            }
             case ReadMenuAction::Dump: {
                 // Dump
                 modal_ = Modal::None;
@@ -2039,6 +2277,8 @@ private:
                 modal_idx_ = 0;
                 scan_log_lines_.clear();
                 log_scroll_offset_ = 0;
+                uhf_table_rows_.clear();
+                uhf_table_scroll_offset_ = 0;
                 std::string clear_error;
                 if (service_.clear_last_scan_result(&clear_error)) {
                     const auto conn = service_.connection_state();
@@ -2118,21 +2358,13 @@ private:
                 modal_ = Modal::None;
                 modal_idx_ = 0;
                 const auto &selected_ep = usb_select_list_[usb_select_idx_];
-                service_.select_usb_endpoint_by_path(selected_ep.path);
                 scan_log_lines_.clear();
                 log_scroll_offset_ = 0;
                 scan_log_lines_.push_back("> Connect " + selected_ep.label.substr(0, 22) + "...");
-                render_all();
-                const bool ok = service_.connect_current();
-                const auto conn2 = service_.connection_state();
-                if (!ok) {
-                    scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
-                    ui_message_ = "Connect failed";
-                } else {
-                    scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
-                    scan_log_lines_.push_back(supported_protocols_text());
-                    ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
-                }
+                scan_log_lines_.push_back("[Detect] PN532@115200 -> UHF@115200/9600");
+                pending_usb_connect_ = true;
+                pending_usb_connect_path_ = selected_ep.path;
+                ui_message_ = "Detecting device...";
             }
             break;
         case KEY_ESC:
@@ -2141,6 +2373,30 @@ private:
             break;
         default: break;
         }
+    }
+
+    void perform_pending_usb_connect()
+    {
+        if (!pending_usb_connect_) return;
+        pending_usb_connect_ = false;
+
+        if (!service_.select_usb_endpoint_by_path(pending_usb_connect_path_)) {
+            scan_log_lines_.push_back("ERR Select USB failed");
+            ui_message_ = "Select USB failed";
+            return;
+        }
+
+        const bool ok = service_.connect_current();
+        const auto conn2 = service_.connection_state();
+        if (!ok) {
+            scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
+            ui_message_ = "Connect failed";
+            return;
+        }
+
+        scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
+        scan_log_lines_.push_back(supported_protocols_text());
+        ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
     }
 
     // ── I2cSelect modal (scan I2C buses, choose which device to connect) ──────
@@ -2372,7 +2628,12 @@ private:
         // Semi-transparent centered popup, auto-dismissed after 1 s
         lv_obj_t *card = lv_obj_create(parent);
         lv_obj_remove_style_all(card);
-        static constexpr int W = 120, H = 32;
+        static constexpr int H = 32;
+        static constexpr int MIN_W = 120;
+        static constexpr int MAX_W = 312;
+        const std::string toast_text = to_tail_compact(toast_msg_, 36);
+        const int text_w = static_cast<int>(toast_text.size()) * 8;
+        const int W = std::max(MIN_W, std::min(MAX_W, text_w + 20));
         lv_obj_set_size(card, W, H);
         lv_obj_set_pos(card, (320 - W) / 2, (CONTENT_H - H) / 2);
         lv_obj_set_style_radius(card, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -2383,7 +2644,9 @@ private:
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *lbl = lv_label_create(card);
-        lv_label_set_text(lbl, toast_msg_.c_str());
+        lv_label_set_text(lbl, toast_text.c_str());
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(lbl, W - 10);
         lv_obj_set_style_text_color(lbl, lv_color_hex(0x00EE55), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(lbl, &lv_font_unscii_8, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_center(lbl);

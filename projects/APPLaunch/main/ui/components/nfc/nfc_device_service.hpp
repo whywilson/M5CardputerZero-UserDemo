@@ -8,14 +8,19 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <set>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 
 namespace nfc_app {
 
@@ -55,7 +60,17 @@ enum class UidMagicGeneration {
 };
 
 class NfcDeviceService {
+    struct UhfTagSnapshot;
 public:
+    struct UhfTableRow {
+        std::string epc;
+        std::string rssi;
+        std::string antenna;
+        int read_count = 0;
+        std::string first_seen;
+        std::string last_seen;
+    };
+
     NfcDeviceService()
     {
         refresh_endpoints();
@@ -88,6 +103,7 @@ public:
 
     ~NfcDeviceService()
     {
+        stop_uhf_continuous_scan();
         cancel_hw_upload_.store(true);
         cancel_hw_mfkey_.store(true);
         stop_pn532_ndef_emulation();
@@ -751,13 +767,11 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (endpoints_.empty()) return false;
 
-        transport_ = NfcTransportFactory::create(endpoints_[selected_endpoint_]);
-        transport_ = std::unique_ptr<INfcTransport>(
-            new LoggingTransport(std::move(transport_), "NFC"));
+        TransportEndpoint open_endpoint = endpoints_[selected_endpoint_];
         std::string error;
-        if (!transport_->open(endpoints_[selected_endpoint_], &error)) {
+        if (!open_transport_locked(open_endpoint, &error)) {
             connection_.connected = false;
-            connection_.endpoint = endpoints_[selected_endpoint_];
+            connection_.endpoint = open_endpoint;
             connection_.status = "Connect failed";
             connection_.detail = error;
             connection_.pn532_ready = false;
@@ -781,6 +795,160 @@ public:
 
         if (connection_.endpoint.kind == TransportKind::UsbSerial ||
             connection_.endpoint.kind == TransportKind::UartSerial) {
+            const int primary_baud = 115200;
+            const int uhf_preferred_baud = 9600;
+            auto is_known_uhf_vid_pid = [](int vid, int pid) {
+                return vid == 0x1A86 && pid == 0xFE1C;
+            };
+            auto endpoint_has_usb20_hint = [](const TransportEndpoint &ep) {
+                const std::string up = to_upper_ascii(ep.label + " " + ep.path);
+                return up.find("USB2.0") != std::string::npos ||
+                       up.find("USB 2.0") != std::string::npos;
+            };
+            auto endpoint_has_usb_serial_hint = [](const TransportEndpoint &ep) {
+                const std::string up = to_upper_ascii(ep.label + " " + ep.path);
+                return up.find("USB SERIAL") != std::string::npos;
+            };
+            push_log(std::string("[Detect] Serial endpoint: ") + connection_.endpoint.path);
+            if (connection_.endpoint.kind == TransportKind::UsbSerial &&
+                connection_.endpoint.usb_vid >= 0 && connection_.endpoint.usb_pid >= 0) {
+                char vp[48];
+                std::snprintf(vp, sizeof(vp), "[Detect] USB VID:PID = %04X:%04X",
+                              connection_.endpoint.usb_vid, connection_.endpoint.usb_pid);
+                push_log(vp);
+            }
+
+            const bool force_uhf_by_name =
+                connection_.endpoint.kind == TransportKind::UsbSerial &&
+                endpoint_has_usb20_hint(connection_.endpoint);
+            const bool force_pn_by_name =
+                connection_.endpoint.kind == TransportKind::UsbSerial &&
+                endpoint_has_usb_serial_hint(connection_.endpoint);
+
+            if (force_pn_by_name) {
+                push_log("[Detect] Name hint USB Serial -> PN532 route only");
+            }
+
+            if (force_uhf_by_name) {
+                push_log("[Detect] USB2.0 hint found -> direct UHF probe @9600");
+                std::string uhf_detail;
+                bool uhf_found = false;
+                int used_baud = uhf_preferred_baud;
+
+                if (connection_.endpoint.baud_rate != uhf_preferred_baud) {
+                    TransportEndpoint ep = connection_.endpoint;
+                    ep.baud_rate = uhf_preferred_baud;
+                    std::string reopen_err;
+                    if (!open_transport_locked(ep, &reopen_err)) {
+                        push_log(std::string("[Detect] open@9600 failed: ") + reopen_err);
+                    } else {
+                        connection_.endpoint = ep;
+                    }
+                }
+
+                if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
+                    uhf_found = true;
+                    used_baud = uhf_preferred_baud;
+                } else {
+                    push_log("[Detect] UHF not found @9600, retry @115200");
+                    TransportEndpoint ep = connection_.endpoint;
+                    ep.baud_rate = primary_baud;
+                    std::string reopen_err;
+                    if (open_transport_locked(ep, &reopen_err)) {
+                        connection_.endpoint = ep;
+                        if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
+                            uhf_found = true;
+                            used_baud = primary_baud;
+                        }
+                    } else {
+                        push_log(std::string("[Detect] open@115200 failed: ") + reopen_err);
+                    }
+                }
+
+                if (uhf_found) {
+                    connection_.device_kind = DeviceKind::UHFReader;
+                    connection_.pn532_ready = false;
+                    connection_.status = "Connected UHF Reader";
+                    connection_.detail = (uhf_detail.empty()
+                        ? (std::string("UHFReader @ ") + connection_.endpoint.path)
+                        : uhf_detail) + " @" + std::to_string(used_baud);
+                    push_log(std::string("[Detect] UHF confirmed @") + std::to_string(used_baud));
+                    return true;
+                }
+
+                push_log("[Detect] USB2.0 direct UHF probe failed");
+                connection_.device_kind = DeviceKind::OtherSerial;
+                connection_.pn532_ready = false;
+                connection_.status = "Connected Serial";
+                connection_.detail = "USB2.0 device, UHF probe failed";
+                return true;
+            }
+
+            if (!force_pn_by_name &&
+                connection_.endpoint.kind == TransportKind::UsbSerial &&
+                is_known_uhf_vid_pid(connection_.endpoint.usb_vid, connection_.endpoint.usb_pid)) {
+                push_log("[Detect] VID/PID matched known UHF reader (1A86:FE1C)");
+
+                std::string uhf_detail;
+                bool uhf_found = false;
+                int uhf_baud = primary_baud;
+
+                push_log("[Detect] Probe UHF reader @115200");
+                if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
+                    uhf_found = true;
+                    uhf_baud = 115200;
+                } else {
+                    push_log("[Detect] UHF not found @115200, retry @9600");
+                    TransportEndpoint ep9600 = connection_.endpoint;
+                    ep9600.baud_rate = 9600;
+                    std::string reopen_err;
+                    if (open_transport_locked(ep9600, &reopen_err)) {
+                        connection_.endpoint = ep9600;
+                        if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
+                            uhf_found = true;
+                            uhf_baud = 9600;
+                        } else {
+                            push_log("[Detect] UHF not found @9600");
+                        }
+                    } else {
+                        push_log(std::string("[Detect] open@9600 failed: ") + reopen_err);
+                    }
+                }
+
+                connection_.device_kind = DeviceKind::UHFReader;
+                connection_.pn532_ready = false;
+                connection_.status = "Connected UHF Reader";
+                if (uhf_found) {
+                    connection_.detail = (uhf_detail.empty()
+                        ? (std::string("UHFReader @ ") + connection_.endpoint.path)
+                        : uhf_detail) + " @" + std::to_string(uhf_baud);
+                    push_log(std::string("[Detect] UHF confirmed @") + std::to_string(uhf_baud));
+                } else {
+                    connection_.detail = std::string("UHFReader VID/PID 1A86:FE1C @ ") +
+                                         connection_.endpoint.path +
+                                         " (version query timeout)";
+                    push_log("[Detect] UHF VID/PID matched, but version query timeout");
+                }
+                return true;
+            }
+
+            push_log("[Detect] Probe PN532/PN532Killer @115200");
+
+            if (connection_.endpoint.baud_rate != primary_baud) {
+                TransportEndpoint ep = connection_.endpoint;
+                ep.baud_rate = primary_baud;
+                std::string reopen_err;
+                if (!open_transport_locked(ep, &reopen_err)) {
+                    connection_.connected = false;
+                    connection_.status = "Connect failed";
+                    connection_.detail = std::string("open@115200 failed: ") + reopen_err;
+                    connection_.device_kind = DeviceKind::NotConnected;
+                    push_log(std::string("[Detect] open@115200 failed: ") + reopen_err);
+                    return false;
+                }
+                connection_.endpoint = ep;
+            }
+
             Pn532KillerClient client(transport_.get());
             std::string probe_error;
             std::string firmware;
@@ -790,9 +958,94 @@ public:
                 connection_.pn532_ready = true;
                 connection_.status = std::string("Connected ") + to_string(kind);
                 const std::string fw_label = firmware.empty() ? to_string(kind) : firmware;
-                connection_.detail = fw_label + std::string(" @ ") + connection_.endpoint.path;
+                connection_.detail = fw_label + std::string(" @ ") + connection_.endpoint.path + " @115200";
+                push_log(std::string("[Detect] PN532 detected: ") + fw_label);
+
+                // Some USB ACM UHF adapters may occasionally look like a PN532 response.
+                // Cross-check once with UHF version query and prefer UHF when signature is clear.
+                if (!force_pn_by_name &&
+                    connection_.endpoint.kind == TransportKind::UsbSerial &&
+                    connection_.endpoint.path.find("ttyACM") != std::string::npos) {
+                    std::string cross_detail;
+                    push_log("[Detect] Cross-check UHF signature @115200");
+                    if (uhf_detect_on_open_transport_locked(transport_.get(), &cross_detail)) {
+                        connection_.device_kind = DeviceKind::UHFReader;
+                        connection_.pn532_ready = false;
+                        connection_.status = "Connected UHF Reader";
+                        connection_.detail = (cross_detail.empty()
+                            ? (std::string("UHFReader @ ") + connection_.endpoint.path)
+                            : cross_detail) + " @115200";
+                        push_log("[Detect] UHF signature confirmed, override PN532 result");
+                    }
+                }
             } else {
-                connection_.detail = std::string("Raw serial only: ") + probe_error;
+                if (!probe_error.empty()) {
+                    push_log(std::string("[Detect] PN532 not found: ") + probe_error);
+                } else {
+                    push_log("[Detect] PN532 not found");
+                }
+
+                if (force_pn_by_name) {
+                    connection_.device_kind = DeviceKind::OtherSerial;
+                    connection_.pn532_ready = false;
+                    connection_.status = "Connected Serial";
+                    connection_.detail = std::string("USB Serial route: ") +
+                                         (probe_error.empty() ? "PN532 not detected" : probe_error);
+                    push_log("[Detect] Skip UHF probe due to USB Serial name route");
+                    return true;
+                }
+
+                std::string uhf_detail;
+                push_log("[Detect] Probe UHF reader @115200");
+                if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
+                    connection_.device_kind = DeviceKind::UHFReader;
+                    connection_.pn532_ready = false;
+                    connection_.status = "Connected UHF Reader";
+                    connection_.detail = (uhf_detail.empty()
+                        ? (std::string("UHFReader @ ") + connection_.endpoint.path)
+                        : uhf_detail) + " @115200";
+                    push_log(std::string("[Detect] UHF detected @115200: ") +
+                             (uhf_detail.empty() ? "OK" : uhf_detail));
+                } else {
+                    push_log("[Detect] UHF not found @115200, retry @9600");
+
+                    bool uhf_found_9600 = false;
+                    std::string open9600_error;
+                    TransportEndpoint ep9600 = connection_.endpoint;
+                    ep9600.baud_rate = 9600;
+                    if (open_transport_locked(ep9600, &open9600_error)) {
+                        connection_.endpoint = ep9600;
+                        if (uhf_detect_on_open_transport_locked(transport_.get(), &uhf_detail)) {
+                            connection_.device_kind = DeviceKind::UHFReader;
+                            connection_.pn532_ready = false;
+                            connection_.status = "Connected UHF Reader";
+                            connection_.detail = (uhf_detail.empty()
+                                ? (std::string("UHFReader @ ") + connection_.endpoint.path)
+                                : uhf_detail) + " @9600";
+                            push_log(std::string("[Detect] UHF detected @9600: ") +
+                                     (uhf_detail.empty() ? "OK" : uhf_detail));
+                            uhf_found_9600 = true;
+                        } else {
+                            push_log("[Detect] UHF not found @9600");
+                        }
+                    } else {
+                        push_log(std::string("[Detect] open@9600 failed: ") + open9600_error);
+                    }
+
+                    if (!uhf_found_9600) {
+                        TransportEndpoint ep115200 = connection_.endpoint;
+                        ep115200.baud_rate = primary_baud;
+                        std::string restore_err;
+                        if (open_transport_locked(ep115200, &restore_err)) {
+                            connection_.endpoint = ep115200;
+                        }
+                        connection_.device_kind = DeviceKind::OtherSerial;
+                        connection_.pn532_ready = false;
+                        connection_.status = "Connected Serial";
+                        connection_.detail = std::string("Raw serial only: ") +
+                                             (probe_error.empty() ? "unknown device" : probe_error);
+                    }
+                }
             }
         } else if (connection_.endpoint.kind == TransportKind::I2cBus) {
             // Parse "/dev/i2c-1:0x48" → bus + addr
@@ -853,6 +1106,229 @@ public:
         return pn532_ndef_;
     }
 
+    bool is_current_device_uhf() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return connection_.connected && connection_.device_kind == DeviceKind::UHFReader;
+    }
+
+    bool uhf_continuous_scan_running() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return scan_.running && uhf_continuous_mode_;
+    }
+
+    std::vector<UhfTableRow> uhf_table_rows() const
+    {
+        std::vector<UhfTableRow> rows;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            rows.reserve(uhf_tags_.size());
+            for (const auto &kv : uhf_tags_) {
+                UhfTableRow row;
+                row.epc = kv.second.epc;
+                row.rssi = kv.second.rssi;
+                row.antenna = kv.second.antenna;
+                row.read_count = kv.second.read_count;
+                row.first_seen = kv.second.first_seen;
+                row.last_seen = kv.second.last_seen;
+                rows.push_back(std::move(row));
+            }
+        }
+
+        std::sort(rows.begin(), rows.end(), [](const UhfTableRow &a, const UhfTableRow &b) {
+            if (a.read_count != b.read_count) return a.read_count > b.read_count;
+            return a.epc < b.epc;
+        });
+        return rows;
+    }
+
+    bool start_uhf_scan_once(std::string *error = nullptr)
+    {
+        stop_pn532_ndef_emulation();
+        if (scan_thread_.joinable()) scan_thread_.join();
+        cancel_uhf_scan_.store(false);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!transport_ || !transport_->is_open()) {
+                if (error) *error = "Connect UHF reader first";
+                return false;
+            }
+            if (connection_.device_kind != DeviceKind::UHFReader) {
+                if (error) *error = "Connected device is not UHF reader";
+                return false;
+            }
+            if (scan_.running) {
+                if (error) *error = "Operation already running";
+                return false;
+            }
+            scan_.running = true;
+            scan_.has_result = false;
+            scan_.status = "UHF scan";
+            scan_.error.clear();
+            uhf_continuous_mode_ = false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            pending_log_lines_.clear();
+        }
+        scan_thread_ = std::thread([this]() { perform_uhf_scan_worker(false); });
+        if (error) error->clear();
+        return true;
+    }
+
+    bool start_uhf_continuous_scan(std::string *error = nullptr)
+    {
+        stop_pn532_ndef_emulation();
+        if (scan_thread_.joinable()) scan_thread_.join();
+        cancel_uhf_scan_.store(false);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!transport_ || !transport_->is_open()) {
+                if (error) *error = "Connect UHF reader first";
+                return false;
+            }
+            if (connection_.device_kind != DeviceKind::UHFReader) {
+                if (error) *error = "Connected device is not UHF reader";
+                return false;
+            }
+            if (scan_.running) {
+                if (error) *error = "Operation already running";
+                return false;
+            }
+            scan_.running = true;
+            scan_.has_result = false;
+            scan_.status = "UHF continuous";
+            scan_.error.clear();
+            uhf_continuous_mode_ = true;
+        }
+        {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            pending_log_lines_.clear();
+        }
+        scan_thread_ = std::thread([this]() { perform_uhf_scan_worker(true); });
+        if (error) error->clear();
+        return true;
+    }
+
+    bool stop_uhf_continuous_scan(std::string *error = nullptr)
+    {
+        bool running = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running = scan_.running && uhf_continuous_mode_;
+        }
+        if (!running) {
+            if (error) *error = "UHF continuous scan not running";
+            return false;
+        }
+
+        cancel_uhf_scan_.store(true);
+        {
+            std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
+            INfcTransport *transport_raw = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                transport_raw = transport_.get();
+            }
+            if (transport_raw && transport_raw->is_open()) {
+                std::string ignore;
+                uhf_exchange_command_locked(transport_raw, 0x8C, {}, 80, nullptr, &ignore);
+            }
+        }
+        if (scan_thread_.joinable()) scan_thread_.join();
+        if (error) error->clear();
+        return true;
+    }
+
+    bool export_uhf_csv(std::string *csv_path = nullptr, std::string *error = nullptr)
+    {
+        std::vector<UhfTagSnapshot> tags;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto &kv : uhf_tags_) tags.push_back(kv.second);
+        }
+        if (tags.empty()) {
+            if (error) *error = "No UHF tag data to export";
+            return false;
+        }
+
+        const std::string csv_dir = "/home/pi/rfid/uhf";
+        ::mkdir("/home/pi/rfid", 0755);
+        ::mkdir(csv_dir.c_str(), 0755);
+
+        std::time_t now = std::time(nullptr);
+        struct tm local_tm;
+#if defined(_WIN32)
+        localtime_s(&local_tm, &now);
+#else
+        localtime_r(&now, &local_tm);
+#endif
+        char date_buf[16];
+        std::strftime(date_buf, sizeof(date_buf), "%Y%m%d", &local_tm);
+
+        auto file_exists = [](const std::string &path) {
+            std::ifstream f(path.c_str(), std::ios::in);
+            return f.good();
+        };
+
+        std::string path = csv_dir + "/" + date_buf + ".csv";
+        if (file_exists(path)) {
+            bool found = false;
+            for (int i = 1; i <= 999; ++i) {
+                char suffix[16];
+                std::snprintf(suffix, sizeof(suffix), "-%03d.csv", i);
+                const std::string candidate = csv_dir + "/" + date_buf + suffix;
+                if (!file_exists(candidate)) {
+                    path = candidate;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (error) *error = "CSV name exhausted for today";
+                return false;
+            }
+        }
+
+        std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc);
+        if (!out.is_open()) {
+            if (error) *error = "Open CSV failed";
+            return false;
+        }
+
+        out << "first_seen,last_seen,epc,tid,pc,crc,rssi,frequency,antenna,read_count,raw_hex\n";
+        for (const auto &tag : tags) {
+            out << csv_escape(tag.first_seen) << ','
+                << csv_escape(tag.last_seen) << ','
+                << csv_escape(tag.epc) << ','
+                << csv_escape(tag.tid) << ','
+                << csv_escape(tag.pc) << ','
+                << csv_escape(tag.crc) << ','
+                << csv_escape(tag.rssi) << ','
+                << csv_escape(tag.frequency) << ','
+                << csv_escape(tag.antenna) << ','
+                << tag.read_count << ','
+                << csv_escape(tag.raw_hex)
+                << '\n';
+        }
+        if (!out.good()) {
+            if (error) *error = "Write CSV failed";
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            uhf_last_csv_path_ = path;
+        }
+        push_log(std::string("Inventory CSV saved: ") + path);
+        if (csv_path) *csv_path = path;
+        if (error) error->clear();
+        return true;
+    }
+
     bool start_pn532_ndef_emulation(const std::string &uri, std::string *error = nullptr)
     {
         std::string target_uri = uri.empty() ? "https://m5stack.com" : uri;
@@ -903,6 +1379,9 @@ public:
             scan_.status = connection_.connected ? "Ready" : "Idle";
             scan_.error.clear();
             last_dump_success_ = false;
+            uhf_continuous_mode_ = false;
+            uhf_tags_.clear();
+            uhf_last_csv_path_.clear();
         }
         {
             std::lock_guard<std::mutex> lk(pending_log_mutex_);
@@ -932,6 +1411,9 @@ public:
         if (kind == DeviceKind::NFCUnit) {
             return {ProtocolKind::Iso14443A, ProtocolKind::Iso14443B,
                     ProtocolKind::Iso15693, ProtocolKind::Felica};
+        }
+        if (kind == DeviceKind::UHFReader) {
+            return {ProtocolKind::Unknown};
         }
 
         if (transport == TransportKind::I2cBus) {
@@ -1167,6 +1649,7 @@ public:
     {
         stop_pn532_ndef_emulation();
         if (scan_thread_.joinable()) scan_thread_.join();
+        cancel_uhf_scan_.store(false);
         // Cancel any running EMU probe/dump threads to avoid racing set_work_mode calls
         cancel_emu_probe_.store(true);
         if (emu_probe_thread_.joinable()) emu_probe_thread_.join();
@@ -1189,12 +1672,18 @@ public:
         scan_.status = "Scanning";
         scan_.error.clear();
         last_dump_success_ = false;
+        uhf_continuous_mode_ = false;
         {
             std::lock_guard<std::mutex> lk(pending_log_mutex_);
             pending_log_lines_.clear();
         }
 
-        scan_thread_ = std::thread([this]() { perform_scan(); });
+        if (connection_.device_kind == DeviceKind::UHFReader) {
+            scan_.status = "UHF scan";
+            scan_thread_ = std::thread([this]() { perform_uhf_scan_worker(false); });
+        } else {
+            scan_thread_ = std::thread([this]() { perform_scan(); });
+        }
         return true;
     }
 
@@ -1223,6 +1712,10 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (scan_.running) {
             if (error) *error = "Operation already running";
+            return false;
+        }
+        if (connection_.device_kind == DeviceKind::UHFReader) {
+            if (error) *error = "UHF reader does not support NFC dump";
             return false;
         }
         if (!scan_.has_result) {
@@ -1804,6 +2297,654 @@ public:
     }
 
 private:
+    bool open_transport_locked(const TransportEndpoint &endpoint, std::string *error)
+    {
+        if (transport_) {
+            transport_->close();
+            transport_.reset();
+        }
+
+        std::unique_ptr<INfcTransport> inner = NfcTransportFactory::create(endpoint);
+        if (!inner) {
+            if (error) *error = "create transport failed";
+            return false;
+        }
+
+        std::unique_ptr<INfcTransport> wrapped(new LoggingTransport(std::move(inner), "NFC"));
+        if (!wrapped->open(endpoint, error)) {
+            return false;
+        }
+        transport_ = std::move(wrapped);
+        if (error) error->clear();
+        return true;
+    }
+
+    struct UhfTagSnapshot {
+        std::string first_seen;
+        std::string last_seen;
+        std::string epc;
+        std::string tid;
+        std::string pc;
+        std::string crc;
+        std::string rssi;
+        std::string frequency;
+        std::string antenna;
+        int read_count = 0;
+        std::string raw_hex;
+    };
+
+    static std::string csv_escape(const std::string &value)
+    {
+        bool need_quote = false;
+        for (char ch : value) {
+            if (ch == ',' || ch == '"' || ch == '\n' || ch == '\r') {
+                need_quote = true;
+                break;
+            }
+        }
+        if (!need_quote) return value;
+        std::string out;
+        out.reserve(value.size() + 4);
+        out.push_back('"');
+        for (char ch : value) {
+            if (ch == '"') out += "\"\"";
+            else out.push_back(ch);
+        }
+        out.push_back('"');
+        return out;
+    }
+
+    static std::string to_upper_ascii(std::string value)
+    {
+        for (char &ch : value) {
+            ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        }
+        return value;
+    }
+
+    static std::string keep_hex_chars_upper(const std::string &value)
+    {
+        std::string out;
+        out.reserve(value.size());
+        for (char ch : value) {
+            if (std::isxdigit(static_cast<unsigned char>(ch))) {
+                out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+            }
+        }
+        return out;
+    }
+
+    static std::string bytes_to_hex_string(const uint8_t *data, size_t len, size_t max_len = 0)
+    {
+        if (!data || len == 0) return {};
+        const size_t use_len = (max_len == 0 || max_len > len) ? len : max_len;
+        std::ostringstream oss;
+        oss << std::uppercase << std::hex << std::setfill('0');
+        for (size_t i = 0; i < use_len; ++i) {
+            oss << std::setw(2) << static_cast<int>(data[i]);
+        }
+        if (use_len < len) oss << "...";
+        return oss.str();
+    }
+
+    static std::string bytes_to_readable_ascii(const std::vector<uint8_t> &bytes)
+    {
+        std::string out;
+        out.reserve(bytes.size());
+        for (uint8_t b : bytes) {
+            const unsigned char ch = static_cast<unsigned char>(b);
+            if (ch >= 32 && ch <= 126) out.push_back(static_cast<char>(ch));
+            else out.push_back(' ');
+        }
+        return out;
+    }
+
+    static std::string extract_label_token(const std::string &text_up, const std::string &label)
+    {
+        const std::string token = label + ":";
+        const size_t pos = text_up.find(token);
+        if (pos == std::string::npos) return {};
+
+        size_t index = pos + token.size();
+        while (index < text_up.size() &&
+               (text_up[index] == ' ' || text_up[index] == '=' || text_up[index] == '\t')) {
+            ++index;
+        }
+
+        std::string out;
+        while (index < text_up.size()) {
+            const char ch = text_up[index];
+            const bool ok = std::isalnum(static_cast<unsigned char>(ch)) ||
+                            ch == '-' || ch == '.' || ch == '/' || ch == ':';
+            if (!ok) break;
+            out.push_back(ch);
+            ++index;
+        }
+        return out;
+    }
+
+    static std::vector<std::string> extract_hex_tokens(const std::string &text_up)
+    {
+        std::vector<std::string> tokens;
+        std::string cur;
+        for (char ch : text_up) {
+            if (std::isxdigit(static_cast<unsigned char>(ch))) {
+                cur.push_back(ch);
+            } else {
+                if (cur.size() >= 8 && (cur.size() % 2) == 0) tokens.push_back(cur);
+                cur.clear();
+            }
+        }
+        if (cur.size() >= 8 && (cur.size() % 2) == 0) tokens.push_back(cur);
+        return tokens;
+    }
+
+    static bool looks_like_epc(const std::string &epc)
+    {
+        if (epc.size() < 8 || (epc.size() % 2) != 0) return false;
+        bool all_zero = true;
+        for (char ch : epc) {
+            if (!std::isxdigit(static_cast<unsigned char>(ch))) return false;
+            if (ch != '0') all_zero = false;
+        }
+        return !all_zero;
+    }
+
+    static std::vector<uint8_t> build_uhf_bb_frame(uint8_t cmd, const std::vector<uint8_t> &payload)
+    {
+        const uint16_t len = static_cast<uint16_t>(payload.size());
+        std::vector<uint8_t> frame;
+        frame.reserve(payload.size() + 8);
+        frame.push_back(0xBB);
+        frame.push_back(0x00);
+        frame.push_back(cmd);
+        frame.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
+        frame.push_back(static_cast<uint8_t>(len & 0xFF));
+        frame.insert(frame.end(), payload.begin(), payload.end());
+        uint8_t sum = 0;
+        for (size_t i = 1; i < frame.size(); ++i) sum = static_cast<uint8_t>(sum + frame[i]);
+        frame.push_back(sum);
+        frame.push_back(0x7E);
+        return frame;
+    }
+
+    static std::vector<uint8_t> build_uhf_a0_frame(uint8_t cmd, const std::vector<uint8_t> &payload)
+    {
+        // Android reference (UhfUsbReader.kt):
+        // frame = A0 | len(payload+3) | addr(0x00) | cmd | payload | checksum(two's complement)
+        std::vector<uint8_t> frame;
+        frame.reserve(payload.size() + 5);
+        frame.push_back(0xA0);
+        frame.push_back(static_cast<uint8_t>(payload.size() + 3));
+        frame.push_back(0x00);
+        frame.push_back(cmd);
+        frame.insert(frame.end(), payload.begin(), payload.end());
+
+        int checksum_source = 0;
+        for (uint8_t b : frame) checksum_source = (checksum_source + (b & 0xFF)) & 0xFF;
+        const uint8_t checksum = static_cast<uint8_t>(((~checksum_source) + 1) & 0xFF);
+        frame.push_back(checksum);
+        return frame;
+    }
+
+    static bool extract_a0_frames(const std::vector<uint8_t> &raw,
+                                  std::vector<std::vector<uint8_t>> *frames)
+    {
+        if (frames) frames->clear();
+        if (raw.empty() || !frames) return false;
+
+        size_t index = 0;
+        while (index < raw.size()) {
+            while (index < raw.size() && raw[index] != 0xA0) ++index;
+            if (index + 2 > raw.size()) break;
+
+            const size_t frame_len = static_cast<size_t>(raw[index + 1]) + 2;
+            if (frame_len < 5 || index + frame_len > raw.size()) break;
+
+            frames->push_back(std::vector<uint8_t>(raw.begin() + index,
+                                                   raw.begin() + index + frame_len));
+            index += frame_len;
+        }
+        return !frames->empty();
+    }
+
+    static bool parse_a0_frame(const std::vector<uint8_t> &frame,
+                               uint8_t *cmd,
+                               std::vector<uint8_t> *data)
+    {
+        if (frame.size() < 5) return false;
+        if (frame[0] != 0xA0) return false;
+
+        const int len = frame[1] & 0xFF;
+        if (len < 3) return false;
+        if (frame.size() != static_cast<size_t>(len + 2)) return false;
+
+        int checksum_source = 0;
+        for (size_t i = 0; i + 1 < frame.size(); ++i) {
+            checksum_source = (checksum_source + (frame[i] & 0xFF)) & 0xFF;
+        }
+        const uint8_t checksum = static_cast<uint8_t>(((~checksum_source) + 1) & 0xFF);
+        if (checksum != frame.back()) return false;
+
+        if (cmd) *cmd = frame[3];
+        if (data) {
+            const int data_len = len - 3;
+            if (data_len <= 0) {
+                data->clear();
+            } else {
+                data->assign(frame.begin() + 4, frame.begin() + 4 + data_len);
+            }
+        }
+        return true;
+    }
+
+    static bool write_all(INfcTransport *transport,
+                          const std::vector<uint8_t> &frame,
+                          std::string *error)
+    {
+        if (!transport || !transport->is_open()) {
+            if (error) *error = "transport not open";
+            return false;
+        }
+        const ssize_t sent = transport->write_bytes(frame.data(), frame.size(), error);
+        if (sent < 0 || static_cast<size_t>(sent) != frame.size()) {
+            if (error && error->empty()) *error = "short write";
+            return false;
+        }
+        return true;
+    }
+
+    bool uhf_exchange_command_locked(INfcTransport *transport,
+                                     uint8_t cmd,
+                                     const std::vector<uint8_t> &payload,
+                                     int listen_ms,
+                                     std::vector<uint8_t> *raw_response,
+                                     std::string *error)
+    {
+        if (raw_response) raw_response->clear();
+        std::string io_error;
+
+        auto read_window = [&](std::vector<uint8_t> *out) {
+            if (!out) return;
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(listen_ms);
+            while (std::chrono::steady_clock::now() < deadline) {
+                uint8_t buf[256] = {};
+                std::string read_err;
+                const ssize_t got = transport->read_bytes(buf, sizeof(buf), 40, &read_err);
+                if (got > 0) {
+                    out->insert(out->end(), buf, buf + got);
+                    continue;
+                }
+                if (got < 0) {
+                    io_error = read_err;
+                    break;
+                }
+            }
+        };
+
+        std::vector<uint8_t> merged;
+        // Prefer Android-compatible A0 framing first (UhfUsbReader.kt), then keep BB as fallback.
+        const std::vector<uint8_t> a0_frame = build_uhf_a0_frame(cmd, payload);
+        if (write_all(transport, a0_frame, &io_error)) {
+            read_window(&merged);
+        }
+        if (merged.empty()) {
+            const std::vector<uint8_t> bb_frame = build_uhf_bb_frame(cmd, payload);
+            if (write_all(transport, bb_frame, &io_error)) {
+                read_window(&merged);
+            }
+        }
+
+        if (raw_response) *raw_response = merged;
+        if (!merged.empty()) {
+            if (error) error->clear();
+            return true;
+        }
+        if (error) *error = io_error.empty() ? "no response" : io_error;
+        return false;
+    }
+
+    bool uhf_detect_on_open_transport_locked(INfcTransport *transport, std::string *detail)
+    {
+        if (!transport || !transport->is_open()) return false;
+
+        std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
+        std::vector<uint8_t> raw;
+        std::string err;
+        if (!uhf_exchange_command_locked(transport, 0x72, {}, 160, &raw, &err)) {
+            return false;
+        }
+
+        bool signature = false;
+        std::string version_text;
+
+        std::vector<std::vector<uint8_t>> a0_frames;
+        if (extract_a0_frames(raw, &a0_frames)) {
+            for (const auto &frame : a0_frames) {
+                uint8_t frame_cmd = 0;
+                std::vector<uint8_t> data;
+                if (!parse_a0_frame(frame, &frame_cmd, &data)) continue;
+                if (frame_cmd != 0x72) continue;
+                signature = true;
+
+                if (data.size() >= 3) {
+                    version_text = std::to_string(static_cast<int>(data[0])) + "." +
+                                   std::to_string(static_cast<int>(data[1])) + "." +
+                                   std::to_string(static_cast<int>(data[2]));
+                }
+                break;
+            }
+        }
+
+        if (!signature) {
+            const std::string ascii_raw = bytes_to_readable_ascii(raw);
+            const std::string ascii = to_upper_ascii(ascii_raw);
+            if (ascii.find("UHF") != std::string::npos ||
+                ascii.find("EPC") != std::string::npos ||
+                ascii.find("RSSI") != std::string::npos ||
+                ascii.find("TID") != std::string::npos) {
+                signature = true;
+            }
+        }
+
+        if (!signature) {
+            for (size_t i = 0; i + 6 < raw.size(); ++i) {
+                if (raw[i] == 0xBB && raw[i + 1] <= 0x02) {
+                    signature = true;
+                    break;
+                }
+            }
+        }
+        if (!signature) return false;
+
+        if (detail) {
+            if (!version_text.empty()) {
+                *detail = std::string("UHFReader FW ") + version_text;
+            } else {
+                *detail = std::string("UHFReader response: ") +
+                          bytes_to_hex_string(raw.data(), raw.size(), 32);
+            }
+        }
+        return true;
+    }
+
+    std::vector<UhfTagSnapshot> parse_uhf_tags_from_raw(const std::vector<uint8_t> &raw) const
+    {
+        std::vector<UhfTagSnapshot> out;
+        if (raw.empty()) return out;
+
+        auto parse_a0_realtime_data = [&](const std::vector<uint8_t> &data) {
+            if (data.size() < 5) return;
+
+            auto try_layout = [&](size_t pc_offset, size_t epc_offset, bool has_antenna, size_t antenna_offset) -> bool {
+                if (data.size() < pc_offset + 2) return false;
+
+                const int pc = ((data[pc_offset] & 0xFF) << 8) | (data[pc_offset + 1] & 0xFF);
+                const int epc_words = (pc >> 11) & 0x1F;
+                const int epc_len = epc_words * 2;
+                if (epc_len <= 0 || epc_len > 62) return false;
+
+                const size_t epc_end = epc_offset + static_cast<size_t>(epc_len);
+                if (epc_end > data.size()) return false;
+
+                UhfTagSnapshot row;
+                row.epc = keep_hex_chars_upper(
+                    bytes_to_hex_string(data.data() + epc_offset, static_cast<size_t>(epc_len)));
+
+                if (!looks_like_epc(row.epc)) return false;
+
+                char pc_buf[8];
+                std::snprintf(pc_buf, sizeof(pc_buf), "%04X", pc & 0xFFFF);
+                row.pc = pc_buf;
+
+                if (has_antenna && antenna_offset < data.size()) {
+                    row.antenna = std::to_string(static_cast<int>(data[antenna_offset] & 0xFF));
+                }
+
+                const size_t meta_offset = epc_end;
+                if (data.size() >= meta_offset + 7) {
+                    const int32_t rssi =
+                        (static_cast<int32_t>(data[meta_offset + 0]) << 24) |
+                        (static_cast<int32_t>(data[meta_offset + 1]) << 16) |
+                        (static_cast<int32_t>(data[meta_offset + 2]) << 8) |
+                        (static_cast<int32_t>(data[meta_offset + 3]));
+                    row.rssi = std::to_string(rssi);
+
+                    const int freq_hz =
+                        ((data[meta_offset + 4] & 0xFF) << 16) |
+                        ((data[meta_offset + 5] & 0xFF) << 8) |
+                        (data[meta_offset + 6] & 0xFF);
+                    row.frequency = std::to_string(freq_hz);
+                }
+
+                row.raw_hex = bytes_to_hex_string(data.data(), data.size(), 64);
+                row.read_count = 1;
+                out.push_back(row);
+                return true;
+            };
+
+            // Layout A (Android reference): [ant][pc_hi][pc_lo][epc...][rssi(4)][freq(3)]
+            if (try_layout(1, 3, true, 0)) return;
+            // Layout B (some modules): [pc_hi][pc_lo][epc...][rssi(4)][freq(3)]
+            if (try_layout(0, 2, false, 0)) return;
+            // Layout C (status + antenna prefix): [status][ant][pc_hi][pc_lo][epc...]
+            (void)try_layout(2, 4, true, 1);
+        };
+
+        std::vector<std::vector<uint8_t>> a0_frames;
+        if (extract_a0_frames(raw, &a0_frames)) {
+            for (const auto &frame : a0_frames) {
+                uint8_t cmd = 0;
+                std::vector<uint8_t> data;
+                if (!parse_a0_frame(frame, &cmd, &data)) continue;
+                if (cmd == 0x72) continue; // firmware response, not EPC payload
+                parse_a0_realtime_data(data);
+            }
+            if (!out.empty()) return out;
+        }
+
+        auto parse_one = [&](const std::vector<uint8_t> &chunk) {
+            if (chunk.empty()) return;
+            const std::string chunk_ascii_up = to_upper_ascii(bytes_to_readable_ascii(chunk));
+            UhfTagSnapshot row;
+            row.epc       = keep_hex_chars_upper(extract_label_token(chunk_ascii_up, "EPC"));
+            row.tid       = keep_hex_chars_upper(extract_label_token(chunk_ascii_up, "TID"));
+            row.pc        = keep_hex_chars_upper(extract_label_token(chunk_ascii_up, "PC"));
+            row.crc       = keep_hex_chars_upper(extract_label_token(chunk_ascii_up, "CRC"));
+            row.rssi      = extract_label_token(chunk_ascii_up, "RSSI");
+            row.frequency = extract_label_token(chunk_ascii_up, "FREQ");
+            row.antenna   = extract_label_token(chunk_ascii_up, "ANT");
+
+            if (row.epc.empty()) {
+                auto tokens = extract_hex_tokens(chunk_ascii_up);
+                std::sort(tokens.begin(), tokens.end(),
+                          [](const std::string &a, const std::string &b) { return a.size() > b.size(); });
+                for (const auto &token : tokens) {
+                    if (looks_like_epc(token) && token.size() <= 96) {
+                        row.epc = token;
+                        break;
+                    }
+                }
+            }
+
+            if (!looks_like_epc(row.epc)) return;
+            row.raw_hex = bytes_to_hex_string(chunk.data(), chunk.size(), 64);
+            row.read_count = 1;
+            out.push_back(row);
+        };
+
+        parse_one(raw);
+
+        // Parse BB frames to avoid missing tags from binary payload reports.
+        for (size_t i = 0; i + 6 < raw.size();) {
+            if (raw[i] != 0xBB) {
+                ++i;
+                continue;
+            }
+            const uint16_t len = static_cast<uint16_t>((raw[i + 3] << 8) | raw[i + 4]);
+            const size_t frame_len = static_cast<size_t>(len) + 7;
+            if (i + frame_len > raw.size()) break;
+            if (raw[i + frame_len - 1] == 0x7E && len > 0) {
+                const size_t payload_start = i + 5;
+                parse_one(std::vector<uint8_t>(raw.begin() + payload_start,
+                                               raw.begin() + payload_start + len));
+            }
+            i += frame_len;
+        }
+
+        return out;
+    }
+
+    static void merge_if_empty(std::string *target, const std::string &value)
+    {
+        if (target && target->empty() && !value.empty()) *target = value;
+    }
+
+    TagInfo uhf_snapshot_to_tag_info(const UhfTagSnapshot &tag) const
+    {
+        TagInfo info;
+        info.protocol = ProtocolKind::Unknown;
+        info.tag_type = "UHF EPC Gen2";
+        info.uid = tag.epc;
+        if (!tag.tid.empty()) info.identity_fields["TID"] = tag.tid;
+        if (!tag.pc.empty()) info.identity_fields["PC"] = tag.pc;
+        if (!tag.crc.empty()) info.identity_fields["CRC"] = tag.crc;
+        if (!tag.rssi.empty()) info.identity_fields["RSSI"] = tag.rssi;
+        if (!tag.frequency.empty()) info.identity_fields["FREQ"] = tag.frequency;
+        if (!tag.antenna.empty()) info.identity_fields["ANT"] = tag.antenna;
+        info.identity_fields["READ_COUNT"] = std::to_string(tag.read_count);
+        if (!tag.raw_hex.empty()) info.raw_data.push_back(tag.raw_hex);
+        return info;
+    }
+
+    void merge_uhf_tags(const std::vector<UhfTagSnapshot> &detected, const TransportEndpoint &endpoint)
+    {
+        for (const auto &row : detected) {
+            if (!looks_like_epc(row.epc)) continue;
+
+            UhfTagSnapshot snapshot;
+            bool first_seen = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                UhfTagSnapshot &slot = uhf_tags_[row.epc];
+                first_seen = slot.read_count == 0;
+                if (first_seen) {
+                    slot.first_seen = iso8601_now();
+                    slot.epc = row.epc;
+                    slot.read_count = 0;
+                }
+                slot.last_seen = iso8601_now();
+                slot.read_count += 1;
+                merge_if_empty(&slot.tid, row.tid);
+                merge_if_empty(&slot.pc, row.pc);
+                merge_if_empty(&slot.crc, row.crc);
+                merge_if_empty(&slot.rssi, row.rssi);
+                merge_if_empty(&slot.frequency, row.frequency);
+                merge_if_empty(&slot.antenna, row.antenna);
+                if (!row.raw_hex.empty()) slot.raw_hex = row.raw_hex;
+                snapshot = slot;
+
+                scan_.has_result = true;
+                scan_.status = uhf_continuous_mode_ ? "UHF continuous" : "UHF scan ready";
+                scan_.error.clear();
+                scan_.last_record = make_record_from_tag(
+                    uhf_snapshot_to_tag_info(snapshot), endpoint, false, "uhf_scan");
+            }
+
+            if (first_seen) {
+                std::string line = "EPC " + snapshot.epc;
+                if (!snapshot.rssi.empty()) line += " RSSI:" + snapshot.rssi;
+                if (!snapshot.antenna.empty()) line += " ANT:" + snapshot.antenna;
+                line += " CNT:" + std::to_string(snapshot.read_count);
+                push_log(line);
+            }
+        }
+    }
+
+    void perform_uhf_scan_worker(bool continuous)
+    {
+        NfcHexLog::get().log_event("uhf", continuous ? "start continuous scan" : "start single scan");
+
+        TransportEndpoint endpoint;
+        INfcTransport *transport_raw = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            endpoint = connection_.endpoint;
+            transport_raw = transport_.get();
+        }
+
+        if (!transport_raw || !transport_raw->is_open()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            scan_.running = false;
+            scan_.status = "No UHF device";
+            scan_.error = "UHF reader disconnected";
+            uhf_continuous_mode_ = false;
+            return;
+        }
+
+        push_log(continuous ? "> UHF continuous scan..." : "> UHF scan once...");
+
+        bool found_any = false;
+        int idle_rounds = 0;
+        const auto once_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1800);
+
+        while (true) {
+            if (cancel_uhf_scan_.load()) break;
+
+            std::vector<uint8_t> raw;
+            std::string io_err;
+            {
+                std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
+                uhf_exchange_command_locked(transport_raw, 0x89, {0x01}, 220, &raw, &io_err);
+            }
+
+            const auto tags = parse_uhf_tags_from_raw(raw);
+            if (!tags.empty()) {
+                merge_uhf_tags(tags, endpoint);
+                found_any = true;
+                idle_rounds = 0;
+            } else {
+                ++idle_rounds;
+            }
+
+            if (!continuous) {
+                if (found_any) break;
+                if (std::chrono::steady_clock::now() >= once_deadline) break;
+                if (idle_rounds > 8) break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(continuous ? 120 : 80));
+        }
+
+        {
+            std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
+            std::string ignore;
+            uhf_exchange_command_locked(transport_raw, 0x8C, {}, 60, nullptr, &ignore);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            scan_.running = false;
+            if (continuous) {
+                scan_.status = "UHF stopped";
+                scan_.error.clear();
+            } else if (found_any) {
+                scan_.status = "UHF scan ready";
+                scan_.error.clear();
+            } else {
+                scan_.status = "No UHF tag";
+                scan_.error = "no tag detected";
+            }
+            uhf_continuous_mode_ = false;
+        }
+
+        if (continuous && cancel_uhf_scan_.load()) {
+            push_log("UHF scan stopped");
+        } else if (!found_any && !continuous) {
+            push_log("No UHF tag detected");
+        }
+    }
+
     static bool parse_hex_bytes(const std::string &value, std::vector<uint8_t> *out)
     {
         if (!out) return false;
@@ -2906,6 +4047,10 @@ private:
     std::unique_ptr<I2cGroveNfcDevice> i2c_device_;
     ConnectionState connection_;
     ScanState scan_;
+    std::unordered_map<std::string, UhfTagSnapshot> uhf_tags_;
+    bool uhf_continuous_mode_ = false;
+    std::string uhf_last_csv_path_;
+    std::atomic<bool> cancel_uhf_scan_{false};
     bool last_dump_success_ = false;
     ProtocolKind selected_emulator_protocol_ = ProtocolKind::MifareClassic;
     std::map<ProtocolKind, int> selected_slot_by_protocol_;

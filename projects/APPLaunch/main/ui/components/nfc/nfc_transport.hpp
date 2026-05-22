@@ -4,11 +4,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
 #include <dirent.h>
 #include <memory>
@@ -70,6 +72,8 @@ struct TransportEndpoint {
     std::string path;
     std::string label;
     int baud_rate = 115200;
+    int usb_vid = -1;
+    int usb_pid = -1;
 };
 
 class INfcTransport {
@@ -397,12 +401,20 @@ public:
             TransportEndpoint endpoint;
             endpoint.kind = kind;
             endpoint.path = std::string("/dev/") + name;
+            if (kind == TransportKind::UsbSerial)
+                read_usb_vid_pid(name, &endpoint.usb_vid, &endpoint.usb_pid);
             // Try to read USB product name for a friendlier label
             std::string product = read_usb_product_name(name);
-            if (!product.empty())
+            if (!product.empty()) {
                 endpoint.label = std::string(to_string(kind)) + " " + product + " (" + name + ")";
-            else
+            } else {
                 endpoint.label = std::string(to_string(kind)) + " " + name;
+            }
+
+            if (kind == TransportKind::UsbSerial &&
+                is_known_uhf_vid_pid(endpoint.usb_vid, endpoint.usb_pid)) {
+                endpoint.label = std::string("USB UHF Reader ") + "(" + name + ")";
+            }
             endpoint.baud_rate = 115200;
             endpoints.push_back(endpoint);
         }
@@ -723,6 +735,111 @@ private:
         }
 #endif
         return {};
+    }
+
+    static bool is_known_uhf_vid_pid(int vid, int pid)
+    {
+        return (vid == 0x1A86 && pid == 0xFE1C);
+    }
+
+    static bool parse_hex_u16(const std::string &text, int *value)
+    {
+        if (!value) return false;
+        std::string hex;
+        hex.reserve(text.size());
+        for (char ch : text) {
+            if (std::isxdigit(static_cast<unsigned char>(ch))) hex.push_back(ch);
+        }
+        if (hex.empty()) return false;
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(hex.c_str(), &end, 16);
+        if (!end || *end != '\0') return false;
+        if (parsed > 0xFFFFUL) return false;
+        *value = static_cast<int>(parsed);
+        return true;
+    }
+
+    static bool read_first_line_trimmed(const std::string &path, std::string *out)
+    {
+        if (!out) return false;
+        FILE *f = fopen(path.c_str(), "r");
+        if (!f) return false;
+        char buf[128] = {};
+        const bool ok = (fgets(buf, sizeof(buf), f) != nullptr);
+        fclose(f);
+        if (!ok) return false;
+        std::string line(buf);
+        while (!line.empty() &&
+               (line.back() == '\n' || line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
+            line.pop_back();
+        }
+        *out = line;
+        return !out->empty();
+    }
+
+    static bool read_usb_vid_pid(const std::string &devname, int *vid, int *pid)
+    {
+        if (vid) *vid = -1;
+        if (pid) *pid = -1;
+
+#if defined(__linux__)
+        static const char *SUFFIXES[] = {
+            "/device/../../idVendor", "/device/../idVendor", "/device/idVendor", nullptr
+        };
+        static const char *PSUFFIXES[] = {
+            "/device/../../idProduct", "/device/../idProduct", "/device/idProduct", nullptr
+        };
+
+        int found_vid = -1;
+        int found_pid = -1;
+        for (int i = 0; SUFFIXES[i] != nullptr; ++i) {
+            const std::string base = std::string("/sys/class/tty/") + devname;
+            const std::string vpath = base + SUFFIXES[i];
+            const std::string ppath = base + PSUFFIXES[i];
+
+            std::string vline, pline;
+            if (!read_first_line_trimmed(vpath, &vline)) continue;
+            if (!read_first_line_trimmed(ppath, &pline)) continue;
+
+            if (!parse_hex_u16(vline, &found_vid)) continue;
+            if (!parse_hex_u16(pline, &found_pid)) continue;
+            break;
+        }
+
+        if (vid) *vid = found_vid;
+        if (pid) *pid = found_pid;
+        return (found_vid >= 0 && found_pid >= 0);
+#elif defined(__APPLE__)
+        // macOS fallback via ioreg; best-effort only.
+    (void)devname;
+    const std::string cmd =
+        "ioreg -p IOUSB -l 2>/dev/null | "
+        "awk '/idVendor/ {vid=$NF} /idProduct/ {pid=$NF} "
+        "END { if (vid != \"\" && pid != \"\") print vid \" \" pid }' | head -1";
+        FILE *f = popen(cmd.c_str(), "r");
+        if (!f) return false;
+        char line[128] = {};
+        if (!fgets(line, sizeof(line), f)) {
+            pclose(f);
+            return false;
+        }
+        pclose(f);
+        std::string txt(line);
+        size_t sp = txt.find(' ');
+        if (sp == std::string::npos) return false;
+        int local_vid = -1;
+        int local_pid = -1;
+        if (!parse_hex_u16(txt.substr(0, sp), &local_vid)) return false;
+        if (!parse_hex_u16(txt.substr(sp + 1), &local_pid)) return false;
+        if (vid) *vid = local_vid;
+        if (pid) *pid = local_pid;
+        return true;
+#else
+        (void)devname;
+        (void)vid;
+        (void)pid;
+        return false;
+#endif
     }
 };
 
