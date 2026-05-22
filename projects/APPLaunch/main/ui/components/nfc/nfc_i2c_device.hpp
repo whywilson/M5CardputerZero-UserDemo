@@ -19,14 +19,12 @@
 #include <string>
 #include <vector>
 
-#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>
 #ifndef I2C_SLAVE
 #define I2C_SLAVE 0x0703
-#endif
 #endif
 
 #include <chrono>
@@ -163,13 +161,11 @@ public:
 
     void close()
     {
-#ifndef _WIN32
         if (fd_ >= 0) {
             stopRF();
             ::close(fd_);
             fd_ = -1;
         }
-#endif
     }
 
     bool is_open() const { return fd_ >= 0; }
@@ -283,7 +279,6 @@ public:
             return false;
         }
 
-#ifndef _WIN32
         if (!st25r_init_nfca_reader()) {
             if (error) *error = "NFCA init failed";
             return false;
@@ -334,11 +329,6 @@ public:
         }
         if (error) error->clear();
         return true;
-#else
-        (void)block0;
-        if (error) *error = "Unsupported platform";
-        return false;
-#endif
     }
 
     // Write block 0 for Gen3 (CUID) magic card on NFC Unit (ST25R3916B).
@@ -365,12 +355,18 @@ public:
             return false;
         }
 
-#ifndef _WIN32
         // Full ISO14443-A select (includes RF reset inside st25r_nfca_select_uid).
         std::vector<uint8_t> sel_uid;
         uint8_t sak = 0;
         if (!st25r_nfca_select_uid(sel_uid, sak)) {
             if (error) *error = "card select failed";
+            return false;
+        }
+
+        // Match PN532 sequence for Gen3: HALT -> WUPA -> SELECT before raw cmds.
+        if (!st25r_nfca_reselect_current_field(sel_uid, sak, true)) {
+            st25r_write_reg(0x02, 0x80);
+            if (error) *error = "reselect failed";
             return false;
         }
 
@@ -382,61 +378,136 @@ public:
             return false;
         }
 
-        // Gen3 check: block 0 must be readable without authentication.
-        std::array<uint8_t, 16> blk0_read{};
-        if (!st25r_mfc_read_plain_block(0, blk0_read)) {
-            st25r_write_reg(0x02, 0x80);
-            if (error) *error = "not Gen3: block0 plain read failed";
+        auto parse_sw_9000 = [](const uint8_t *rx, uint8_t rx_len) -> bool {
+            if (!rx || rx_len < 2) return false;
+            for (uint8_t i = 0; i + 1 < rx_len; ++i) {
+                if (rx[i] == 0x90 && rx[i + 1] == 0x00) return true;
+            }
             return false;
-        }
-
-        // ACK parser (same logic as Gen1A write).
-        auto parse_ack = [](const uint8_t *rx, uint8_t rx_len) -> bool {
-            if (!rx || rx_len == 0) return false;
-            const uint8_t lo = static_cast<uint8_t>(rx[0] & 0x0F);
-            const uint8_t hi = static_cast<uint8_t>((rx[0] >> 4) & 0x0F);
-            return (lo == 0x0A) || (hi == 0x0A) || (rx[0] == 0x0A);
         };
 
-        auto send_gen3_cmd = [&](const std::vector<uint8_t> &cmd, const char *name) -> bool {
-            uint8_t ack[4] = {0};
-            uint8_t ack_len = sizeof(ack);
-            if (!st25r_nfca_transceive(cmd.data(), static_cast<uint8_t>(cmd.size()),
-                                       true, ack, ack_len, 80, 0x00, true, 0)) {
-                if (error) *error = std::string(name) + " timeout";
+        auto transceive_raw_with_crc = [&](const std::vector<uint8_t> &cmd,
+                                           uint8_t *rx,
+                                           uint8_t &rx_len,
+                                           int timeout_ms,
+                                           bool issue_stop,
+                                           const char *name) -> bool {
+            if (cmd.empty()) return false;
+            std::array<uint8_t, 64> frame{};
+            const size_t cmd_len = cmd.size();
+            if (cmd_len + 2 > frame.size()) {
+                if (error) *error = std::string(name) + " too long";
                 return false;
             }
-            if (!parse_ack(ack, ack_len)) {
-                if (error) *error = std::string(name) + " no ACK";
+
+            std::copy(cmd.begin(), cmd.end(), frame.begin());
+            const uint16_t crc = crc_a(frame.data(), cmd_len);
+            frame[cmd_len] = static_cast<uint8_t>(crc & 0xFF);
+            frame[cmd_len + 1] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+
+            if (!st25r_nfca_transceive(frame.data(),
+                                       static_cast<uint8_t>(cmd_len + 2),
+                                       false,
+                                       rx,
+                                       rx_len,
+                                       timeout_ms,
+                                       0x00,
+                                       true,
+                                       0,
+                                       issue_stop)) {
+                if (error) *error = std::string(name) + " timeout";
                 return false;
             }
             return true;
         };
 
-        // Gen3 UID-set command: {0x90, 0xFB, 0xCC, 0xCC, 0x07, uid...}
-        std::vector<uint8_t> uid_cmd = {0x90, 0xFB, 0xCC, 0xCC, 0x07};
-        uid_cmd.insert(uid_cmd.end(), uid.begin(), uid.end());
-        if (!send_gen3_cmd(uid_cmd, "Gen3 UID set")) {
+        // Gen3 check: block 0 must be readable without authentication.
+        std::array<uint8_t, 20> blk0_resp{};
+        uint8_t blk0_resp_len = static_cast<uint8_t>(blk0_resp.size());
+        if (!transceive_raw_with_crc({0x30, 0x00},
+                                     blk0_resp.data(),
+                                     blk0_resp_len,
+                                     120,
+                                     false,
+                                     "Gen3 READ block0") ||
+            blk0_resp_len < 16) {
             st25r_write_reg(0x02, 0x80);
+            if (error && error->empty()) *error = "not Gen3: block0 plain read failed";
+            return false;
+        }
+
+        // Gen3 UID-set command: {0x90, 0xFB, 0xCC, 0xCC, Lc, uid...}
+        std::vector<uint8_t> uid_cmd = {0x90, 0xFB, 0xCC, 0xCC, static_cast<uint8_t>(uid.size())};
+        uid_cmd.insert(uid_cmd.end(), uid.begin(), uid.end());
+        {
+            uint8_t rx[16] = {0};
+            uint8_t rx_len = sizeof(rx);
+            if (!transceive_raw_with_crc(uid_cmd,
+                                         rx,
+                                         rx_len,
+                                         120,
+                                         false,
+                                         "Gen3 UID set") ||
+                !parse_sw_9000(rx, rx_len)) {
+                st25r_write_reg(0x02, 0x80);
+                if (error && error->empty()) *error = "Gen3 UID set failed";
+                return false;
+            }
+        }
+
+        // Re-select before block0 write to mirror robust PN532 flow.
+        if (!st25r_nfca_reselect_current_field(sel_uid, sak, true)) {
+            st25r_write_reg(0x02, 0x80);
+            if (error) *error = "reselect before block0 write failed";
             return false;
         }
 
         // Gen3 block0-write command: {0x90, 0xF0, 0xCC, 0xCC, 0x10, block0...}
         std::vector<uint8_t> blk0_cmd = {0x90, 0xF0, 0xCC, 0xCC, 0x10};
         blk0_cmd.insert(blk0_cmd.end(), block0.begin(), block0.end());
-        if (!send_gen3_cmd(blk0_cmd, "Gen3 block0 write")) {
+        {
+            uint8_t rx[16] = {0};
+            uint8_t rx_len = sizeof(rx);
+            if (!transceive_raw_with_crc(blk0_cmd,
+                                         rx,
+                                         rx_len,
+                                         120,
+                                         false,
+                                         "Gen3 block0 write") ||
+                !parse_sw_9000(rx, rx_len)) {
+                st25r_write_reg(0x02, 0x80);
+                if (error && error->empty()) *error = "Gen3 block0 write failed";
+                return false;
+            }
+        }
+
+        // Verify by reading block0 again (first 16 bytes are data, CRC may follow).
+        {
+            std::array<uint8_t, 20> verify_resp{};
+            uint8_t verify_len = static_cast<uint8_t>(verify_resp.size());
+            if (!transceive_raw_with_crc({0x30, 0x00},
+                                         verify_resp.data(),
+                                         verify_len,
+                                         120,
+                                         false,
+                                         "Gen3 verify block0") ||
+                verify_len < 16 ||
+                !std::equal(block0.begin(), block0.end(), verify_resp.begin())) {
+                st25r_write_reg(0x02, 0x80);
+                if (error) *error = "verify block0 failed";
+                return false;
+            }
+        }
+
+        if (!st25r_nfca_reselect_current_field(sel_uid, sak, true)) {
             st25r_write_reg(0x02, 0x80);
+            if (error) *error = "reselect after write failed";
             return false;
         }
 
         st25r_write_reg(0x02, 0x80);
         if (error) error->clear();
         return true;
-#else
-        (void)uid; (void)block0;
-        if (error) *error = "Unsupported platform";
-        return false;
-#endif
     }
 
     // ── Emulation (GroveNFC 0x48 only, NFC Unit returns false) ───────────────
@@ -511,7 +582,6 @@ public:
 
     bool writeSysReg(uint16_t reg, uint16_t value)
     {
-#ifndef _WIN32
         if (fd_ < 0) return false;
         // Address: big-endian. Value: little-endian (same as GroveNFC Arduino driver).
         uint8_t buf[4] = {
@@ -521,14 +591,10 @@ public:
             (uint8_t)(value >> 8)
         };
         return ::write(fd_, buf, 4) == 4;
-#else
-        return false;
-#endif
     }
 
     bool writeMiscReg(uint16_t reg, uint8_t value)
     {
-#ifndef _WIN32
         if (fd_ < 0) return false;
         uint8_t buf[3] = {
             (uint8_t)(reg >> 8),
@@ -536,14 +602,10 @@ public:
             value
         };
         return ::write(fd_, buf, 3) == 3;
-#else
-        return false;
-#endif
     }
 
     uint16_t readSysReg(uint16_t reg)
     {
-#ifndef _WIN32
         if (fd_ < 0) return 0;
         // Use I2C_RDWR (repeated-start) so no STOP is issued between the
         // register address write and the data read. GroveNFC M090 clears its
@@ -558,28 +620,20 @@ public:
         struct i2c_rdwr_ioctl_data data = {msgs, 2};
         if (::ioctl(fd_, I2C_RDWR, &data) < 0) return 0;
         return (uint16_t(rx[1]) << 8) | rx[0]; // little-endian
-#else
-        return 0;
-#endif
     }
 
     bool writeData(uint16_t reg, const uint8_t *data, uint16_t len)
     {
-#ifndef _WIN32
         if (fd_ < 0) return false;
         std::vector<uint8_t> buf(2u + len);
         buf[0] = (uint8_t)(reg >> 8);
         buf[1] = (uint8_t)(reg & 0xFF);
         if (len > 0) std::memcpy(buf.data() + 2, data, len);
         return ::write(fd_, buf.data(), (size_t)(2 + len)) == (ssize_t)(2 + len);
-#else
-        return false;
-#endif
     }
 
     bool readData(uint16_t reg, uint8_t *data, uint16_t len)
     {
-#ifndef _WIN32
         if (fd_ < 0) return false;
         if (len == 0) return true;
         uint8_t reg_buf[2] = {(uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF)};
@@ -589,9 +643,6 @@ public:
         };
         struct i2c_rdwr_ioctl_data ioctl_data = {msgs, 2};
         return ::ioctl(fd_, I2C_RDWR, &ioctl_data) >= 0;
-#else
-        return false;
-#endif
     }
 
 private:
@@ -619,17 +670,12 @@ private:
 
     bool st25r_write_reg(uint8_t reg, uint8_t val)
     {
-#ifndef _WIN32
         uint8_t buf[2] = {(uint8_t)(reg & 0x3F), val};
         return ::write(fd_, buf, 2) == 2;
-#else
-        return false;
-#endif
     }
 
     bool st25r_read_reg(uint8_t reg, uint8_t &val)
     {
-#ifndef _WIN32
         uint8_t rb = (reg & 0x3F) | 0x40;  // bit6=1 indicates register read in ST25R3916B I2C protocol
         uint8_t data = 0;
         struct i2c_msg msgs[2] = {
@@ -640,35 +686,23 @@ private:
         if (::ioctl(fd_, I2C_RDWR, &d) < 0) return false;
         val = data;
         return true;
-#else
-        return false;
-#endif
     }
 
     bool st25r_cmd(uint8_t cmd)
     {
-#ifndef _WIN32
         return ::write(fd_, &cmd, 1) == 1;
-#else
-        return false;
-#endif
     }
 
     bool st25r_fifo_write(const uint8_t *data, uint8_t len)
     {
-#ifndef _WIN32
         std::vector<uint8_t> buf;
         buf.push_back(0x80);
         buf.insert(buf.end(), data, data + len);
         return ::write(fd_, buf.data(), buf.size()) == (ssize_t)buf.size();
-#else
-        return false;
-#endif
     }
 
     bool st25r_fifo_read(uint8_t *data, uint8_t len)
     {
-#ifndef _WIN32
         // OP_READ_FIFO = 0x9F (NOT 0x80! 0x80 = OP_LOAD_FIFO, 0xC0 = OP_DIRECT_COMMAND)
         uint8_t op = 0x9F;
         struct i2c_msg msgs[2] = {
@@ -677,9 +711,6 @@ private:
         };
         struct i2c_rdwr_ioctl_data d = {msgs, 2};
         return ::ioctl(fd_, I2C_RDWR, &d) >= 0;
-#else
-        return false;
-#endif
     }
 
     // Set NUM_TX_BYTES registers (0x22-0x23).
@@ -691,6 +722,129 @@ private:
         uint16_t v = ((bytes_count & 0x1FF) << 3) | (last_bits & 0x07);
         st25r_write_reg(0x22, (uint8_t)((v >> 8) & 0xFF));
         st25r_write_reg(0x23, (uint8_t)(v & 0xFF));
+    }
+
+    static constexpr uint8_t ST25R_IRQ_MAIN_FWL = 0x40;
+    static constexpr uint8_t ST25R_IRQ_MAIN_RXS = 0x20;
+    static constexpr uint8_t ST25R_IRQ_MAIN_RXE = 0x10;
+    static constexpr uint8_t ST25R_IRQ_MAIN_TXE = 0x08;
+    static constexpr uint8_t ST25R_IRQ_MAIN_COL = 0x04;
+
+    static constexpr uint8_t ST25R_IRQ_TIMER_NFC_NRE = 0x40;
+
+    struct St25rIrqStatus {
+        uint8_t main = 0;
+        uint8_t timer_nfc = 0;
+        uint8_t error_wup = 0;
+        uint8_t target = 0;
+    };
+
+    uint32_t st25r_ms_to_64fc(int timeout_ms)
+    {
+        if (timeout_ms <= 0) return 1;
+        const uint64_t raw = (static_cast<uint64_t>(timeout_ms) * 13560ULL + 63ULL) / 64ULL;
+        return static_cast<uint32_t>(std::min<uint64_t>(raw, 0xFFFFULL));
+    }
+
+    void st25r_clear_irq_regs()
+    {
+        uint8_t dummy = 0;
+        st25r_read_reg(0x1A, dummy);
+        st25r_read_reg(0x1B, dummy);
+        st25r_read_reg(0x1C, dummy);
+        st25r_read_reg(0x1D, dummy);
+    }
+
+    bool st25r_config_nfca_rx_timers(int timeout_ms)
+    {
+        // Match the RFAL default NFCA receive path closely enough for magic-card
+        // probing: 64/fc steps, NRT tied to the end of TX, tiny MRT.
+        if (!st25r_write_reg(0x12, 0x00)) return false;
+        if (!st25r_write_reg(0x0F, 0x01)) return false;
+
+        const uint32_t nrt_64fc = st25r_ms_to_64fc(timeout_ms);
+        if (!st25r_write_reg(0x10, static_cast<uint8_t>((nrt_64fc >> 8) & 0xFF))) return false;
+        if (!st25r_write_reg(0x11, static_cast<uint8_t>(nrt_64fc & 0xFF))) return false;
+        return true;
+    }
+
+    St25rIrqStatus st25r_read_irq_status(bool include_error = false)
+    {
+        St25rIrqStatus irq;
+        st25r_read_reg(0x1A, irq.main);
+        st25r_read_reg(0x1B, irq.timer_nfc);
+        if (include_error) st25r_read_reg(0x1C, irq.error_wup);
+        return irq;
+    }
+
+    bool st25r_wait_for_nfca_rx(St25rIrqStatus &first_irq,
+                                St25rIrqStatus &last_irq,
+                                int timeout_ms)
+    {
+        auto start = std::chrono::steady_clock::now();
+        bool saw_rxs = false;
+
+        while (true) {
+            St25rIrqStatus irq = st25r_read_irq_status(false);
+            if (!saw_rxs && (irq.main || irq.timer_nfc)) first_irq = irq;
+            if (irq.main & ST25R_IRQ_MAIN_COL) {
+                last_irq = irq;
+                return false;
+            }
+            if (!saw_rxs) {
+                if ((irq.timer_nfc & ST25R_IRQ_TIMER_NFC_NRE) && !(irq.main & ST25R_IRQ_MAIN_RXS)) {
+                    last_irq = irq;
+                    return false;
+                }
+                if (irq.main & (ST25R_IRQ_MAIN_RXS | ST25R_IRQ_MAIN_RXE)) {
+                    saw_rxs = true;
+                    if (irq.main & ST25R_IRQ_MAIN_RXE) {
+                        last_irq = irq;
+                        return true;
+                    }
+                }
+            } else {
+                if (irq.main & ST25R_IRQ_MAIN_RXE) {
+                    last_irq = irq;
+                    return true;
+                }
+                if (irq.timer_nfc & ST25R_IRQ_TIMER_NFC_NRE) {
+                    last_irq = irq;
+                    return false;
+                }
+            }
+
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed >= timeout_ms) {
+                last_irq = irq;
+                return false;
+            }
+        }
+    }
+
+    bool st25r_read_fifo_count(uint16_t &fifo_cnt)
+    {
+        uint8_t fifo_lo = 0;
+        uint8_t fifo_hi = 0;
+        if (!st25r_read_reg(0x1E, fifo_lo)) return false;
+        if (!st25r_read_reg(0x1F, fifo_hi)) return false;
+        fifo_cnt = static_cast<uint16_t>((static_cast<uint16_t>((fifo_hi >> 6) & 0x03) << 8) | fifo_lo);
+        return true;
+    }
+
+    bool st25r_wait_fifo_after_missed_rxe(uint16_t &fifo_cnt, int window_us = 1800)
+    {
+        fifo_cnt = 0;
+        auto start = std::chrono::steady_clock::now();
+        while (true) {
+            if (!st25r_read_fifo_count(fifo_cnt)) return false;
+            if (fifo_cnt > 0) return true;
+
+            const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed_us >= window_us) return false;
+        }
     }
 
     // Poll IRQ_MAIN (0x1A) until `mask` bits are set or `timeout_ms` expires.
@@ -718,12 +872,8 @@ private:
     // Space-B access: [0xFB, reg&0x3F, value]
     bool st25r_write_spaceb(uint8_t reg, uint8_t val)
     {
-#ifndef _WIN32
         uint8_t buf[3] = {0xFB, (uint8_t)(reg & 0x3F), val};
         return ::write(fd_, buf, 3) == 3;
-#else
-        return false;
-#endif
     }
 
     // ISO15693 CRC-16 (poly=0x8408 reflected 0x1021, init=0xFFFF, xor-out=0xFFFF)
@@ -938,6 +1088,23 @@ private:
             char h[3];
             std::snprintf(h, sizeof(h), "%02X", data[i]);
             out += h;
+        }
+        return out;
+    }
+
+    static std::vector<uint8_t> parse_hex_bytes(const std::string &hex)
+    {
+        const std::string compact = normalize_uid_hex(hex);
+        std::vector<uint8_t> out;
+        if ((compact.size() & 1U) != 0) return out;
+        out.reserve(compact.size() / 2);
+        auto hexval = [](char ch) -> uint8_t {
+            if (ch >= '0' && ch <= '9') return static_cast<uint8_t>(ch - '0');
+            if (ch >= 'A' && ch <= 'F') return static_cast<uint8_t>(ch - 'A' + 10);
+            return 0;
+        };
+        for (size_t i = 0; i < compact.size(); i += 2) {
+            out.push_back(static_cast<uint8_t>((hexval(compact[i]) << 4) | hexval(compact[i + 1])));
         }
         return out;
     }
@@ -1434,37 +1601,77 @@ private:
                                int timeout_ms,
                                uint8_t iso14443a_settings = 0x00,
                                bool no_crc_rx = false,
-                               uint8_t last_bits = 0)
+                               uint8_t last_bits = 0,
+                               bool issue_stop = true)
     {
+        auto &hexlog = NfcHexLog::get();
         if (!tx || tx_len == 0 || !rx || rx_len == 0) return false;
+        hexlog.log_tx("NFC", tx, tx_len);
         if (!st25r_write_reg(0x05, iso14443a_settings)) return false;
         if (!st25r_set_aux_crc_mode(no_crc_rx)) return false;
+        if (!st25r_config_nfca_rx_timers(timeout_ms)) return false;
 
+        if (issue_stop) st25r_cmd(0xC2);  // STOP
+        st25r_cmd(0xD5);  // RESET_RXGAIN
         st25r_cmd(0xDB);  // CLEAR_FIFO
         if (!st25r_fifo_write(tx, tx_len)) return false;
         const uint16_t ntx_bytes = (last_bits == 0) ? tx_len : static_cast<uint16_t>(tx_len - 1);
         st25r_set_ntx(ntx_bytes, last_bits);
-        { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }
+        st25r_clear_irq_regs();
         st25r_cmd(with_crc ? 0xC4 : 0xC5);
 
-        const uint8_t irq = st25r_wait_irq(0x10 | 0x04, timeout_ms);
-        if (!(irq & 0x10)) return false;
-
-        uint8_t fifo_cnt = 0;
-        if (!st25r_read_reg(0x1E, fifo_cnt) || fifo_cnt == 0) return false;
-        const uint8_t to_read = std::min<uint8_t>(fifo_cnt, rx_len);
+        St25rIrqStatus first_irq;
+        St25rIrqStatus last_irq;
+        uint16_t fifo_cnt = 0;
+        if (!st25r_wait_for_nfca_rx(first_irq, last_irq, timeout_ms)) {
+            // Some frames can be fully received while RXE/RXS sampling is missed
+            // by tight polling windows; do a short FIFO check before failing.
+            if (!st25r_wait_fifo_after_missed_rxe(fifo_cnt)) return false;
+        } else {
+            if (!st25r_read_fifo_count(fifo_cnt)) return false;
+        }
+        if (fifo_cnt == 0) return false;
+        const uint8_t to_read = std::min<uint16_t>(fifo_cnt, rx_len);
         if (!st25r_fifo_read(rx, to_read)) return false;
         if (fifo_cnt > to_read) {
             uint8_t sink[32] = {0};
-            uint8_t rem = static_cast<uint8_t>(fifo_cnt - to_read);
+            uint16_t rem = static_cast<uint16_t>(fifo_cnt - to_read);
             while (rem > 0) {
-                const uint8_t n = std::min<uint8_t>(rem, sizeof(sink));
+                const uint8_t n = static_cast<uint8_t>(std::min<uint16_t>(rem, sizeof(sink)));
                 st25r_fifo_read(sink, n);
-                rem = static_cast<uint8_t>(rem - n);
+                rem = static_cast<uint16_t>(rem - n);
             }
         }
         rx_len = to_read;
+        if (rx_len > 0) hexlog.log_rx("NFC", rx, rx_len);
         return true;
+    }
+
+    bool st25r_nfca_transceive_diag(const char *log_tag,
+                                    const uint8_t *tx,
+                                    uint8_t tx_len,
+                                    bool with_crc,
+                                    uint8_t iso14443a_settings,
+                                    bool no_crc_rx,
+                                    int timeout_ms,
+                                    bool issue_stop = true)
+    {
+        if (!tx || tx_len == 0) return false;
+        (void)log_tag;
+
+        uint8_t rx[48] = {0};
+        uint8_t rx_len = static_cast<uint8_t>(sizeof(rx));
+        const bool ok = st25r_nfca_transceive(tx,
+                                              tx_len,
+                                              with_crc,
+                                              rx,
+                                              rx_len,
+                                              timeout_ms,
+                                              iso14443a_settings,
+                                              no_crc_rx,
+                                              0,
+                                              issue_stop);
+        return ok;
     }
 
     bool st25r_nfca_transmit_only(const uint8_t *tx,
@@ -1489,16 +1696,99 @@ private:
         return (irq & 0x08) != 0;
     }
 
-    bool st25r_mfc_read_plain_block(uint8_t block, std::array<uint8_t, 16> &out)
+    bool st25r_mfc_read_plain_block(uint8_t block,
+                                    std::array<uint8_t, 16> &out,
+                                    uint8_t *observed_rx_len = nullptr,
+                                    bool *exchange_ok = nullptr,
+                                    const char **read_mode = nullptr)
     {
-        uint8_t rx_len = 20;
-        uint8_t rx[20] = {0};
-        const uint8_t cmd[2] = {0x30, block};
-        if (!st25r_nfca_transceive(cmd, 2, true, rx, rx_len, 40, 0x00, false, 0) || rx_len < 16) {
+        bool any_exchange = false;
+        uint8_t last_rx_len = 0;
+        const char *last_mode = "none";
+
+        auto finish_success = [&](const uint8_t *rx, uint8_t rx_len, const char *mode) {
+            if (exchange_ok) *exchange_ok = true;
+            if (observed_rx_len) *observed_rx_len = rx_len;
+            if (read_mode) *read_mode = mode;
+            std::copy(rx, rx + 16, out.begin());
+            return true;
+        };
+
+        auto try_native = [&](uint8_t iso14443a_settings, bool issue_stop, const char *mode) {
+            uint8_t rx_len = 18;
+            uint8_t rx[18] = {0};
+            const uint8_t cmd[2] = {0x30, block};
+            const bool ok = st25r_nfca_transceive(cmd,
+                                                  sizeof(cmd),
+                                                  true,
+                                                  rx,
+                                                  rx_len,
+                                                  80,
+                                                  iso14443a_settings,
+                                                  false,
+                                                  0,
+                                                  issue_stop);
+            if (ok) {
+                any_exchange = true;
+                last_rx_len = rx_len;
+                last_mode = mode;
+            }
+            if (ok && rx_len >= 16) {
+                return finish_success(rx, rx_len, mode);
+            }
             return false;
-        }
-        std::copy(rx, rx + 16, out.begin());
-        return true;
+        };
+
+        auto try_raw = [&](uint8_t iso14443a_settings, bool no_crc_rx, bool issue_stop, const char *mode) {
+            uint8_t rx_len = 20;
+            uint8_t rx[20] = {0};
+            const uint8_t cmd[2] = {0x30, block};
+            const uint16_t crc = crc_a(cmd, sizeof(cmd));
+            const uint8_t raw_cmd[4] = {
+                cmd[0],
+                cmd[1],
+                static_cast<uint8_t>(crc & 0xFF),
+                static_cast<uint8_t>((crc >> 8) & 0xFF)
+            };
+            // Match pn532-python's Gen3 probe: send a raw READ frame with an
+            // explicit CRC-A and keep CRC bytes in RX. Some magic cards appear
+            // to need looser receive settings than standard MFC.
+            const bool ok = st25r_nfca_transceive(raw_cmd,
+                                                  sizeof(raw_cmd),
+                                                  false,
+                                                  rx,
+                                                  rx_len,
+                                                  80,
+                                                  iso14443a_settings,
+                                                  no_crc_rx,
+                                                  0,
+                                                  issue_stop);
+            if (ok) {
+                any_exchange = true;
+                last_rx_len = rx_len;
+                last_mode = mode;
+            }
+            if (ok && rx_len >= 16) {
+                return finish_success(rx, rx_len, mode);
+            }
+            return false;
+        };
+
+        if (try_raw(0x00, false, true, "raw-crc-check")) return true;
+        if (try_raw(0x00, false, false, "raw-crc-check-keep")) return true;
+        if (try_raw(0x00, true, true, "raw")) return true;
+        if (try_raw(0x00, true, false, "raw-keep")) return true;
+        if (try_raw(0x40, true, true, "raw-no-rx-par")) return true;
+        if (try_raw(0x40, true, false, "raw-no-rx-par-keep")) return true;
+        if (try_native(0x00, true, "native")) return true;
+        if (try_native(0x00, false, "native-keep")) return true;
+        if (try_native(0x40, true, "native-no-rx-par")) return true;
+        if (try_native(0x40, false, "native-no-rx-par-keep")) return true;
+
+        if (exchange_ok) *exchange_ok = any_exchange;
+        if (observed_rx_len) *observed_rx_len = last_rx_len;
+        if (read_mode) *read_mode = last_mode;
+        return false;
     }
 
     // Type 2 tags support READ(page) for 4 consecutive pages (16 bytes).
@@ -1512,7 +1802,9 @@ private:
                rx_len >= 16;
     }
 
-    bool st25r_gen1a_backdoor_ack(uint8_t cmd, uint8_t tx_last_bits)
+    // Generic 7-bit (or N-bit) short-frame transceive with ACK nibble check.
+    // Use last_bits=7 for backdoor commands (e.g. 0x40/0x43), last_bits=0 for full-byte.
+    bool st25r_nfca_7bit_cmd_ack(uint8_t cmd, uint8_t tx_last_bits)
     {
         uint8_t rx_len = 4;
         uint8_t rx[4] = {0};
@@ -1527,89 +1819,170 @@ private:
 
     bool st25r_is_gen1a_magic(const std::string &selected_uid)
     {
-        auto run_unlock_probe = [&](bool send_halt) {
-            for (int attempt = 0; attempt < 3; ++attempt) {
-                std::vector<uint8_t> uid;
-                uint8_t sak = 0;
-                if (!st25r_nfca_select_uid(uid, sak)) continue;
+        auto run_unlock_probe = [&](bool send_halt) -> bool {
+            std::vector<uint8_t> uid;
+            uint8_t sak = 0;
+            if (!st25r_nfca_select_uid(uid, sak)) return false;
 
-                const std::string uid_hex = hex_compact(uid.data(), uid.size());
-                if (!selected_uid.empty() && uid_hex != selected_uid) continue;
+            const std::string uid_hex = hex_compact(uid.data(), uid.size());
+            if (!selected_uid.empty() && uid_hex != selected_uid) return false;
 
-                if (send_halt) {
-                    const uint8_t halt_no_crc[2] = {0x50, 0x00};
-                    (void)st25r_nfca_transmit_only(halt_no_crc, 2, false, 0x00, 0, 25);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
-
-                const bool ack1 = st25r_gen1a_backdoor_ack(0x40, 7);  // 7-bit frame
+            if (send_halt) {
+                const uint8_t halt_no_crc[2] = {0x50, 0x00};
+                (void)st25r_nfca_transmit_only(halt_no_crc, 2, false, 0x00, 0, 25);
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-                const bool ack2 = st25r_gen1a_backdoor_ack(0x43, 0);
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                // Bruce-compatible Gen1A confirmation: unlock1 ACK + unlock2 ACK.
-                // Avoid read-without-auth fallback here, otherwise Gen3/Gen4 can
-                // be misclassified as Gen1A.
-                if (ack1 && ack2) {
-                    return true;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
-            return false;
+
+            const bool ack1 = st25r_nfca_7bit_cmd_ack(0x40, 7);  // 7-bit frame
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const bool ack2 = st25r_nfca_7bit_cmd_ack(0x43, 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return ack1 && ack2;
         };
 
-        // Try both styles for compatibility: with HALT pre-step and without HALT.
+        // Try with HALT pre-step first, then without — each only once.
         if (run_unlock_probe(true)) return true;
         if (run_unlock_probe(false)) return true;
-
         return false;
     }
 
+    bool st25r_gen3_apdu_transceive(uint8_t ins,
+                                    const uint8_t *payload,
+                                    uint8_t payload_len,
+                                    uint8_t *rx,
+                                    uint8_t &rx_len,
+                                    const char **mode = nullptr)
+    {
+        if (!rx || rx_len == 0) return false;
+
+        std::array<uint8_t, 32> cmd{};
+        const size_t cmd_len = static_cast<size_t>(5U + payload_len);
+        if (cmd_len > cmd.size()) return false;
+
+        cmd[0] = 0x90;
+        cmd[1] = ins;
+        cmd[2] = 0xCC;
+        cmd[3] = 0xCC;
+        cmd[4] = payload_len;
+        if (payload_len > 0 && payload) {
+            std::copy(payload, payload + payload_len, cmd.begin() + 5);
+        }
+
+        auto try_raw_mode = [&](uint8_t iso14443a_settings, bool no_crc_rx, bool issue_stop, const char *mode_name) {
+            std::array<uint8_t, 34> raw_cmd{};
+            if (cmd_len + 2 > raw_cmd.size()) return false;
+            std::copy(cmd.begin(), cmd.begin() + static_cast<ptrdiff_t>(cmd_len), raw_cmd.begin());
+            const uint16_t crc = crc_a(raw_cmd.data(), cmd_len);
+            raw_cmd[cmd_len] = static_cast<uint8_t>(crc & 0xFF);
+            raw_cmd[cmd_len + 1] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+
+            uint8_t tmp_len = rx_len;
+            if (!st25r_nfca_transceive(raw_cmd.data(),
+                                       static_cast<uint8_t>(cmd_len + 2),
+                                       false,
+                                       rx,
+                                       tmp_len,
+                                       70,
+                                       iso14443a_settings,
+                                       no_crc_rx,
+                                       0,
+                                       issue_stop)) {
+                return false;
+            }
+            rx_len = tmp_len;
+            if (mode) *mode = mode_name;
+            return true;
+        };
+
+        auto try_mode = [&](uint8_t iso14443a_settings, bool issue_stop, const char *mode_name) {
+            uint8_t tmp_len = rx_len;
+            if (!st25r_nfca_transceive(cmd.data(),
+                                       static_cast<uint8_t>(cmd_len),
+                                       true,
+                                       rx,
+                                       tmp_len,
+                                       70,
+                                       iso14443a_settings,
+                                       false,
+                                       0,
+                                       issue_stop)) {
+                return false;
+            }
+            rx_len = tmp_len;
+            if (mode) *mode = mode_name;
+            return true;
+        };
+
+        if (try_raw_mode(0x00, false, true, "apdu-raw-crc-check")) return true;
+        if (try_mode(0x00, true, "apdu")) return true;
+        if (try_raw_mode(0x40, true, false, "apdu-raw-no-rx-par-keep")) return true;
+        if (mode) *mode = "none";
+        return false;
+    }
+
+    // Gen3 magic detection: HALT + fresh select, then plain READ(block0) without auth.
+    // A Gen3 card responds with 16+ bytes; a normal MFC card NAKs (no auth = no data).
+    // Uses no_crc_rx=true (raw RX) to match PN532 InCommunicateThru raw exchange
+    // behavior and avoid HW CRC stripping failures on some card variants.
     bool st25r_is_gen3_magic(const std::string &selected_uid)
     {
-        auto &hexlog = NfcHexLog::get();
-        hexlog.log_event("GEN3", "probe start");
-
         std::vector<uint8_t> uid;
         uint8_t sak = 0;
-        if (!st25r_nfca_select_uid(uid, sak)) {
-            hexlog.log_event("GEN3", "select FAILED");
-            return false;
-        }
-
-        {
-            char sak_msg[32];
-            std::snprintf(sak_msg, sizeof(sak_msg), "SAK=0x%02X", sak);
-            hexlog.log_event("GEN3", sak_msg);
-        }
+        if (!st25r_nfca_reselect_current_field(uid, sak, true)) return false;
 
         // Only Mifare Classic / Mifare Plus SL2 can be Gen3 magic.
         if (!(sak == 0x08 || sak == 0x09 || sak == 0x18 || sak == 0x28 || sak == 0x38 ||
               sak == 0x1C)) {
-            hexlog.log_event("GEN3", "SAK not MFC");
             return false;
         }
 
-        const std::string uid_hex = hex_compact(uid.data(), uid.size());
-        if (!selected_uid.empty() && uid_hex != selected_uid) {
-            char mm[64];
-            std::snprintf(mm, sizeof(mm), "UID mismatch got=%s want=%s",
-                          uid_hex.c_str(), selected_uid.c_str());
-            hexlog.log_event("GEN3", mm);
-            return false;
+        if (!selected_uid.empty()) {
+            const std::string got = hex_compact(uid.data(), uid.size());
+            if (got != selected_uid) return false;
         }
 
-        std::array<uint8_t, 16> block0{};
-        const bool ok = st25r_mfc_read_plain_block(0, block0);
-        hexlog.log_event("GEN3", ok ? "plain_read OK → Gen3" : "plain_read FAILED");
-        return ok;
+        // Gen3 probe: send "90 FB CC CC [Lc] [uid...]" with the card's own UID.
+        // A Gen3 (CUID) card responds with SW 9000; normal Mifare Classic ignores it.
+        // This matches the proven write-path command observed in logs:
+        //   TX: 90FBCCCC07[uid7]CRC  RX: 9000CRC
+        const uint8_t uid_len = static_cast<uint8_t>(uid.size());
+        std::array<uint8_t, 32> cmd{};
+        cmd[0] = 0x90; cmd[1] = 0xFB; cmd[2] = 0xCC; cmd[3] = 0xCC; cmd[4] = uid_len;
+        std::copy(uid.begin(), uid.end(), cmd.begin() + 5);
+        const size_t cmd_len = 5u + uid_len;
+        const uint16_t crc = crc_a(cmd.data(), cmd_len);
+        cmd[cmd_len]     = static_cast<uint8_t>(crc & 0xFF);
+        cmd[cmd_len + 1] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+
+        uint8_t rx[16] = {0};
+        uint8_t rx_len = sizeof(rx);
+        if (!st25r_nfca_transceive(cmd.data(),
+                                   static_cast<uint8_t>(cmd_len + 2),
+                                   false,   // CRC already appended manually
+                                   rx,
+                                   rx_len,
+                                   120,
+                                   0x00,
+                                   true,    // no_crc_rx: raw RX, no HW CRC strip
+                                   0,
+                                   false)) {
+            return false;
+        }
+        // Accept response if it contains 90 00 anywhere (raw bytes, CRC not stripped).
+        for (uint8_t i = 0; i + 1 < rx_len; ++i) {
+            if (rx[i] == 0x90 && rx[i + 1] == 0x00) return true;
+        }
+        return false;
     }
 
-    bool st25r_is_gen4_magic(const std::string &selected_uid)
+    // Gen4 magic detection.
+    // password: 4-byte PWD field in the CF command (default all-zero).
+    bool st25r_is_gen4_magic(const std::string &selected_uid,
+                             const std::array<uint8_t, 4> &password = {})
     {
         std::vector<uint8_t> uid;
         uint8_t sak = 0;
-        if (!st25r_nfca_select_uid(uid, sak)) return false;
+        if (!st25r_nfca_reselect_current_field(uid, sak, true)) return false;
 
         // Only Mifare Classic / Mifare Plus SL2 can be Gen4 magic.
         if (!(sak == 0x08 || sak == 0x09 || sak == 0x18 || sak == 0x28 || sak == 0x38 ||
@@ -1620,7 +1993,10 @@ private:
         const std::string uid_hex = hex_compact(uid.data(), uid.size());
         if (!selected_uid.empty() && uid_hex != selected_uid) return false;
 
-        uint8_t cmd[8] = {0xCF, 0x00, 0x00, 0x00, 0x00, 0xC6, 0x00, 0x00};
+        // CF <4-byte PWD> C6 <2-byte CRC-A>
+        uint8_t cmd[8] = {0xCF,
+                          password[0], password[1], password[2], password[3],
+                          0xC6, 0x00, 0x00};
         const uint16_t c = crc_a(cmd, 6);
         cmd[6] = static_cast<uint8_t>(c & 0xFF);
         cmd[7] = static_cast<uint8_t>((c >> 8) & 0xFF);
@@ -1634,34 +2010,46 @@ private:
         return rx_len >= 4;
     }
 
-    std::string st25r_detect_magic_type(const std::string &selected_uid)
+    // Probe order: Gen3 → Gen4 → Gen1A.
+    // Gen3 must run before Gen1A: Gen1A sends 7-bit backdoor frames that leave
+    // the ST25R in a state where a subsequent plain READ would fail.
+    // current_sak / use_current_selection are kept for call-site compatibility
+    // but are no longer used — each detector does its own fresh reselect.
+    std::string st25r_detect_magic_type(const std::string &selected_uid,
+                                        uint8_t current_sak = 0xFF,
+                                        bool use_current_selection = false)
     {
-        // Probe order: Gen3 first, then Gen1A, then Gen4.
-        // Gen3 detection uses plain READ(block0) without auth — it must run
-        // BEFORE Gen1A probing, which sends 7-bit backdoor frames (0x40/0x43)
-        // that can leave the ST25R in a state where subsequent plain READ fails.
-        for (int pass = 0; pass < 2; ++pass) {
-            if (st25r_is_gen3_magic(selected_uid)) return "Gen3";
-            if (!selected_uid.empty() && st25r_is_gen3_magic("")) return "Gen3";
-            if (st25r_is_gen1a_magic(selected_uid)) return "Gen1A";
-            // Some ST25R UID reads may differ during re-select; retry without UID pinning.
-            if (!selected_uid.empty() && st25r_is_gen1a_magic("")) return "Gen1A";
-            if (st25r_is_gen4_magic(selected_uid)) return "Gen4";
-            if (!selected_uid.empty() && st25r_is_gen4_magic("")) return "Gen4";
-        }
+        (void)current_sak;
+        (void)use_current_selection;
+        auto &hexlog = NfcHexLog::get();
+
+        hexlog.log_event("MAGIC", "Check Magic Type: is Gen3?");
+        if (st25r_is_gen3_magic(selected_uid)) { hexlog.log_event("MAGIC", "=> Gen3"); return "Gen3"; }
+
+        hexlog.log_event("MAGIC", "Check Magic Type: is Gen1A?");
+        if (st25r_is_gen1a_magic(selected_uid)) { hexlog.log_event("MAGIC", "=> Gen1A"); return "Gen1A"; }
+
+        hexlog.log_event("MAGIC", "Check Magic Type: is Gen4?");
+        if (st25r_is_gen4_magic(selected_uid)) { hexlog.log_event("MAGIC", "=> Gen4"); return "Gen4"; }
+
+        hexlog.log_event("MAGIC", "=> not magic");
         return "";
     }
 
-    bool st25r_nfca_select_uid(std::vector<uint8_t> &uid, uint8_t &sak)
+    bool st25r_nfca_select_uid_current_field(std::vector<uint8_t> &uid, uint8_t &sak)
     {
         uid.clear();
         sak = 0;
-        if (!st25r_init_nfca_reader()) return false;
 
-        // WUPA short frame
+        // WUPA short frame (retry once — some cards need extra RF stabilization time)
         st25r_cmd(0xDB);
         st25r_cmd(0xC7);
-        const uint8_t irq = st25r_wait_irq(0x10 | 0x04, 25);
+        uint8_t irq = st25r_wait_irq(0x10 | 0x04, 25);
+        if (!(irq & 0x10)) {
+            st25r_cmd(0xDB);
+            st25r_cmd(0xC7);
+            irq = st25r_wait_irq(0x10 | 0x04, 40);
+        }
         if (!(irq & 0x10)) return false;
         uint8_t atqa_len = 0;
         uint8_t atqa[8] = {0};
@@ -1686,10 +2074,18 @@ private:
         if (!st25r_nfca_transceive(anticol1, 2, false, cl1, cl1_len, 50, 0x01, false, 0)) return false;
         if (cl1_len < 5) return false;
 
-        const uint8_t sel1[7] = {0x93, 0x70, cl1[0], cl1[1], cl1[2], cl1[3], cl1[4]};
+        const uint8_t sel1[9] = {
+            0x93, 0x70, cl1[0], cl1[1], cl1[2], cl1[3], cl1[4], 0x00, 0x00
+        };
+        const uint16_t sel1_c = crc_a(sel1, 7);
+        uint8_t sel1_raw[9] = {
+            sel1[0], sel1[1], sel1[2], sel1[3], sel1[4], sel1[5], sel1[6],
+            static_cast<uint8_t>(sel1_c & 0xFF),
+            static_cast<uint8_t>((sel1_c >> 8) & 0xFF)
+        };
         uint8_t sak_len = 4;
         uint8_t sak_buf[4] = {0};
-        if (!st25r_nfca_transceive(sel1, 7, true, sak_buf, sak_len, 50, 0x00, false, 0)) return false;
+        if (!st25r_nfca_transceive(sel1_raw, sizeof(sel1_raw), false, sak_buf, sak_len, 50, 0x00, false, 0)) return false;
         if (sak_len < 1) return false;
         sak = sak_buf[0];
 
@@ -1707,15 +2103,43 @@ private:
         if (!st25r_nfca_transceive(anticol2, 2, false, cl2, cl2_len, 50, 0x01, false, 0)) return false;
         if (cl2_len < 5) return false;
 
-        const uint8_t sel2[7] = {0x95, 0x70, cl2[0], cl2[1], cl2[2], cl2[3], cl2[4]};
+        const uint8_t sel2[9] = {
+            0x95, 0x70, cl2[0], cl2[1], cl2[2], cl2[3], cl2[4], 0x00, 0x00
+        };
+        const uint16_t sel2_c = crc_a(sel2, 7);
+        uint8_t sel2_raw[9] = {
+            sel2[0], sel2[1], sel2[2], sel2[3], sel2[4], sel2[5], sel2[6],
+            static_cast<uint8_t>(sel2_c & 0xFF),
+            static_cast<uint8_t>((sel2_c >> 8) & 0xFF)
+        };
         sak_len = 4;
         std::memset(sak_buf, 0, sizeof(sak_buf));
-        if (!st25r_nfca_transceive(sel2, 7, true, sak_buf, sak_len, 50, 0x00, false, 0)) return false;
+        if (!st25r_nfca_transceive(sel2_raw, sizeof(sel2_raw), false, sak_buf, sak_len, 50, 0x00, false, 0)) return false;
         if (sak_len < 1) return false;
         sak = sak_buf[0];
 
         uid = {cl1[1], cl1[2], cl1[3], cl2[0], cl2[1], cl2[2], cl2[3]};
         return true;
+    }
+
+    bool st25r_nfca_reselect_current_field(std::vector<uint8_t> &uid,
+                                           uint8_t &sak,
+                                           bool send_halt_pre_step = false)
+    {
+        if (send_halt_pre_step) {
+            const uint8_t halt_no_crc[2] = {0x50, 0x00};
+            (void)st25r_nfca_transmit_only(halt_no_crc, 2, false, 0x00, 0, 25);
+            delay_ms(5);
+        }
+        return st25r_nfca_select_uid_current_field(uid, sak);
+    }
+
+    bool st25r_nfca_select_uid(std::vector<uint8_t> &uid,
+                               uint8_t &sak,
+                               bool send_halt_pre_step = false)
+    {
+        if (!st25r_init_nfca_reader()) return false;
+        return st25r_nfca_reselect_current_field(uid, sak, send_halt_pre_step);
     }
 
     bool st25r_nfcv_transceive(const uint8_t *req,
@@ -1756,7 +2180,6 @@ private:
                         std::vector<std::string> &out_lines,
                         std::string *error)
     {
-#ifndef _WIN32
         std::vector<uint8_t> uid;
         uint8_t sak = 0;
         if (!st25r_nfca_select_uid(uid, sak)) {
@@ -1841,12 +2264,6 @@ private:
             return false;
         }
         return true;
-#else
-        (void)uid_hint;
-        (void)out_lines;
-        if (error) *error = "Unsupported platform";
-        return false;
-#endif
     }
 
     bool dumpNFCUnitMFC(const std::string &uid_hint,
@@ -1856,7 +2273,6 @@ private:
                         std::vector<std::string> &out_lines,
                         std::string *error)
     {
-#ifndef _WIN32
         std::vector<uint8_t> uid;
         uint8_t sak = 0;
         if (!st25r_nfca_select_uid(uid, sak)) {
@@ -1881,7 +2297,7 @@ private:
             return std::string(prefix) + hex_compact(data.data(), data.size());
         };
 
-        const std::string detected_magic = st25r_detect_magic_type(selected_uid);
+        const std::string detected_magic = st25r_detect_magic_type(selected_uid, sak, true);
         if (magic_type) *magic_type = detected_magic;
         if (!detected_magic.empty()) {
             out_lines.assign(static_cast<size_t>(block_count), std::string());
@@ -1986,20 +2402,12 @@ private:
         }
 
         return true;
-#else
-        (void)uid_hint;
-        (void)tag_type;
-        (void)out_lines;
-        if (error) *error = "Unsupported platform";
-        return false;
-#endif
     }
 
     bool dumpNFCUnitISO15693(const std::string &uid_hint,
                              std::vector<std::string> &out_lines,
                              std::string *error)
     {
-#ifndef _WIN32
         if (!configure_nfcv()) {
             if (error) *error = "ISO15693 init failed";
             return false;
@@ -2088,12 +2496,6 @@ private:
             return false;
         }
         return true;
-#else
-        (void)uid_hint;
-        (void)out_lines;
-        if (error) *error = "Unsupported platform";
-        return false;
-#endif
     }
 
     // ── ST25R3916B ISO14443A card reader ─────────────────────────────────────
@@ -2101,7 +2503,6 @@ private:
     // Returns true if a card was found.
     bool readCardNFCUnit(I2cCardInfo &card)
     {
-#ifndef _WIN32
         if (fd_ < 0) return false;
         card.magic_type.clear();
         card.atqa_hex.clear();
@@ -2409,13 +2810,8 @@ private:
         }
         {
             char sak_msg[32];
-            std::snprintf(sak_msg, sizeof(sak_msg), "SAK=0x%02X cascade=%d", sak, !!(sak & 0x04) && cl1[0] == 0x88);
+            std::snprintf(sak_msg, sizeof(sak_msg), "SAK CL1=0x%02X cascade=%d", sak, !!(sak & 0x04) && cl1[0] == 0x88);
             hexlog.log_event("NFC-I2C", sak_msg);
-        }
-        {
-            char sak_hex[3];
-            std::snprintf(sak_hex, sizeof(sak_hex), "%02X", sak);
-            card.sak_hex = sak_hex;
         }
 
         // UID cascade: if uid[0]==CT(0x88) AND SAK bit2 set → more levels.
@@ -2497,6 +2893,17 @@ private:
         if (uid_len == 0) {
             st25r_write_reg(0x02, 0x80);
             return false;
+        }
+
+        {
+            char sak_msg[24];
+            std::snprintf(sak_msg, sizeof(sak_msg), "Final SAK=0x%02X", sak);
+            hexlog.log_event("NFC-I2C", sak_msg);
+        }
+        {
+            char sak_hex[3];
+            std::snprintf(sak_hex, sizeof(sak_hex), "%02X", sak);
+            card.sak_hex = sak_hex;
         }
 
         // Format UID (no colon separators, consistent with GroveNFC path).
@@ -2621,11 +3028,6 @@ private:
             card.detail = buf;
         }
 
-        // Turn off RF field (keep oscillator on for fast next poll).
-        // Done HERE (after SAK classification) so that GET_VERSION / page-probe
-        // for SAK=0x00 cards can run while RF is still active.
-        st25r_write_reg(0x02, 0x80);
-
         const bool magic_probe_candidate =
             (sak == 0x08 || sak == 0x09 || sak == 0x18 || sak == 0x28 || sak == 0x38 ||
              sak == 0x1C ||
@@ -2633,22 +3035,15 @@ private:
              card.protocol == "MFCMini" || card.protocol == "MFCPlus");
 
         if (magic_probe_candidate) {
-            card.magic_type = st25r_detect_magic_type(uid_str);
-            if (!card.magic_type.empty()) {
-                hexlog.log_event("NFC-I2C", (std::string("Magic detected: ") + card.magic_type).c_str());
-            } else {
-                hexlog.log_event("NFC-I2C", "Magic detect done: None");
-            }
+            card.magic_type = st25r_detect_magic_type(uid_str, sak, true);
         }
 
+        // Turn off RF field (keep oscillator on for fast next poll).
+        // Leave RF active through magic probing so the probe can reuse the
+        // just-selected card state for Bruce-style HALT/reselect flows.
+        st25r_write_reg(0x02, 0x80);
+
         return true;
-#else
-        card.valid = false;
-        card.protocol = "None";
-        card.uid = "";
-        card.detail = "No card";
-        return false;
-#endif
     }
 
     // Arduino delay() → usleep

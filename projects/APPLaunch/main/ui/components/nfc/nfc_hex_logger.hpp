@@ -64,6 +64,8 @@ public:
     // Log a plain text event (timestamp + optional tag + message)
     void log_event(const char *tag, const char *msg)
     {
+        if (should_suppress_event(tag, msg)) return;
+
         char buf[256];
         if (tag && tag[0])
             std::snprintf(buf, sizeof(buf), "[%s] %s: %s", timestamp().c_str(), tag, msg ? msg : "");
@@ -173,6 +175,25 @@ private:
 #else
         return "00:00:00.000";
 #endif
+    }
+
+    static bool should_suppress_event(const char *tag, const char *msg)
+    {
+        if (!msg || !msg[0]) return false;
+
+        // Keep hex-only style in I2C logs: drop timeout text noise globally.
+        if (std::strstr(msg, "timeout") != nullptr) return true;
+
+        if (!tag || !tag[0]) return false;
+
+        // For NFC Unit magic detection path, keep hex RX/TX only.
+        const bool i2c_magic_tag = (std::strcmp(tag, "NFC-I2C") == 0) ||
+                                   (std::strcmp(tag, "GEN3") == 0);
+        if (i2c_magic_tag) {
+            return true;
+        }
+
+        return false;
     }
 
     // Build the log file path for today, optionally prefixed by mode.
@@ -293,7 +314,7 @@ private:
         constexpr size_t MAX_BYTES = 64; // cap per line to keep it readable
         const size_t show = display.size() > MAX_BYTES ? MAX_BYTES : display.size();
         for (size_t i = 0; i < show; ++i) {
-            std::snprintf(h, sizeof(h), "%02x", display[i]);
+            std::snprintf(h, sizeof(h), "%02X", display[i]);
             out += h;
         }
         if (display.size() > MAX_BYTES) out += "...";

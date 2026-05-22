@@ -19,6 +19,10 @@
 
 namespace nfc_app {
 
+// Declared here to keep nfc_device_service.hpp independent of helper definition order.
+ProtocolKind i2c_protocol_to_kind(const std::string &proto);
+std::string i2c_protocol_to_tag_type(const std::string &proto);
+
 struct ConnectionState {
     bool connected = false;
     TransportEndpoint endpoint;

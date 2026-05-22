@@ -17,6 +17,10 @@ REMOTE_STAGE="/home/${DEVICE_USER}/dist"
 REMOTE_BIN="/usr/share/APPLaunch/bin"
 SERVICE="APPLaunch.service"
 
+DOCKER_IMAGE="${DOCKER_IMAGE:-ubuntu:22.04}"
+DOCKER_CONTAINER="${DOCKER_CONTAINER:-m5cz_applaunch_builder}"
+DOCKER_PERSIST="${DOCKER_PERSIST:-1}"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -25,20 +29,62 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # ---------------------------------------------------------------------------
 echo "==> [1/3] Docker cross-compile APPLaunch for aarch64..."
 
-docker run --rm \
-  -v "${REPO_ROOT}:/work" \
-  ubuntu:22.04 \
-  bash -c "
+ensure_docker_builder_container() {
+  if [[ "${DOCKER_PERSIST}" != "1" ]]; then
+    return 0
+  fi
+
+  if ! docker ps -a --format '{{.Names}}' | grep -qx "${DOCKER_CONTAINER}"; then
+    echo "    Creating persistent builder container: ${DOCKER_CONTAINER}"
+    docker run -d \
+      --name "${DOCKER_CONTAINER}" \
+      -v "${REPO_ROOT}:/work" \
+      -w /work \
+      "${DOCKER_IMAGE}" \
+      tail -f /dev/null > /dev/null
+  elif ! docker ps --format '{{.Names}}' | grep -qx "${DOCKER_CONTAINER}"; then
+    docker start "${DOCKER_CONTAINER}" > /dev/null
+  fi
+
+  if ! docker exec "${DOCKER_CONTAINER}" test -f /opt/appbuild/.deps_ready; then
+    echo "    Installing builder dependencies (first run only)..."
+    docker exec "${DOCKER_CONTAINER}" bash -lc "
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      apt-get install -y -qq \
+        python3 python3-pip g++-aarch64-linux-gnu \
+        pkg-config libfreetype6-dev libpng-dev zlib1g-dev > /dev/null
+      pip3 install scons parse --quiet
+      mkdir -p /opt/appbuild
+      touch /opt/appbuild/.deps_ready
+    "
+  fi
+}
+
+if [[ "${DOCKER_PERSIST}" == "1" ]]; then
+  ensure_docker_builder_container
+  docker exec "${DOCKER_CONTAINER}" bash -lc "
     set -e
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq \
-      python3 python3-pip g++-aarch64-linux-gnu \
-      pkg-config libfreetype6-dev libpng-dev zlib1g-dev > /dev/null
-    pip3 install scons parse --quiet
     cd /work/projects/APPLaunch
     CONFIG_REPO_AUTOMATION=1 CardputerZero=y python3 -m SCons -j\$(nproc)
   "
+else
+  docker run --rm \
+    -v "${REPO_ROOT}:/work" \
+    "${DOCKER_IMAGE}" \
+    bash -c "
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      apt-get install -y -qq \
+        python3 python3-pip g++-aarch64-linux-gnu \
+        pkg-config libfreetype6-dev libpng-dev zlib1g-dev > /dev/null
+      pip3 install scons parse --quiet
+      cd /work/projects/APPLaunch
+      CONFIG_REPO_AUTOMATION=1 CardputerZero=y python3 -m SCons -j\$(nproc)
+    "
+fi
 
 echo "==> [1/3] Built: ${SCRIPT_DIR}/dist/M5CardputerZero-APPLaunch"
 ls -lh "${SCRIPT_DIR}/dist/M5CardputerZero-APPLaunch"
