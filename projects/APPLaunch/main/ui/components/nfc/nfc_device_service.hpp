@@ -1048,9 +1048,13 @@ public:
                 return i2c_dev->writeNFCUnitGen1ABlock0(block0, error);
             }
             if (generation == UidMagicGeneration::Gen3) {
-                return i2c_dev->writeNFCUnitGen3Block0(uid, block0, error);
+                if (error) *error = "NFC Unit Gen3 write is disabled (unsafe). Use PN532/PM3 for Gen3 UID changes.";
+                return false;
             }
-            if (error) *error = "NFC Unit supports Gen1A and Gen3 only";
+            if (generation == UidMagicGeneration::Gen4) {
+                return i2c_dev->writeNFCUnitGen4Block0(uid, block0, gen4_password, error);
+            }
+            if (error) *error = "NFC Unit supports Gen1A and Gen4 only";
             return false;
         }
 
@@ -1092,7 +1096,8 @@ public:
         return true;
     }
 
-    bool scan_uid_once(std::string *uid_hex, std::string *error)
+    bool scan_uid_once(std::string *uid_hex, std::string *error,
+                       std::string *tag_type = nullptr)
     {
         INfcTransport *transport_raw = nullptr;
         I2cGroveNfcDevice *i2c_dev = nullptr;
@@ -1132,6 +1137,7 @@ public:
                 return false;
             }
             if (uid_hex) *uid_hex = normalized;
+            if (tag_type) *tag_type = card.protocol; // e.g. "MFC1K","MFC4K","NTAG213","MFUL",...
             if (error) error->clear();
             return true;
         }
@@ -1153,6 +1159,7 @@ public:
             return false;
         }
         if (uid_hex) *uid_hex = tag.uid;
+        if (tag_type) *tag_type = tag.tag_type; // e.g. "Mifare Classic 1K", "NTAG213", ...
         return true;
     }
 

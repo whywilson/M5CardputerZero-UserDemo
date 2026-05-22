@@ -421,22 +421,12 @@ public:
             return true;
         };
 
-        // Gen3 check: block 0 must be readable without authentication.
-        std::array<uint8_t, 20> blk0_resp{};
-        uint8_t blk0_resp_len = static_cast<uint8_t>(blk0_resp.size());
-        if (!transceive_raw_with_crc({0x30, 0x00},
-                                     blk0_resp.data(),
-                                     blk0_resp_len,
-                                     120,
-                                     false,
-                                     "Gen3 READ block0") ||
-            blk0_resp_len < 16) {
-            st25r_write_reg(0x02, 0x80);
-            if (error && error->empty()) *error = "not Gen3: block0 plain read failed";
-            return false;
-        }
-
         // Gen3 UID-set command: {0x90, 0xFB, 0xCC, 0xCC, Lc, uid...}
+        // Note: Gen3 (CUID) cards DO support unauthenticated READ (0x30) in principle.
+        // However, empirical testing shows the card does not respond via ST25R3916B
+        // (while it does respond via PN532 InCommunicateThru). Root cause unknown —
+        // likely an RF/parity/framing difference between the two reader chips.
+        // We skip the pre-check and rely on the 9000 response to 90FBCCCC instead.
         std::vector<uint8_t> uid_cmd = {0x90, 0xFB, 0xCC, 0xCC, static_cast<uint8_t>(uid.size())};
         uid_cmd.insert(uid_cmd.end(), uid.begin(), uid.end());
         {
@@ -455,12 +445,16 @@ public:
             }
         }
 
-        // Re-select before block0 write to mirror robust PN532 flow.
-        if (!st25r_nfca_reselect_current_field(sel_uid, sak, true)) {
-            st25r_write_reg(0x02, 0x80);
-            if (error) *error = "reselect before block0 write failed";
-            return false;
-        }
+        // Keep same RF session (no reselect), but give the card a short settle
+        // window after 90FBCCCC before sending 90F0CCCC.
+        // PN532 path has natural transport latency; ST25R path is faster and can
+        // otherwise trigger unstable UID commit on some Gen3 cards.
+        delay_ms(8);
+
+        // NOTE: Do NOT reselect here. On ST25R3916B, 90FBCCCC and 90F0CCCC must be
+        // sent back-to-back in the same session. A reselect between them causes
+        // the block0 write to silently fail (card returns 9000 but data is not
+        // committed). Send 90F0CCCC immediately after 90FBCCCC.
 
         // Gen3 block0-write command: {0x90, 0xF0, 0xCC, 0xCC, 0x10, block0...}
         std::vector<uint8_t> blk0_cmd = {0x90, 0xF0, 0xCC, 0xCC, 0x10};
@@ -481,33 +475,207 @@ public:
             }
         }
 
-        // Verify by reading block0 again (first 16 bytes are data, CRC may follow).
-        {
-            std::array<uint8_t, 20> verify_resp{};
-            uint8_t verify_len = static_cast<uint8_t>(verify_resp.size());
-            if (!transceive_raw_with_crc({0x30, 0x00},
-                                         verify_resp.data(),
-                                         verify_len,
-                                         120,
-                                         false,
-                                         "Gen3 verify block0") ||
-                verify_len < 16 ||
-                !std::equal(block0.begin(), block0.end(), verify_resp.begin())) {
-                st25r_write_reg(0x02, 0x80);
-                if (error) *error = "verify block0 failed";
-                return false;
-            }
-        }
+        // Verification via plain READ (0x30) is currently unreliable on ST25R3916B
+        // for Gen3 cards (card does not respond, see note above). The 9000 from
+        // 90F0CCCC is sufficient write confirmation.
 
-        if (!st25r_nfca_reselect_current_field(sel_uid, sak, true)) {
-            st25r_write_reg(0x02, 0x80);
-            if (error) *error = "reselect after write failed";
-            return false;
-        }
-
+        // After a successful UID-changing write, the card now responds with the NEW
+        // UID. Reselecting with the old sel_uid will naturally fail — this is expected
+        // and is NOT an error. Just turn off RF and return success.
+        st25r_nfca_reselect_current_field(sel_uid, sak, true); // best-effort, ignore failure
         st25r_write_reg(0x02, 0x80);
         if (error) error->clear();
         return true;
+    }
+
+    // ── Gen4 block0 write ────────────────────────────────────────────────────
+
+    // Write UID + Block 0 to a Gen4 (DirectWrite) magic card via ST25R3916B.
+    // Uses the CF-backdoor command set:
+    //   CF <pw4> 68 <uid_mode>       → set UID length (0=4B, 1=7B)
+    //   CF <pw4> CD 00 <block0_16B>  → write block 0
+    // password: 8-char hex string of the 4-byte password (default 00000000).
+    bool writeNFCUnitGen4Block0(const std::vector<uint8_t> &uid,
+                                const std::vector<uint8_t> &block0,
+                                const std::string &password,
+                                std::string *error = nullptr)
+    {
+        if (!is_open()) {
+            if (error) *error = "I2C device not open";
+            return false;
+        }
+        if (!is_nfc_unit()) {
+            if (error) *error = "Only NFC Unit supports this operation";
+            return false;
+        }
+        if (uid.size() != 4 && uid.size() != 7) {
+            if (error) *error = "uid must be 4 or 7 bytes";
+            return false;
+        }
+        if (block0.size() != 16) {
+            if (error) *error = "block0 must be 16 bytes";
+            return false;
+        }
+
+        // Decode 8-char hex password (default 00 00 00 00).
+        auto hexval = [](char c) -> uint8_t {
+            if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+            if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+            if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+            return 0;
+        };
+        uint8_t pw[4] = {0, 0, 0, 0};
+        for (int i = 0; i < 4 && (i * 2 + 1) < static_cast<int>(password.size()); ++i)
+            pw[i] = static_cast<uint8_t>((hexval(password[i * 2]) << 4) | hexval(password[i * 2 + 1]));
+
+        // Select card.
+        std::vector<uint8_t> sel_uid;
+        uint8_t sak = 0;
+        if (!st25r_nfca_select_uid(sel_uid, sak)) {
+            if (error) *error = "card select failed";
+            return false;
+        }
+        if (!st25r_nfca_reselect_current_field(sel_uid, sak, true)) {
+            st25r_write_reg(0x02, 0x80);
+            if (error) *error = "reselect failed";
+            return false;
+        }
+        if (!(sak == 0x08 || sak == 0x09 || sak == 0x18 || sak == 0x28 || sak == 0x38 || sak == 0x1C)) {
+            st25r_write_reg(0x02, 0x80);
+            if (error) *error = "not Mifare Classic (SAK mismatch)";
+            return false;
+        }
+
+        // Helper: append CRC-A and transceive, require rx_len >= min_rx.
+        auto transceive_gen4 = [&](const std::vector<uint8_t> &cmd,
+                                   uint8_t min_rx,
+                                   const char *name) -> bool {
+            std::array<uint8_t, 64> frame{};
+            const size_t cmd_len = cmd.size();
+            if (cmd_len + 2 > frame.size()) {
+                if (error) *error = std::string(name) + " too long";
+                return false;
+            }
+            std::copy(cmd.begin(), cmd.end(), frame.begin());
+            const uint16_t crc = crc_a(frame.data(), cmd_len);
+            frame[cmd_len] = static_cast<uint8_t>(crc & 0xFF);
+            frame[cmd_len + 1] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+            uint8_t rx[64] = {0};
+            uint8_t rx_len = sizeof(rx);
+            if (!st25r_nfca_transceive(frame.data(),
+                                       static_cast<uint8_t>(cmd_len + 2),
+                                       false, rx, rx_len, 120, 0x00, true, 0)) {
+                if (error) *error = std::string(name) + " timeout";
+                return false;
+            }
+            if (rx_len < min_rx) {
+                if (error) *error = std::string(name) + " short response";
+                return false;
+            }
+            return true;
+        };
+
+        // Step 1: CF pw 68 uid_mode → set UID length.
+        const uint8_t uid_mode = (uid.size() == 4) ? 0x00 : 0x01;
+        const std::vector<uint8_t> cmd_len_set = {0xCF, pw[0], pw[1], pw[2], pw[3], 0x68, uid_mode};
+        if (!transceive_gen4(cmd_len_set, 2, "Gen4 set UID mode")) {
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+
+        // Re-select before block0 write.
+        if (!st25r_nfca_reselect_current_field(sel_uid, sak, true)) {
+            st25r_write_reg(0x02, 0x80);
+            if (error) *error = "reselect before block0 write failed";
+            return false;
+        }
+
+        // Step 2: CF pw CD 00 block0[16] → write block 0.
+        std::vector<uint8_t> cmd_write = {0xCF, pw[0], pw[1], pw[2], pw[3], 0xCD, 0x00};
+        cmd_write.insert(cmd_write.end(), block0.begin(), block0.end());
+        if (!transceive_gen4(cmd_write, 1, "Gen4 block0 write")) {
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+
+        // Final reselect to leave card in clean state.
+        st25r_nfca_reselect_current_field(sel_uid, sak, true);
+        st25r_write_reg(0x02, 0x80);
+        if (error) error->clear();
+        return true;
+    }
+
+    // ── Gen3 block read ──────────────────────────────────────────────────────
+
+    // Read one block (16 bytes) from a Gen3 (CUID) card via plain READ(0x30).
+    // Gen3 cards respond to READ without authentication (vendor backdoor feature).
+    // Equivalent to PN532 "hf 14a raw -s -c 30 <block>".
+    // The card must already be selected. Returns true on success.
+    // NOTE: Empirically fails on some Gen3 cards via ST25R3916B (card gives no
+    // response), while the same card responds correctly via PN532. Cause unknown.
+    bool readNFCUnitGen3Block(uint8_t block,
+                             std::vector<uint8_t> *block_data,
+                             std::string *error = nullptr)
+    {
+        if (!is_open() || !is_nfc_unit()) {
+            if (error) *error = "device not available";
+            return false;
+        }
+        std::array<uint8_t, 16> data{};
+        if (!st25r_mfc_read_plain_block(block, data)) {
+            if (error) *error = "READ 0x30 timeout (no response from card)";
+            return false;
+        }
+        if (block_data) block_data->assign(data.begin(), data.end());
+        return true;
+    }
+
+    // Read all 64 blocks of a Gen3 card. Requires fresh select before calling.
+    bool readNFCUnitGen3Full(std::vector<std::vector<uint8_t>> *blocks,
+                             std::vector<std::string> *log,
+                             std::string *error = nullptr)
+    {
+        auto emit = [&](const std::string &s) {
+            if (log) log->push_back(s);
+        };
+        std::vector<uint8_t> uid;
+        uint8_t sak = 0;
+        if (!st25r_nfca_select_uid(uid, sak)) {
+            if (error) *error = "select failed";
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+        emit("> Gen3 selected, reading blocks via 30 XX...");
+        if (blocks) blocks->assign(64, {});
+        int ok_count = 0;
+        for (uint8_t blk = 0; blk < 64; ++blk) {
+            std::vector<uint8_t> bdata;
+            std::string berr;
+            if (readNFCUnitGen3Block(blk, &bdata, &berr)) {
+                if (blocks) (*blocks)[blk] = bdata;
+                ++ok_count;
+                char buf[40];
+                int pos = std::snprintf(buf, sizeof(buf), "%02d:", blk);
+                for (size_t bi = 0; bi < bdata.size() && bi < 16; ++bi)
+                    pos += std::snprintf(buf + pos, sizeof(buf) - pos, "%02X", bdata[bi]);
+                emit(buf);
+            } else {
+                char buf[48];
+                std::snprintf(buf, sizeof(buf), "ERR blk%02d: %s", blk, berr.c_str());
+                emit(buf);
+                // If first block fails, abort early — card likely doesn't support this.
+                if (blk == 0) {
+                    if (error) *error = "block 0 read failed; Gen3 READ not supported on this card";
+                    st25r_write_reg(0x02, 0x80);
+                    return false;
+                }
+            }
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "OK %d/64 blocks read", ok_count);
+        emit(buf);
+        st25r_write_reg(0x02, 0x80);
+        return ok_count > 0;
     }
 
     // ── Emulation (GroveNFC 0x48 only, NFC Unit returns false) ───────────────

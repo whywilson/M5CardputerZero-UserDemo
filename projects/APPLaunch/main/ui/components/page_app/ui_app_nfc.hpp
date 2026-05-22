@@ -1707,20 +1707,19 @@ private:
                 create_text(detail, 6, 50, "OK to open manager", 0x8DB6FF, 11);
                 break;
             case 1:
-                create_text(detail, 6, 22, "Change magic Mifare/", 0xD8D8D8, 10);
-                create_text(detail, 6, 34, "Ultralight card UID", 0xD8D8D8, 10);
-                create_text(detail, 6, 48, "Gen1A  Chinese Magic Card", 0x9E9E9E, 10);
-                create_text(detail, 6, 60, "Gen2   CUID", 0x9E9E9E, 10);
-                create_text(detail, 6, 72, "Gen3   Direct Write", 0x9E9E9E, 10);
-                create_text(detail, 6, 84, "Gen4   Ultimate Magic Card", 0x9E9E9E, 10);
+                create_text(detail, 6, 22, "Magic MIFARE Classic Card", 0xD8D8D8, 10);
+                create_text(detail, 6, 34, "Gen1A  Chinese Magic Card", 0x9E9E9E, 10);
+                create_text(detail, 6, 48, "Gen2   CUID", 0x9E9E9E, 10);
+                create_text(detail, 6, 60, "Gen3   APDU", 0x9E9E9E, 10);
+                create_text(detail, 6, 72, "Gen3   Ultimate Magic Card", 0x9E9E9E, 10);
                 break;
             case 2:
-                create_text(detail, 6, 22, "MIFARE Classic sniff", 0xD8D8D8, 11);
+                create_text(detail, 6, 22, "MIFARE Classic Sniff", 0xD8D8D8, 11);
                 create_text(detail, 6, 35, "without tag present", 0xD8D8D8, 11);
                 create_text(detail, 6, 50, "PN532Killer required", 0x8DB6FF, 11);
                 break;
             case 3:
-                create_text(detail, 6, 22, "MIFARE Classic sniff", 0xD8D8D8, 11);
+                create_text(detail, 6, 22, "MIFARE Classic Sniff", 0xD8D8D8, 11);
                 create_text(detail, 6, 35, "with tag present", 0xD8D8D8, 11);
                 create_text(detail, 6, 50, "PN532Killer required", 0x8DB6FF, 11);
                 break;
@@ -2552,7 +2551,7 @@ private:
              conn.device_kind == nfc_app::DeviceKind::PN532Killer ||
              conn.device_kind == nfc_app::DeviceKind::NFCUnit);
 
-        const char *gen_labels[4] = {"Gen1A", "Gen2", "Gen3", "Gen4"};
+        const char *gen_labels[4] = {"Gen1A", "Gen2", "Gen3(disabled)", "Gen4"};
         const char *len_labels[2] = {"4B", "7B"};
         const char *source_labels[2] = {"Input", "Scan"};
 
@@ -2562,57 +2561,55 @@ private:
         const std::string gen2_key = uid_changer_normalize_hex(uid_changer_gen2_keya_input_, 12);
         const std::string gen4_pwd = uid_changer_normalize_hex(uid_changer_gen4_pwd_input_, 8);
 
-        create_text(parent, 6, 4, "UID Changer", 0xFFFFFF, 12);
-        // Step indicator: ①②③ with current step highlighted
+        // Device + step indicator on same line
         {
-            const char *step_ch[3] = {"(1)", "(2)", "(3)"}; // ①②③ UTF-8
-            int sx = 220;
+            const std::string dev_line = std::string("Device: ") + nfc_app::to_string(conn.device_kind);
+            create_text(parent, 6, 4, to_compact(dev_line, 28).c_str(), supported ? 0x00FF88 : 0xFF8888, 10);
+            const char *step_ch[3] = {"(1)", "(2)", "(3)"};
+            int sx = 210;
             for (int si = 0; si < 3; ++si) {
                 const bool cur = (si == uid_changer_step_);
                 create_text(parent, sx, 4, step_ch[si], cur ? 0xF7A600 : 0x444444, cur ? 12 : 10);
                 sx += cur ? 16 : 14;
             }
         }
-        const std::string dev_line = std::string("Device: ") + nfc_app::to_string(conn.device_kind);
-        create_text(parent, 6, 16, to_compact(dev_line, 36).c_str(), supported ? 0x00FF88 : 0xFF8888, 10);
 
         if (uid_changer_step_ == 0) {
-            const uint32_t c0 = (uid_changer_field_idx_ == 0) ? 0xF7A600 : 0xD8D8D8;
-            const uint32_t c1 = (uid_changer_field_idx_ == 1) ? 0x00D2FF : 0xD8D8D8;
-            const uint32_t c2 = (uid_changer_field_idx_ == 2) ? 0x00D2FF : 0x8DB6FF;
+            const uint32_t c1 = (uid_changer_field_idx_ == 0) ? 0x00D2FF : 0xD8D8D8;
+            const uint32_t c2 = (uid_changer_field_idx_ == 1) ? 0x00D2FF : 0x8DB6FF;
 
-            create_text(parent, 6, 27, "(1) Set UID", 0xF7A600, 11);
-            // Len toggle row
-            create_text(parent, 6, 40, (std::string("UID Len: ") + len_labels[uid_changer_uid_len_idx_] + "  [L/R]").c_str(), c0, 10);
+            create_text(parent, 6, 16, "(1) Set UID  [Mifare Classic only]", 0xF7A600, 11);
+            // Len toggle row (not a selectable field; Tab toggles it)
+            create_text(parent, 6, 29, (std::string("UID Len: ") + len_labels[uid_changer_uid_len_idx_] + "  [Tab]").c_str(), 0x8DB6FF, 10);
             // UID input row
             {
                 std::string in = std::string("UID(") + std::to_string(uid_changer_uid_hex_len()) + "): " + uid_input;
-                if (uid_changer_field_idx_ == 1) in += "_";
-                create_text(parent, 6, 54, to_compact(in, 46).c_str(), c1, 10);
+                if (uid_changer_field_idx_ == 0) in += "_";
+                create_text(parent, 6, 43, to_compact(in, 46).c_str(), c1, 10);
             }
             // Block 0 editable row (auto-filled from UID, or manually edited)
             {
                 const std::string b0_disp = uid_changer_normalize_hex(uid_changer_block0_input_, 32);
                 std::string b0_line = std::string("Block 0: ") + b0_disp;
-                if (uid_changer_field_idx_ == 2) b0_line += "_";
-                create_text(parent, 6, 68, to_compact(b0_line, 46).c_str(), c2, 10);
+                if (uid_changer_field_idx_ == 1) b0_line += "_";
+                create_text(parent, 6, 57, to_compact(b0_line, 46).c_str(), c2, 10);
             }
-            create_text(parent, 6, 82, "[S] Scan card from PN532/Killer/NFC Unit", 0x00FF88, 10);
-            create_text(parent, 6, 95, "U/D:field Bsp:del [S]:scan Enter:next", 0x666666, 10);
+            create_text(parent, 6, 71, "[S] Scan MFC card  (warns if non-MFC)", 0x00FF88, 10);
+            create_text(parent, 6, 84, "U/D:field Tab:len Bsp:del [S]:scan Enter:next", 0x666666, 10);
             return;
         }
 
         if (uid_changer_step_ == 1) {
             const uint32_t c0 = (uid_changer_field_idx_ == 0) ? 0xF7A600 : 0xD8D8D8;
             const uint32_t c1 = (uid_changer_field_idx_ == 1) ? 0x00FF88 : 0x8DB6FF;
-            create_text(parent, 6, 27, "(2) Card Type", 0xF7A600, 11);
-            create_text(parent, 6, 44, (std::string("Type: ") + gen_labels[uid_changer_generation_idx_]).c_str(), c0, 10);
-            create_text(parent, 6, 58, (std::string("UID: ") + uid_input).c_str(), 0x8DB6FF, 10);
-            create_text(parent, 6, 80, "[ Enter ] Next  L/R type  ESC back", c1, 10);
+            create_text(parent, 6, 16, "(2) Card Type (Mifare Classic)", 0xF7A600, 11);
+            create_text(parent, 6, 33, (std::string("Type: ") + gen_labels[uid_changer_generation_idx_] + "  [Tab]").c_str(), c0, 10);
+            create_text(parent, 6, 47, (std::string("UID: ") + uid_input).c_str(), 0x8DB6FF, 10);
+            create_text(parent, 6, 69, "[ Enter ] Next  Tab:type  ESC back", c1, 10);
             return;
         }
 
-        int row_y = 27;
+        int row_y = 16;
         int row = 0;
         const auto draw_row = [&](const std::string &text, uint32_t color) {
             create_text(parent, 6, row_y + row * 14, to_compact(text, 46).c_str(), color, 10);
@@ -3357,6 +3354,7 @@ private:
 
     static bool uid_changer_generation_allowed(int gen_idx, int uid_len_idx)
     {
+        if (gen_idx == 2) return false; // UID Changer: disable Gen3 write path.
         if (uid_len_idx == 1 && gen_idx == 1) return false; // Gen2 does not support 7B UID here.
         return gen_idx >= 0 && gen_idx <= 3;
     }
@@ -3364,7 +3362,10 @@ private:
     void uid_changer_fix_generation_for_uid_len()
     {
         if (!uid_changer_generation_allowed(uid_changer_generation_idx_, uid_changer_uid_len_idx_)) {
-            uid_changer_generation_idx_ = 2; // fallback to Gen3 for 7B
+            // Prefer Gen4, then Gen1A, then Gen2 as fallback.
+            if (uid_changer_generation_allowed(3, uid_changer_uid_len_idx_)) uid_changer_generation_idx_ = 3;
+            else if (uid_changer_generation_allowed(0, uid_changer_uid_len_idx_)) uid_changer_generation_idx_ = 0;
+            else uid_changer_generation_idx_ = 1;
         }
     }
 
@@ -3385,18 +3386,22 @@ private:
         const std::string uid = uid_changer_normalize_hex(uid_hex, static_cast<size_t>(uid_changer_uid_hex_len()));
         if (uid.size() != static_cast<size_t>(uid_changer_uid_hex_len())) return "";
 
-        const std::string sak = "08";
-        const std::string atqa = "0400";
         if (uid_changer_uid_len_idx_ == 0) {
+            // 4-byte UID block0: [UID0-3][BCC][SAK=08][ATQA=0400][MFR x8]
+            // BCC = UID[0]^UID[1]^UID[2]^UID[3]
             const uint8_t b0 = static_cast<uint8_t>(std::stoul(uid.substr(0, 2), nullptr, 16));
             const uint8_t b1 = static_cast<uint8_t>(std::stoul(uid.substr(2, 2), nullptr, 16));
             const uint8_t b2 = static_cast<uint8_t>(std::stoul(uid.substr(4, 2), nullptr, 16));
             const uint8_t b3 = static_cast<uint8_t>(std::stoul(uid.substr(6, 2), nullptr, 16));
             char bcc[3];
             std::snprintf(bcc, sizeof(bcc), "%02X", static_cast<unsigned>(b0 ^ b1 ^ b2 ^ b3));
-            return uid + bcc + sak + atqa + "1122334455667788";
+            // 8+2+2+4+16 = 32 hex chars
+            return uid + bcc + "08" + "0400" + "1122334455667788";
         }
-        return uid + sak + atqa + "112233445566";
+
+        // 7-byte UID block0: [UID 7 bytes][18][42][00][AA][BB][CC][DD][EE][FF]
+        // Total: 16 bytes = 32 hex chars
+        return uid + "184200AABBCCDDEEFF";
     }
 
     nfc_app::UidMagicGeneration uid_changer_generation() const
@@ -3884,8 +3889,8 @@ private:
         if (uid_changer_step_ == 0) {
             // [S] key: scan UID from card at any time
             if (key == KEY_S) {
-                std::string scanned_uid, scan_err;
-                if (service_.scan_uid_once(&scanned_uid, &scan_err)) {
+                std::string scanned_uid, scan_err, scanned_type;
+                if (service_.scan_uid_once(&scanned_uid, &scan_err, &scanned_type)) {
                     uid_changer_uid_input_ = uid_changer_normalize_hex(scanned_uid, 14);
                     if (uid_changer_uid_input_.size() == 8)  uid_changer_uid_len_idx_ = 0;
                     else if (uid_changer_uid_input_.size() == 14) uid_changer_uid_len_idx_ = 1;
@@ -3894,35 +3899,40 @@ private:
                     uid_changer_block0_manual_ = false;
                     const std::string uid_hex_s = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
                     uid_changer_block0_input_ = uid_changer_build_block0_from_uid(uid_hex_s);
-                    ui_message_ = "UID scanned";
+                    // Check if scanned card is Mifare Classic
+                    const bool is_mfc = scanned_type.find("MFC") != std::string::npos ||
+                                        scanned_type.find("Mifare Classic") != std::string::npos ||
+                                        scanned_type.find("MIFARE Classic") != std::string::npos;
+                    if (is_mfc) {
+                        ui_message_ = "UID scanned " + scanned_type;
+                    } else {
+                        ui_message_ = "WARNING: Not MFC (" + scanned_type + ")! UID loaded";
+                    }
                 } else {
                     ui_message_ = scan_err.empty() ? "Scan UID failed" : scan_err;
                 }
                 return;
             }
-            const int field_count = 3; // 0=Len, 1=UID input, 2=Block 0
+            const int field_count = 2; // 0=UID input, 1=Block 0
+            if (key == KEY_TAB) {
+                uid_changer_uid_len_idx_ = 1 - uid_changer_uid_len_idx_;
+                uid_changer_fix_generation_for_uid_len();
+                uid_changer_uid_input_ = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+                if (!uid_changer_block0_manual_) {
+                    const std::string uid_hex_s = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
+                    uid_changer_block0_input_ = uid_changer_build_block0_from_uid(uid_hex_s);
+                }
+                return;
+            }
             if (key == KEY_UP || key == KEY_F) {
                 uid_changer_field_idx_ = (uid_changer_field_idx_ + field_count - 1) % field_count;
                 return;
             }
-            if (key == KEY_DOWN || (uid_changer_field_idx_ != 2 && key == KEY_X)) {
+            if (key == KEY_DOWN || (uid_changer_field_idx_ != 1 && key == KEY_X)) {
                 uid_changer_field_idx_ = (uid_changer_field_idx_ + 1) % field_count;
                 return;
             }
-            if (key == KEY_LEFT || key == KEY_RIGHT) {
-                const int delta = (key == KEY_LEFT) ? -1 : 1;
-                if (uid_changer_field_idx_ == 0) {
-                    uid_changer_uid_len_idx_ = (uid_changer_uid_len_idx_ + delta + 2) % 2;
-                    uid_changer_fix_generation_for_uid_len();
-                    uid_changer_uid_input_ = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
-                    if (!uid_changer_block0_manual_) {
-                        const std::string uid_hex_s = uid_changer_normalize_hex(uid_changer_uid_input_, uid_changer_uid_hex_len());
-                        uid_changer_block0_input_ = uid_changer_build_block0_from_uid(uid_hex_s);
-                    }
-                }
-                return;
-            }
-            if (uid_changer_field_idx_ == 1) {
+            if (uid_changer_field_idx_ == 0) {
                 if (key == KEY_BACKSPACE) {
                     if (!uid_changer_uid_input_.empty()) uid_changer_uid_input_.pop_back();
                     if (!uid_changer_block0_manual_) {
@@ -3942,7 +3952,7 @@ private:
                     return;
                 }
             }
-            if (uid_changer_field_idx_ == 2) {
+            if (uid_changer_field_idx_ == 1) {
                 if (key == KEY_BACKSPACE) {
                     if (!uid_changer_block0_input_.empty()) {
                         uid_changer_block0_input_.pop_back();
@@ -3991,8 +4001,11 @@ private:
 
         if (uid_changer_step_ == 1) {
             const auto conn = service_.connection_state();
-            if (conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
-                uid_changer_generation_idx_ = 0;
+            // NFCUnit supports Gen1A(0), Gen4(3); Gen2(1) is PN532-only.
+            // Gen3(2) is disabled in UID Changer.
+            if (conn.device_kind == nfc_app::DeviceKind::NFCUnit &&
+                uid_changer_generation_idx_ == 1 /* Gen2 */) {
+                uid_changer_generation_idx_ = 0; // reset Gen2 to Gen1A
             }
             const int field_count = 2;
             if (key == KEY_UP || key == KEY_F) {
@@ -4003,16 +4016,16 @@ private:
                 uid_changer_field_idx_ = (uid_changer_field_idx_ + 1) % field_count;
                 return;
             }
-            if ((key == KEY_LEFT || key == KEY_RIGHT) && uid_changer_field_idx_ == 0) {
-                if (conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
-                    ui_message_ = "NFC Unit supports Gen1A only";
-                    return;
-                }
-                const int delta = (key == KEY_LEFT) ? -1 : 1;
+            if (key == KEY_TAB) {
+                // Tab cycles forward through allowed types.
+                // UID Changer disables Gen3(2). NFCUnit also skips Gen2(1).
                 int next = uid_changer_generation_idx_;
                 for (int i = 0; i < 4; ++i) {
-                    next = (next + delta + 4) % 4;
-                    if (uid_changer_generation_allowed(next, uid_changer_uid_len_idx_)) break;
+                    next = (next + 1) % 4;
+                    if (!uid_changer_generation_allowed(next, uid_changer_uid_len_idx_)) continue;
+                    if (conn.device_kind == nfc_app::DeviceKind::NFCUnit &&
+                        next == 1 /* Gen2 not supported on NFCUnit */) continue;
+                    break;
                 }
                 uid_changer_generation_idx_ = next;
                 return;
@@ -4088,8 +4101,13 @@ private:
         }
 
         if (conn.device_kind == nfc_app::DeviceKind::NFCUnit &&
-            uid_changer_generation() != nfc_app::UidMagicGeneration::Gen1A) {
-            ui_message_ = "NFC Unit supports Gen1A only";
+            uid_changer_generation() == nfc_app::UidMagicGeneration::Gen2) {
+            ui_message_ = "NFC Unit: Gen2 not supported (use Gen1A/Gen4)";
+            return;
+        }
+
+        if (uid_changer_generation() == nfc_app::UidMagicGeneration::Gen3) {
+            ui_message_ = "UID Changer: Gen3 write disabled (use PM3/PN532 tools)";
             return;
         }
 

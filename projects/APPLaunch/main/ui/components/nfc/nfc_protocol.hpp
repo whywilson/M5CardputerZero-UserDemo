@@ -1135,7 +1135,86 @@ public:
         return mf_write_block_auth(0, block0, error);
     }
 
+    // Re-select a Gen3 card via raw ICT anticollision without going through
+    // InListPassiveTarget. Does: HALT → WUPA → 9320(→9520) → 9370(→9570).
+    // Must be called while in raw ICT mode (target_listed_ == false).
+    // Returns false on any RF error; does NOT set target_listed_.
+    bool gen3_select_raw(std::string *error)
+    {
+        // HALT (no CRC, timeout expected)
+        {
+            const std::vector<uint8_t> frame =
+                Pn532FrameCodec::build_command(0x42, {0x50, 0x00});
+            transport_->write_bytes(frame.data(), frame.size(), nullptr);
+            std::vector<uint8_t> rx;
+            collect_response(&rx, nullptr);
+        }
+#ifndef _WIN32
+        usleep(10000);
+#endif
+        // WUPA (7-bit)
+        write_register(0x633D, 0x07, nullptr);
+#ifndef _WIN32
+        usleep(5000);
+#endif
+        const uint8_t wupa = 0x52;
+        std::vector<uint8_t> atqa_resp;
+        in_communicate_thru_raw(&wupa, 1, &atqa_resp, nullptr);
+        write_register(0x633D, 0x00, nullptr);
+#ifndef _WIN32
+        usleep(5000);
+#endif
+        if (atqa_resp.empty() || atqa_resp[0] != 0x00) {
+            if (error) *error = "Gen3 reselect: WUPA no ATQA";
+            return false;
+        }
+
+        // Anticollision cascade 1 (9320)
+        const uint8_t ac1_cmd[] = {0x93, 0x20};
+        std::vector<uint8_t> ac1;
+        in_communicate_thru_raw(ac1_cmd, sizeof(ac1_cmd), &ac1, nullptr);
+        if (ac1.size() < 6 || ac1[0] != 0x00) {
+            if (error) *error = "Gen3 reselect: anticol1 failed";
+            return false;
+        }
+
+        // Select cascade 1 (9370)
+        uint8_t sel1[9] = {0x93, 0x70, ac1[1], ac1[2], ac1[3], ac1[4], ac1[5], 0, 0};
+        compute_crc_a(sel1, 7, &sel1[7], &sel1[8]);
+        std::vector<uint8_t> sak1;
+        in_communicate_thru_raw(sel1, sizeof(sel1), &sak1, nullptr);
+        if (sak1.size() < 2 || sak1[0] != 0x00) {
+            if (error) *error = "Gen3 reselect: sel1 failed";
+            return false;
+        }
+
+        // Cascade 2 for 7-byte UIDs
+        if (ac1[1] == 0x88) {
+            const uint8_t ac2_cmd[] = {0x95, 0x20};
+            std::vector<uint8_t> ac2;
+            in_communicate_thru_raw(ac2_cmd, sizeof(ac2_cmd), &ac2, nullptr);
+            if (ac2.size() < 6 || ac2[0] != 0x00) {
+                if (error) *error = "Gen3 reselect: anticol2 failed";
+                return false;
+            }
+            uint8_t sel2[9] = {0x95, 0x70, ac2[1], ac2[2], ac2[3], ac2[4], ac2[5], 0, 0};
+            compute_crc_a(sel2, 7, &sel2[7], &sel2[8]);
+            std::vector<uint8_t> sak2;
+            in_communicate_thru_raw(sel2, sizeof(sel2), &sak2, nullptr);
+            if (sak2.size() < 2 || sak2[0] != 0x00) {
+                if (error) *error = "Gen3 reselect: sel2 failed";
+                return false;
+            }
+        }
+        return true;
+    }
+
     // Set UID for Gen3 Mifare Classic magic cards.
+    // Sequence: is_gen3 (confirm + initial select) →
+    //           gen3_select_raw (fresh select before 90FBCCCC) →
+    //           90FBCCCC →
+    //           gen3_select_raw (fresh select before 90F0CCCC) →
+    //           90F0CCCC.
     bool set_classic_gen3_uid(const std::vector<uint8_t> &uid,
                               const std::vector<uint8_t> &block0,
                               std::string *error)
@@ -1149,15 +1228,26 @@ public:
             return false;
         }
 
+        // Confirm Gen3 via HALT→WUPA→9320→9370→READ. Card ends up selected.
         if (!is_gen3(error)) {
             if (error && error->empty()) *error = "not Gen3";
             return false;
         }
 
-        std::vector<uint8_t> cmd_uid = {0x90, 0xFB, 0xCC, 0xCC, 0x07};
+        // After is_gen3's READ, card needs a fresh anticollision cycle before
+        // it will accept the backdoor 90FBCCCC command.
+        if (!gen3_select_raw(error)) return false;
+
+        // 90FBCCCC: set UID.
+        // NOTE: Do NOT reselect between 90FBCCCC and 90F0CCCC. The two commands
+        // must be sent back-to-back in the same RF session; a reselect in between
+        // causes 90F0CCCC to fail silently (returns 9000 but data not committed).
+        std::vector<uint8_t> cmd_uid = {0x90, 0xFB, 0xCC, 0xCC,
+                                        static_cast<uint8_t>(uid.size())};
         cmd_uid.insert(cmd_uid.end(), uid.begin(), uid.end());
         if (!in_communicate_thru_checked(cmd_uid, true, nullptr, error)) return false;
 
+        // 90F0CCCC: write block0 immediately (no reselect)
         std::vector<uint8_t> cmd_blk0 = {0x90, 0xF0, 0xCC, 0xCC, 0x10};
         cmd_blk0.insert(cmd_blk0.end(), block0.begin(), block0.end());
         return in_communicate_thru_checked(cmd_blk0, true, nullptr, error);
