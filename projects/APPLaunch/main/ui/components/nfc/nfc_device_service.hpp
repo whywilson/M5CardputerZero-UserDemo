@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <set>
 #include <thread>
@@ -71,6 +72,15 @@ public:
         std::string last_seen;
     };
 
+    struct NfcUnitEmuStartState {
+        bool running = false;
+        bool has_result = false;
+        bool ok = false;
+        std::string status;
+        std::string error;
+        std::string profile;
+    };
+
     NfcDeviceService()
     {
         refresh_endpoints();
@@ -106,6 +116,8 @@ public:
         stop_uhf_continuous_scan();
         cancel_hw_upload_.store(true);
         cancel_hw_mfkey_.store(true);
+        if (nfc_unit_emu_start_thread_.joinable()) nfc_unit_emu_start_thread_.join();
+        stop_nfcunit_emulation_worker(false);
         stop_pn532_ndef_emulation();
         if (uart_test_thread_.joinable()) uart_test_thread_.join();
         if (hw_upload_thread_.joinable()) hw_upload_thread_.join();
@@ -1055,7 +1067,24 @@ public:
                 connection_.detail = "I2C: invalid endpoint path (missing ':' separator)";
             } else {
                 const std::string bus = path.substr(0, colon_pos);
-                const uint8_t addr = (uint8_t)std::stoul(path.substr(colon_pos + 1), nullptr, 16);
+                uint8_t addr = 0;
+                try {
+                    addr = static_cast<uint8_t>(std::stoul(path.substr(colon_pos + 1), nullptr, 16));
+                } catch (...) {
+                    connection_.connected = false;
+                    connection_.device_kind = DeviceKind::NotConnected;
+                    connection_.detail = "I2C: invalid address in endpoint";
+                    return false;
+                }
+
+                // First I2C connect: force a short Grove power-cycle to recover
+                // from stale peripheral state after previous EMU/reader mode.
+                NfcTransportFactory::grove_gpio_enable_bcm(17, false);
+                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                NfcTransportFactory::grove_gpio_enable_bcm(4, true);
+                NfcTransportFactory::grove_gpio_enable_bcm(17, true);
+                std::this_thread::sleep_for(std::chrono::milliseconds(240));
+
                 i2c_device_ = std::make_unique<I2cGroveNfcDevice>();
                 std::string i2c_error;
                 if (!i2c_device_->open(bus, addr, &i2c_error)) {
@@ -1067,12 +1096,14 @@ public:
                     connection_.device_kind = i2c_device_->device_kind();
                     connection_.pn532_ready = true;
                     connection_.status = std::string("Connected ") + to_string(connection_.device_kind);
-                    const uint16_t hw = i2c_device_->readSysReg(0x0000);
-                    const uint16_t fw = i2c_device_->readSysReg(0x0002);
                     char ver[128];
-                    std::snprintf(ver, sizeof(ver), "%s @%s HW:%04X FW:%04X",
-                        to_string(connection_.device_kind), path.c_str(), hw, fw);
+                    std::snprintf(ver, sizeof(ver), "%s @%s",
+                        to_string(connection_.device_kind), path.c_str());
                     connection_.detail = ver;
+                    if (connection_.device_kind == DeviceKind::NFCUnit) {
+                        nfc_unit_emu_profile_ = 0;
+                        selected_emulator_protocol_ = ProtocolKind::Iso14443A;
+                    }
                 }
             }
         }
@@ -1081,6 +1112,8 @@ public:
 
     void disconnect()
     {
+        stop_nfcunit_emulation_worker(true);
+        stop_nfcunit_mfkey_sniffer(false);
         std::lock_guard<std::mutex> lock(mutex_);
         if (transport_) transport_->close();
         transport_.reset();
@@ -1104,6 +1137,11 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return pn532_ndef_;
+    }
+
+    bool nfcunit_emulation_running() const
+    {
+        return nfc_unit_emu_running_.load();
     }
 
     bool is_current_device_uhf() const
@@ -1409,8 +1447,7 @@ public:
                     ProtocolKind::Iso15693, ProtocolKind::Felica};
         }
         if (kind == DeviceKind::NFCUnit) {
-            return {ProtocolKind::Iso14443A, ProtocolKind::Iso14443B,
-                    ProtocolKind::Iso15693, ProtocolKind::Felica};
+            return {ProtocolKind::Iso14443A, ProtocolKind::Iso15693};
         }
         if (kind == DeviceKind::UHFReader) {
             return {ProtocolKind::Unknown};
@@ -1436,6 +1473,8 @@ public:
     void hw_switch_to_reader_mode()
     {
         NfcHexLog::get().log_event("reader", "switching to reader mode");
+        stop_nfcunit_emulation_worker(true);
+        stop_nfcunit_mfkey_sniffer(true);
         cancel_emu_probe_.store(true);
         if (emu_probe_thread_.joinable()) emu_probe_thread_.join();
         cancel_emu_probe_.store(false);
@@ -1648,6 +1687,8 @@ public:
     bool start_scan()
     {
         stop_pn532_ndef_emulation();
+        stop_nfcunit_emulation_worker(true);
+        stop_nfcunit_mfkey_sniffer(true);
         if (scan_thread_.joinable()) scan_thread_.join();
         cancel_uhf_scan_.store(false);
         // Cancel any running EMU probe/dump threads to avoid racing set_work_mode calls
@@ -1659,10 +1700,20 @@ public:
         cancel_emu_dump_.store(false);
 
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!transport_ || !transport_->is_open()) {
+        const bool i2c_connected = (i2c_device_ && i2c_device_->is_open() &&
+                                    (connection_.endpoint.kind == TransportKind::I2cBus ||
+                                     connection_.device_kind == DeviceKind::NFCUnit ||
+                                     connection_.device_kind == DeviceKind::GroveNFC));
+        const bool transport_connected = (transport_ && transport_->is_open());
+        if (!i2c_connected && !transport_connected) {
             scan_.running = false;
             scan_.status = "No device";
-            scan_.error = "Connect USB/UART first";
+            const bool i2c_expected = (connection_.endpoint.kind == TransportKind::I2cBus ||
+                                       connection_.device_kind == DeviceKind::NFCUnit ||
+                                       connection_.device_kind == DeviceKind::GroveNFC);
+            scan_.error = i2c_expected
+                ? "Connect I2C device first"
+                : "Connect USB/UART first";
             return false;
         }
         if (scan_.running) return false;
@@ -1921,6 +1972,173 @@ public:
         std::string key_hex; // empty if not found
     };
 
+    struct NfcUnitMfkeyEntry {
+        uint32_t uid = 0;
+        uint32_t nt = 0;
+        uint32_t nr = 0;
+        uint32_t ar = 0;
+        uint8_t sector = 0;
+        uint8_t key_type = 0; // 0=A, 1=B
+    };
+
+    static uint32_t read_le_u32(const uint8_t *p)
+    {
+        if (!p) return 0;
+        return static_cast<uint32_t>(p[0]) |
+               (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) |
+               (static_cast<uint32_t>(p[3]) << 24);
+    }
+
+    static uint8_t mfc_block_to_sector(uint8_t block)
+    {
+        if (block < 128) return static_cast<uint8_t>(block / 4);
+        return static_cast<uint8_t>(32 + ((block - 128) / 16));
+    }
+
+    void stop_nfcunit_mfkey_sniffer(bool reset_reader_mode)
+    {
+        nfc_unit_mfkey_sniff_cancel_.store(true);
+        if (nfc_unit_mfkey_sniff_thread_.joinable()) {
+            nfc_unit_mfkey_sniff_thread_.join();
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (reset_reader_mode && i2c_device_ && i2c_device_->is_open()) {
+            if (i2c_device_->is_nfc_unit()) {
+                i2c_device_->nfcunit_stop_listener();
+            } else {
+                i2c_device_->writeMiscReg(i2c_reg::MISC_THRU, 0x00);
+                i2c_device_->stopEmulation();
+            }
+        }
+        nfc_unit_mfkey_sniff_running_.store(false);
+    }
+
+    void nfcunit_mfkey_sniff_worker(uint32_t uid)
+    {
+        NfcHexLog::get().log_event("mfkey32v2", "NFCUnit sniff worker started");
+
+        std::mt19937 rng(std::random_device{}());
+        bool pending_auth = false;
+        uint8_t pending_sector = 0;
+        uint8_t pending_key_type = 0;
+        uint32_t pending_nt = 0;
+
+        while (!nfc_unit_mfkey_sniff_cancel_.load()) {
+            I2cGroveNfcDevice *dev = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                dev = i2c_device_.get();
+            }
+
+            if (!dev || !dev->is_open() || !dev->is_nfc_unit()) break;
+
+            std::vector<uint8_t> frame;
+            if (!dev->nfcunit_poll_listener_frame(frame, 25)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+
+            NfcHexLog::get().log_rx("MFKEY-I2C", frame.data(), frame.size());
+
+            if (frame.size() >= 2 && (frame[0] == 0x60 || frame[0] == 0x61)) {
+                pending_auth = true;
+                pending_sector = mfc_block_to_sector(frame[1]);
+                pending_key_type = (frame[0] == 0x61) ? 1 : 0;
+                pending_nt = static_cast<uint32_t>(rng());
+
+                uint8_t nt_resp[4] = {
+                    static_cast<uint8_t>(pending_nt & 0xFF),
+                    static_cast<uint8_t>((pending_nt >> 8) & 0xFF),
+                    static_cast<uint8_t>((pending_nt >> 16) & 0xFF),
+                    static_cast<uint8_t>((pending_nt >> 24) & 0xFF),
+                };
+                dev->nfcunit_send_listener_frame(nt_resp, sizeof(nt_resp));
+                NfcHexLog::get().log_tx("MFKEY-I2C", nt_resp, sizeof(nt_resp));
+                continue;
+            }
+
+            if (pending_auth && frame.size() >= 8) {
+                NfcUnitMfkeyEntry e;
+                e.uid = uid;
+                e.nt = pending_nt;
+                e.nr = read_le_u32(frame.data());
+                e.ar = read_le_u32(frame.data() + 4);
+                e.sector = pending_sector;
+                e.key_type = pending_key_type;
+
+                {
+                    std::lock_guard<std::mutex> lk(nfc_unit_mfkey_mutex_);
+                    nfc_unit_mfkey_entries_.push_back(e);
+                }
+
+                char line[96];
+                std::snprintf(line, sizeof(line), "NFCUnit nonce s%u%c nt=%08X nr=%08X ar=%08X",
+                              static_cast<unsigned>(e.sector), e.key_type ? 'B' : 'A',
+                              e.nt, e.nr, e.ar);
+                NfcHexLog::get().log_event("mfkey32v2", line);
+
+                uint8_t at_resp[4] = {0, 0, 0, 0};
+                dev->nfcunit_send_listener_frame(at_resp, sizeof(at_resp));
+                NfcHexLog::get().log_tx("MFKEY-I2C", at_resp, sizeof(at_resp));
+
+                pending_auth = false;
+            }
+        }
+
+        nfc_unit_mfkey_sniff_running_.store(false);
+        NfcHexLog::get().log_event("mfkey32v2", "NFCUnit sniff worker stopped");
+    }
+
+    bool start_nfcunit_mfkey_sniffer(std::string *error = nullptr)
+    {
+        // Best-effort stop stale worker before a new sniff session.
+        nfc_unit_mfkey_sniff_cancel_.store(true);
+        if (nfc_unit_mfkey_sniff_thread_.joinable()) {
+            nfc_unit_mfkey_sniff_thread_.join();
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
+            if (error) *error = "NFC Unit not connected";
+            return false;
+        }
+
+        std::string uid_hex = mfkey_sniff_uid_hex_;
+        if (uid_hex.size() < 8) uid_hex = "A0A1A2A3";
+        uid_hex = keep_hex_chars_upper(uid_hex);
+        if (uid_hex.size() < 8) uid_hex = "A0A1A2A3";
+        uid_hex = uid_hex.substr(0, 8);
+
+        uint8_t uid[4] = {};
+        for (int i = 0; i < 4; ++i) {
+            uid[i] = static_cast<uint8_t>(std::stoul(uid_hex.substr(i * 2, 2), nullptr, 16));
+        }
+        const uint32_t uid_u32 = static_cast<uint32_t>(std::stoul(uid_hex, nullptr, 16));
+
+        const std::vector<uint8_t> uid_vec = {uid[0], uid[1], uid[2], uid[3]};
+        const bool emu_ok = i2c_device_->nfcunit_start_listener_a(uid_vec, 0x0004, 0x08);
+        if (!emu_ok) {
+            if (error) *error = "NFC Unit listener init failed";
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(nfc_unit_mfkey_mutex_);
+            nfc_unit_mfkey_entries_.clear();
+        }
+        nfc_unit_mfkey_uid_ = uid_u32;
+        nfc_unit_mfkey_sniff_cancel_.store(false);
+        nfc_unit_mfkey_sniff_running_.store(true);
+        nfc_unit_mfkey_sniff_thread_ = std::thread([this, uid_u32]() {
+            nfcunit_mfkey_sniff_worker(uid_u32);
+        });
+
+        if (error) error->clear();
+        return true;
+    }
+
     // Synchronously set sniffer slot UID from 8-char hex string (e.g. "DEADBEEF").
     // Builds block0: uid[4] + BCC[1] + SAK(0x08)[1] + ATQA(0x04,0x00)[2] + pad[8]
     bool hw_sniff_set_uid(const std::string &uid_hex)
@@ -1943,10 +2161,18 @@ public:
         // bytes 8-15 remain 0
 
         INfcTransport *transport_raw = nullptr;
+        DeviceKind kind = DeviceKind::Unknown;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             transport_raw = transport_.get();
+            kind = connection_.device_kind;
+            mfkey_sniff_uid_hex_ = keep_hex_chars_upper(uid_hex.substr(0, 8));
         }
+
+        if (kind == DeviceKind::NFCUnit) {
+            return true;
+        }
+
         if (!transport_raw || !transport_raw->is_open()) return false;
         Pn532KillerClient client(transport_raw);
         return client.sniff_set_uid(block0);
@@ -1959,10 +2185,24 @@ public:
         NfcHexLog::get().log_event(with_card ? "mfkey64" : "mfkey32v2",
                                    with_card ? "enter card-present sniffer mode" : "enter no-card sniffer mode");
         INfcTransport *transport_raw = nullptr;
+        DeviceKind kind = DeviceKind::Unknown;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             transport_raw = transport_.get();
+            kind = connection_.device_kind;
         }
+
+        if (kind == DeviceKind::NFCUnit) {
+            if (with_card) {
+                NfcHexLog::get().log_event("mfkey64", "NFCUnit does not support card-present mfkey64 flow");
+                return false;
+            }
+            std::string err;
+            const bool ok = start_nfcunit_mfkey_sniffer(&err);
+            if (!ok && !err.empty()) NfcHexLog::get().log_event("mfkey32v2", err.c_str());
+            return ok;
+        }
+
         if (!transport_raw || !transport_raw->is_open()) return false;
         Pn532KillerClient client(transport_raw);
         return client.sniff_enter_mode(with_card);
@@ -2070,6 +2310,126 @@ public:
         else selected_emulator_protocol_ = ProtocolKind::Iso14443A;
     }
 
+    void toggle_nfcunit_profile_protocol()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        nfc_unit_emu_profile_ = (nfc_unit_emu_profile_ == 0) ? 1 : 0;
+        selected_emulator_protocol_ = (nfc_unit_emu_profile_ == 1)
+            ? ProtocolKind::Iso15693
+            : ProtocolKind::Iso14443A;
+    }
+
+    bool start_nfcunit_current_profile_emulation(std::string *error = nullptr)
+    {
+        stop_nfcunit_emulation_worker(true);
+
+        ProtocolKind protocol = ProtocolKind::Iso14443A;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
+                if (error) *error = "NFC Unit not connected";
+                return false;
+            }
+            protocol = (nfc_unit_emu_profile_ == 1) ? ProtocolKind::Iso15693 : ProtocolKind::Iso14443A;
+            selected_emulator_protocol_ = protocol;
+
+            std::string reset_err;
+            if (!nfcunit_power_cycle_and_reopen_locked(&reset_err)) {
+                if (error) *error = reset_err.empty() ? "NFC Unit power-cycle failed" : reset_err;
+                return false;
+            }
+        }
+        return grovenfc_activate(protocol, 0, error);
+    }
+
+    bool start_nfcunit_current_profile_emulation_no_reopen(std::string *error = nullptr)
+    {
+        stop_nfcunit_emulation_worker(true);
+
+        ProtocolKind protocol = ProtocolKind::Iso14443A;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
+                if (error) *error = "NFC Unit not connected";
+                return false;
+            }
+            protocol = (nfc_unit_emu_profile_ == 1) ? ProtocolKind::Iso15693 : ProtocolKind::Iso14443A;
+            selected_emulator_protocol_ = protocol;
+        }
+
+        if (protocol == ProtocolKind::Iso14443A || protocol == ProtocolKind::MifareClassic) {
+            return start_nfcunit_ntag_emulation_unlocked(error);
+        }
+        if (protocol == ProtocolKind::Iso15693) {
+            return start_nfcunit_iso15693_emulation_unlocked(error);
+        }
+        if (error) *error = "NFC Unit 暂不支持该协议模拟";
+        return false;
+    }
+
+    bool start_nfcunit_current_profile_emulation_async()
+    {
+        {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            if (nfc_unit_emu_start_running_) return false;
+        }
+        if (nfc_unit_emu_start_thread_.joinable()) nfc_unit_emu_start_thread_.join();
+        {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            nfc_unit_emu_start_running_ = true;
+            nfc_unit_emu_start_has_result_ = false;
+            nfc_unit_emu_start_ok_ = false;
+            nfc_unit_emu_start_status_ = "starting";
+            nfc_unit_emu_start_error_.clear();
+            nfc_unit_emu_start_profile_ = nfcunit_profile_label();
+        }
+        std::fprintf(stderr, "[NFC-EMU-START] queued profile=%s\n", nfcunit_profile_label().c_str());
+        nfc_unit_emu_start_thread_ = std::thread([this]() {
+            perform_nfcunit_emu_start_worker();
+        });
+        return true;
+    }
+
+    NfcUnitEmuStartState nfcunit_emu_start_state() const
+    {
+        std::lock_guard<std::mutex> lk(pending_log_mutex_);
+        NfcUnitEmuStartState state;
+        state.running = nfc_unit_emu_start_running_;
+        state.has_result = nfc_unit_emu_start_has_result_;
+        state.ok = nfc_unit_emu_start_ok_;
+        state.status = nfc_unit_emu_start_status_;
+        state.error = nfc_unit_emu_start_error_;
+        state.profile = nfc_unit_emu_start_profile_;
+        return state;
+    }
+
+    std::string nfcunit_profile_label() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return nfcunit_profile_label_for_index(nfc_unit_emu_profile_);
+    }
+
+    static std::string nfcunit_profile_label_for_index(int profile)
+    {
+        switch (profile) {
+        case 0: return "NTAG213";
+        case 1: return "ISO15693";
+        default: return "NTAG213";
+        }
+    }
+
+    std::string nfcunit_ndef_uri() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return nfc_unit_ndef_uri_;
+    }
+
+    void set_nfcunit_ndef_uri(const std::string &uri)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        nfc_unit_ndef_uri_ = uri.empty() ? "https://m5stack.com" : uri;
+    }
+
     bool emulation_allowed(std::string *reason = nullptr) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -2088,6 +2448,7 @@ public:
     // Activate GroveNFC emulation for the given protocol/slot (GroveNFC 0x48 only).
     bool grovenfc_activate(ProtocolKind protocol, int slot_index, std::string *error = nullptr)
     {
+        stop_nfcunit_emulation_worker(true);
         std::lock_guard<std::mutex> lock(mutex_);
         if (!i2c_device_ || !i2c_device_->is_open() ||
             (i2c_device_->device_kind() != DeviceKind::GroveNFC &&
@@ -2095,7 +2456,20 @@ public:
             if (error) *error = "I2C emulation device not connected";
             return false;
         }
-        i2c_device_->setSlot((uint8_t)(slot_index < 0 ? 0 : slot_index > 7 ? 7 : slot_index));
+        const int clamped_slot = (slot_index < 0 ? 0 : slot_index > 7 ? 7 : slot_index);
+
+        if (i2c_device_->is_nfc_unit()) {
+            if (protocol == ProtocolKind::Iso14443A || protocol == ProtocolKind::MifareClassic) {
+                return start_nfcunit_ntag_emulation_locked(clamped_slot, error);
+            }
+            if (protocol == ProtocolKind::Iso15693) {
+                return start_nfcunit_iso15693_emulation_locked(error);
+            }
+            if (error) *error = "NFC Unit 暂不支持该协议模拟";
+            return false;
+        }
+
+        i2c_device_->setSlot((uint8_t)clamped_slot);
         bool ok = false;
         switch (protocol) {
         case ProtocolKind::MifareClassic: ok = i2c_device_->startEmulationMifare1K(); break;
@@ -2109,8 +2483,15 @@ public:
 
     bool grovenfc_deactivate()
     {
+        stop_nfcunit_emulation_worker(true);
         std::lock_guard<std::mutex> lock(mutex_);
         if (!i2c_device_ || !i2c_device_->is_open()) return false;
+        if (i2c_device_->is_nfc_unit()) {
+            const bool ok_listener = i2c_device_->nfcunit_stop_listener();
+            const bool ok_mode = i2c_device_->stopEmulation();
+            nfc_unit_emu_running_.store(false);
+            return ok_listener || ok_mode;
+        }
         return i2c_device_->stopEmulation();
     }
 
@@ -2144,6 +2525,17 @@ public:
         selected_slot_by_protocol_[record.tag.protocol] = slot_n;
         slot.payload_record_id = record.meta.record_id;
         slot.protocol = record.tag.protocol;
+        slot.raw_data = record.tag.raw_data;
+        return save_emulator_slots_locked();
+    }
+
+    bool upload_record_to_profile(ProtocolKind protocol, const SavedRecord &record)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto &slot = current_slot_for_protocol_locked(protocol, 0);
+        selected_slot_by_protocol_[protocol] = 0;
+        slot.payload_record_id = record.meta.record_id;
+        slot.protocol = protocol;
         slot.raw_data = record.tag.raw_data;
         return save_emulator_slots_locked();
     }
@@ -2297,6 +2689,631 @@ public:
     }
 
 private:
+    static constexpr size_t kNfcUnitNtag213Pages = 45;
+
+    static bool parse_i2c_endpoint_path(const std::string &path, std::string *bus, uint8_t *addr)
+    {
+        const auto colon_pos = path.rfind(':');
+        if (colon_pos == std::string::npos || colon_pos + 1 >= path.size()) return false;
+        std::string bus_path = path.substr(0, colon_pos);
+        std::string addr_text = path.substr(colon_pos + 1);
+        if (bus_path.empty() || addr_text.empty()) return false;
+        try {
+            const unsigned long v = std::stoul(addr_text, nullptr, 16);
+            if (v > 0x7F) return false;
+            if (bus) *bus = bus_path;
+            if (addr) *addr = static_cast<uint8_t>(v);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool nfcunit_reopen_i2c_for_worker(std::string *error)
+    {
+        TransportEndpoint endpoint;
+        std::unique_ptr<I2cGroveNfcDevice> old_device;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (connection_.endpoint.kind == TransportKind::I2cBus) {
+                endpoint = connection_.endpoint;
+            } else if (!endpoints_.empty() && selected_endpoint_ >= 0 && selected_endpoint_ < static_cast<int>(endpoints_.size()) &&
+                       endpoints_[selected_endpoint_].kind == TransportKind::I2cBus) {
+                endpoint = endpoints_[selected_endpoint_];
+            } else {
+                if (error) *error = "No I2C endpoint selected";
+                return false;
+            }
+            old_device = std::move(i2c_device_);
+            connection_.connected = false;
+            connection_.endpoint = endpoint;
+            connection_.status = "Connecting NFC Unit";
+            connection_.detail = endpoint.path;
+            connection_.device_kind = DeviceKind::Unknown;
+        }
+
+        if (old_device) old_device->close();
+
+        std::string bus;
+        uint8_t addr = 0;
+        if (!parse_i2c_endpoint_path(endpoint.path, &bus, &addr)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            connection_.connected = false;
+            connection_.device_kind = DeviceKind::NotConnected;
+            connection_.status = "Connect failed";
+            connection_.detail = "Invalid I2C endpoint";
+            if (error) *error = connection_.detail;
+            return false;
+        }
+
+        NfcTransportFactory::grove_gpio_enable_bcm(17, false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        NfcTransportFactory::grove_gpio_enable_bcm(4, true);
+        NfcTransportFactory::grove_gpio_enable_bcm(17, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(260));
+
+        auto new_device = std::make_unique<I2cGroveNfcDevice>();
+        std::string i2c_error;
+        if (!new_device->open(bus, addr, &i2c_error) || !new_device->is_nfc_unit()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            connection_.connected = false;
+            connection_.device_kind = DeviceKind::NotConnected;
+            connection_.status = "Connect failed";
+            connection_.detail = i2c_error.empty() ? "NFC Unit not found" : ("I2C open failed: " + i2c_error);
+            if (error) *error = connection_.detail;
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            i2c_device_ = std::move(new_device);
+            connection_.connected = true;
+            connection_.endpoint = endpoint;
+            connection_.device_kind = DeviceKind::NFCUnit;
+            connection_.pn532_ready = true;
+            connection_.status = "Connected NFCUnit";
+            connection_.detail = std::string("NFCUnit @") + endpoint.path;
+            selected_emulator_protocol_ = (nfc_unit_emu_profile_ == 1) ? ProtocolKind::Iso15693 : ProtocolKind::Iso14443A;
+        }
+
+        if (error) error->clear();
+        return true;
+    }
+
+    bool nfcunit_power_cycle_and_reopen_locked(std::string *error)
+    {
+        if (connection_.endpoint.kind != TransportKind::I2cBus ||
+            connection_.device_kind != DeviceKind::NFCUnit) {
+            if (error) error->clear();
+            return true;
+        }
+
+        std::string bus;
+        uint8_t addr = 0;
+        if (!parse_i2c_endpoint_path(connection_.endpoint.path, &bus, &addr)) {
+            if (error) *error = "Invalid I2C endpoint";
+            return false;
+        }
+
+        if (i2c_device_) {
+            i2c_device_->close();
+            i2c_device_.reset();
+        }
+
+        // Equivalent to unplug/replug: power-cycle Grove 5V and keep mux in I2C mode.
+        NfcTransportFactory::grove_gpio_enable_bcm(17, false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        NfcTransportFactory::grove_gpio_enable_bcm(4, true);
+        NfcTransportFactory::grove_gpio_enable_bcm(17, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(260));
+
+        i2c_device_ = std::make_unique<I2cGroveNfcDevice>();
+        std::string i2c_error;
+        if (!i2c_device_->open(bus, addr, &i2c_error)) {
+            connection_.connected = false;
+            connection_.device_kind = DeviceKind::NotConnected;
+            if (error) *error = std::string("I2C reopen failed: ") + i2c_error;
+            return false;
+        }
+
+        connection_.connected = true;
+        connection_.device_kind = i2c_device_->device_kind();
+        connection_.status = std::string("Connected ") + to_string(connection_.device_kind);
+        char ver[128];
+        std::snprintf(ver, sizeof(ver), "%s @%s",
+                  to_string(connection_.device_kind), connection_.endpoint.path.c_str());
+        connection_.detail = ver;
+
+        if (error) error->clear();
+        return true;
+    }
+
+    static std::vector<uint8_t> parse_emulator_line_payload(const std::string &line)
+    {
+        std::string payload = line;
+        const auto colon = payload.find(':');
+        if (colon != std::string::npos && colon + 1 < payload.size()) {
+            payload = payload.substr(colon + 1);
+        }
+        std::vector<uint8_t> out;
+        if (!parse_hex_bytes(payload, &out)) out.clear();
+        return out;
+    }
+
+    static size_t nfcunit_ntag_pages_for_profile(int profile)
+    {
+        (void)profile;
+        return kNfcUnitNtag213Pages;
+    }
+
+    static uint8_t nfcunit_ntag_cc_size_for_pages(size_t pages)
+    {
+        (void)pages;
+        return 0x12;
+    }
+
+    static uint8_t nfcunit_ntag_version_storage_for_pages(size_t pages)
+    {
+        (void)pages;
+        return 0x0F;
+    }
+
+    static std::vector<uint8_t> build_ndef_uri_tlv(const std::string &uri_in)
+    {
+        std::string uri = uri_in.empty() ? "https://m5stack.com" : uri_in;
+        uint8_t uri_id = 0x00;
+        std::string body = uri;
+        if (uri.rfind("https://", 0) == 0) {
+            uri_id = 0x04;
+            body = uri.substr(8);
+        } else if (uri.rfind("http://", 0) == 0) {
+            uri_id = 0x03;
+            body = uri.substr(7);
+        }
+        if (body.size() > 120) body.resize(120);
+
+        std::vector<uint8_t> msg;
+        msg.reserve(5 + body.size());
+        msg.push_back(0xD1);
+        msg.push_back(0x01);
+        msg.push_back(static_cast<uint8_t>(1 + body.size()));
+        msg.push_back(0x55);
+        msg.push_back(uri_id);
+        msg.insert(msg.end(), body.begin(), body.end());
+
+        std::vector<uint8_t> tlv;
+        tlv.reserve(3 + msg.size());
+        tlv.push_back(0x03);
+        tlv.push_back(static_cast<uint8_t>(msg.size()));
+        tlv.insert(tlv.end(), msg.begin(), msg.end());
+        tlv.push_back(0xFE);
+        return tlv;
+    }
+
+    static std::vector<uint8_t> build_ntag213_nfc_forum_area(const std::string &uri)
+    {
+        std::vector<uint8_t> out = {0x01, 0x03, 0xA0, 0x0C, 0x34};
+        const auto ndef = build_ndef_uri_tlv(uri);
+        out.insert(out.end(), ndef.begin(), ndef.end());
+        return out;
+    }
+
+    static std::vector<uint8_t> default_nfcunit_ntag_memory(size_t pages, const std::string &uri)
+    {
+        std::vector<uint8_t> mem(pages * 4, 0x00);
+        const uint8_t uid7[7] = {0x04, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC};
+        const uint8_t bcc0 = static_cast<uint8_t>(0x88 ^ uid7[0] ^ uid7[1] ^ uid7[2]);
+        const uint8_t bcc1 = static_cast<uint8_t>(uid7[3] ^ uid7[4] ^ uid7[5] ^ uid7[6]);
+        mem[0] = uid7[0]; mem[1] = uid7[1]; mem[2] = uid7[2]; mem[3] = bcc0;
+        mem[4] = uid7[3]; mem[5] = uid7[4]; mem[6] = uid7[5]; mem[7] = uid7[6];
+        mem[8] = bcc1; mem[9] = 0x48; mem[10] = 0x00; mem[11] = 0x00;
+        mem[12] = 0xE1; mem[13] = 0x10; mem[14] = nfcunit_ntag_cc_size_for_pages(pages); mem[15] = 0x00;
+        const size_t cfg = (pages - 5) * 4;
+        mem[cfg + 0] = 0x00; mem[cfg + 1] = 0x00; mem[cfg + 2] = 0x00; mem[cfg + 3] = 0xBD;
+        mem[cfg + 4] = 0x04; mem[cfg + 5] = 0x00; mem[cfg + 6] = 0x00; mem[cfg + 7] = 0xFF;
+        mem[cfg + 8] = 0x00; mem[cfg + 9] = 0x05; mem[cfg + 10] = 0x00; mem[cfg + 11] = 0x00;
+        mem[cfg + 12] = 0x00; mem[cfg + 13] = 0x00; mem[cfg + 14] = 0x00; mem[cfg + 15] = 0x00;
+        mem[cfg + 16] = 0x00; mem[cfg + 17] = 0x00; mem[cfg + 18] = 0x00; mem[cfg + 19] = 0x00;
+
+        const auto tlv = build_ntag213_nfc_forum_area(uri);
+        const size_t ndef_start = 16;
+        const size_t ndef_end = cfg;
+        if (ndef_end > ndef_start) {
+            std::fill(mem.begin() + static_cast<ptrdiff_t>(ndef_start),
+                      mem.begin() + static_cast<ptrdiff_t>(ndef_end),
+                      0x00);
+            const size_t copy_len = std::min(tlv.size(), ndef_end - ndef_start);
+            std::memcpy(mem.data() + ndef_start, tlv.data(), copy_len);
+        }
+        return mem;
+    }
+
+    static void apply_nfcunit_ntag213_url_layout(std::vector<uint8_t> &mem, size_t pages, const std::string &uri)
+    {
+        if (pages <= 5 || mem.size() < pages * 4) return;
+        const size_t ndef_start = 16;
+        const size_t ndef_end = (pages - 5) * 4;
+        if (ndef_end <= ndef_start) return;
+        const auto area = build_ntag213_nfc_forum_area(uri.empty() ? "https://m5stack.com" : uri);
+        std::fill(mem.begin() + static_cast<ptrdiff_t>(ndef_start),
+                  mem.begin() + static_cast<ptrdiff_t>(ndef_end),
+                  0x00);
+        const size_t copy_len = std::min(area.size(), ndef_end - ndef_start);
+        std::memcpy(mem.data() + ndef_start, area.data(), copy_len);
+    }
+
+    static void apply_slot_dump_to_ntag_memory(const EmulatorSlotRecord &slot, std::vector<uint8_t> &mem)
+    {
+        const size_t max_pages = mem.size() / 4;
+        for (size_t i = 0; i < slot.raw_data.size() && i < max_pages; ++i) {
+            std::vector<uint8_t> page = parse_emulator_line_payload(slot.raw_data[i]);
+            if (page.size() >= 4) {
+                std::memcpy(mem.data() + (i * 4), page.data(), 4);
+            }
+        }
+    }
+
+    static void normalize_nfcunit_ntag213_identity(std::vector<uint8_t> &mem)
+    {
+        if (mem.size() < 16) return;
+        uint8_t uid7[7] = {mem[0], mem[1], mem[2], mem[4], mem[5], mem[6], mem[7]};
+        bool all_zero = true;
+        for (uint8_t b : uid7) {
+            if (b != 0x00) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero || uid7[0] != 0x04) {
+            const uint8_t def_uid[7] = {0x04, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC};
+            std::memcpy(uid7, def_uid, sizeof(uid7));
+            mem[0] = uid7[0]; mem[1] = uid7[1]; mem[2] = uid7[2];
+            mem[4] = uid7[3]; mem[5] = uid7[4]; mem[6] = uid7[5]; mem[7] = uid7[6];
+        }
+        mem[3] = static_cast<uint8_t>(0x88 ^ uid7[0] ^ uid7[1] ^ uid7[2]);
+        mem[8] = static_cast<uint8_t>(uid7[3] ^ uid7[4] ^ uid7[5] ^ uid7[6]);
+        mem[9] = 0x48;
+    }
+
+    bool start_nfcunit_ntag_emulation_unlocked(std::string *error)
+    {
+        EmulatorSlotRecord slot_copy;
+        size_t pages = kNfcUnitNtag213Pages;
+        std::string uri;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
+                if (error) *error = "NFC Unit not connected";
+                return false;
+            }
+            ensure_protocol_slots_locked(ProtocolKind::Iso14443A);
+            slot_copy = current_slot_for_protocol_locked(ProtocolKind::Iso14443A, 0);
+            pages = nfcunit_ntag_pages_for_profile(nfc_unit_emu_profile_);
+            uri = nfc_unit_ndef_uri_;
+        }
+
+        auto mem = default_nfcunit_ntag_memory(pages, uri);
+        apply_slot_dump_to_ntag_memory(slot_copy, mem);
+        apply_nfcunit_ntag213_url_layout(mem, pages, uri);
+
+        normalize_nfcunit_ntag213_identity(mem);
+        mem[12] = 0xE1;
+        mem[13] = 0x10;
+        mem[14] = nfcunit_ntag_cc_size_for_pages(pages);
+        mem[15] = 0x00;
+
+        std::vector<uint8_t> uid = {mem[0], mem[1], mem[2], mem[4], mem[5], mem[6], mem[7]};
+
+        I2cGroveNfcDevice *dev = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
+                if (error) *error = "NFC Unit not connected";
+                return false;
+            }
+            dev = i2c_device_.get();
+        }
+
+        if (!dev->nfcunit_start_listener_a(uid, 0x0044, 0x00)) {
+            if (error) *error = "NFC Unit NFC-A listener activation failed";
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            nfc_unit_ntag_pages_ = pages;
+            nfc_unit_ntag_mem_ = std::move(mem);
+            nfc_unit_emu_cancel_.store(false);
+            nfc_unit_emu_running_.store(true);
+            nfc_unit_emu_protocol_ = ProtocolKind::Iso14443A;
+            nfc_unit_emu_thread_ = std::thread([this]() { nfcunit_ntag213_worker(); });
+        }
+
+        push_log("[NFCUnit] " + nfcunit_profile_label_for_index(nfc_unit_emu_profile_) + " emulation started");
+        if (error) error->clear();
+        return true;
+    }
+
+    bool start_nfcunit_iso15693_emulation_unlocked(std::string *error)
+    {
+        I2cGroveNfcDevice *dev = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
+                if (error) *error = "NFC Unit not connected";
+                return false;
+            }
+            dev = i2c_device_.get();
+        }
+
+        dev->nfcunit_stop_listener();
+        const bool ok = dev->startEmulationISO15();
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            nfc_unit_emu_running_.store(ok);
+            nfc_unit_emu_protocol_ = ProtocolKind::Iso15693;
+        }
+        if (ok) {
+            push_log("[NFCUnit] ISO15693 emulation started");
+            if (error) error->clear();
+        } else if (error) {
+            *error = "NFC Unit ISO15693 emulation start failed";
+        }
+        return ok;
+    }
+
+    bool start_nfcunit_ntag_emulation_locked(int slot_index, std::string *error)
+    {
+        ensure_protocol_slots_locked(ProtocolKind::Iso14443A);
+        const auto &slot = current_slot_for_protocol_locked(ProtocolKind::Iso14443A, slot_index);
+        nfc_unit_ntag_pages_ = nfcunit_ntag_pages_for_profile(nfc_unit_emu_profile_);
+        nfc_unit_ntag_mem_ = default_nfcunit_ntag_memory(nfc_unit_ntag_pages_, nfc_unit_ndef_uri_);
+        apply_slot_dump_to_ntag_memory(slot, nfc_unit_ntag_mem_);
+        apply_nfcunit_ntag213_url_layout(nfc_unit_ntag_mem_, nfc_unit_ntag_pages_, nfc_unit_ndef_uri_);
+
+        normalize_nfcunit_ntag213_identity(nfc_unit_ntag_mem_);
+        nfc_unit_ntag_mem_[12] = 0xE1;
+        nfc_unit_ntag_mem_[13] = 0x10;
+        nfc_unit_ntag_mem_[14] = nfcunit_ntag_cc_size_for_pages(nfc_unit_ntag_pages_);
+        nfc_unit_ntag_mem_[15] = 0x00;
+
+        std::vector<uint8_t> uid = {
+            nfc_unit_ntag_mem_[0], nfc_unit_ntag_mem_[1], nfc_unit_ntag_mem_[2],
+            nfc_unit_ntag_mem_[4], nfc_unit_ntag_mem_[5], nfc_unit_ntag_mem_[6], nfc_unit_ntag_mem_[7]
+        };
+        if (!i2c_device_->nfcunit_start_listener_a(uid, 0x0044, 0x00)) {
+            if (error) *error = "NFC Unit NFC-A listener activation failed";
+            return false;
+        }
+
+        nfc_unit_emu_cancel_.store(false);
+        nfc_unit_emu_running_.store(true);
+        nfc_unit_emu_protocol_ = ProtocolKind::Iso14443A;
+        nfc_unit_emu_thread_ = std::thread([this]() { nfcunit_ntag213_worker(); });
+        push_log("[NFCUnit] " + nfcunit_profile_label_for_index(nfc_unit_emu_profile_) + " emulation started");
+        if (error) error->clear();
+        return true;
+    }
+
+    bool start_nfcunit_iso15693_emulation_locked(std::string *error)
+    {
+        if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
+            if (error) *error = "NFC Unit not connected";
+            return false;
+        }
+        i2c_device_->nfcunit_stop_listener();
+        const bool ok = i2c_device_->startEmulationISO15();
+        nfc_unit_emu_running_.store(ok);
+        nfc_unit_emu_protocol_ = ProtocolKind::Iso15693;
+        if (ok) {
+            push_log("[NFCUnit] ISO15693 emulation started");
+            if (error) error->clear();
+        } else if (error) {
+            *error = "NFC Unit ISO15693 emulation start failed";
+        }
+        return ok;
+    }
+
+    bool start_nfcunit_felica_emulation_locked(std::string *error)
+    {
+        const uint8_t idm[8] = {0x01, 0x2E, 0x50, 0xE5, 0x3C, 0x4B, 0x4F, 0x29};
+        const uint8_t pmm[8] = {0x00, 0xF1, 0x00, 0x00, 0x00, 0x01, 0x43, 0x00};
+        if (!i2c_device_->nfcunit_start_listener_f(idm, pmm, 0xFFFF)) {
+            if (error) *error = "NFC Unit NFC-F listener activation failed";
+            return false;
+        }
+        nfc_unit_emu_cancel_.store(false);
+        nfc_unit_emu_running_.store(true);
+        nfc_unit_emu_protocol_ = ProtocolKind::Felica;
+        nfc_unit_emu_thread_ = std::thread([this]() { nfcunit_felica_worker(); });
+        push_log("[NFCUnit] NFC-F emulation started");
+        if (error) error->clear();
+        return true;
+    }
+
+    void perform_nfcunit_emu_start_worker()
+    {
+        auto set_status = [this](const std::string &status) {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            nfc_unit_emu_start_status_ = status;
+        };
+
+        set_status("connecting");
+        std::fprintf(stderr, "[NFC-EMU-START] worker connecting\n");
+        bool ok = false;
+        std::string err;
+        if (!nfcunit_reopen_i2c_for_worker(&err)) {
+            std::fprintf(stderr, "[NFC-EMU-START] reopen failed err=%s\n", err.c_str());
+        } else {
+            set_status("starting");
+            std::fprintf(stderr, "[NFC-EMU-START] starting listener\n");
+            for (int attempt = 0; attempt < 2 && !ok; ++attempt) {
+                err.clear();
+                ok = start_nfcunit_current_profile_emulation_no_reopen(&err);
+                std::fprintf(stderr, "[NFC-EMU-START] attempt=%d ok=%d err=%s\n",
+                             attempt + 1, ok ? 1 : 0, err.c_str());
+                if (!ok) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(160));
+                    std::string reopen_err;
+                    (void)nfcunit_reopen_i2c_for_worker(&reopen_err);
+                }
+            }
+        }
+
+        const std::string profile = nfcunit_profile_label();
+        {
+            std::lock_guard<std::mutex> lk(pending_log_mutex_);
+            nfc_unit_emu_start_running_ = false;
+            nfc_unit_emu_start_has_result_ = true;
+            nfc_unit_emu_start_ok_ = ok;
+            nfc_unit_emu_start_status_ = ok ? "running" : "failed";
+            nfc_unit_emu_start_error_ = err;
+            nfc_unit_emu_start_profile_ = profile;
+        }
+        std::fprintf(stderr, "[NFC-EMU-START] done ok=%d profile=%s err=%s\n",
+                     ok ? 1 : 0, profile.c_str(), err.c_str());
+    }
+
+    void stop_nfcunit_emulation_worker(bool stop_listener)
+    {
+        nfc_unit_emu_cancel_.store(true);
+        if (nfc_unit_emu_thread_.joinable()) nfc_unit_emu_thread_.join();
+        nfc_unit_emu_running_.store(false);
+        nfc_unit_emu_protocol_ = ProtocolKind::Unknown;
+        if (stop_listener) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (i2c_device_ && i2c_device_->is_open() && i2c_device_->is_nfc_unit()) {
+                i2c_device_->nfcunit_stop_listener();
+                i2c_device_->stopEmulation();
+            }
+        }
+    }
+
+    void nfcunit_ntag213_worker()
+    {
+        static constexpr uint8_t kAck = 0x0A;
+        static constexpr uint8_t kNak = 0x00;
+        static constexpr uint8_t kTearing = 0xBD;
+        uint32_t counter0 = 0;
+        uint8_t version[8] = {0x00, 0x04, 0x04, 0x02, 0x01, 0x00,
+                              nfcunit_ntag_version_storage_for_pages(nfc_unit_ntag_pages_), 0x03};
+        const std::vector<uint8_t> uid = {
+            nfc_unit_ntag_mem_[0], nfc_unit_ntag_mem_[1], nfc_unit_ntag_mem_[2],
+            nfc_unit_ntag_mem_[4], nfc_unit_ntag_mem_[5], nfc_unit_ntag_mem_[6], nfc_unit_ntag_mem_[7]
+        };
+
+        while (!nfc_unit_emu_cancel_.load()) {
+            std::vector<uint8_t> frame;
+            bool got = false;
+            I2cGroveNfcDevice *dev = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                dev = i2c_device_.get();
+            }
+            if (dev && dev->is_open() && dev->is_nfc_unit()) {
+                got = dev->nfcunit_poll_listener_frame(frame, 20);
+            }
+            if (!got || frame.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+
+            std::vector<uint8_t> response;
+            const uint8_t cmd = frame[0];
+            if (cmd == 0x30 && frame.size() >= 2) {
+                const size_t pages = nfc_unit_ntag_mem_.size() / 4;
+                const size_t start = frame[1];
+                if (start < pages) {
+                    response.reserve(16);
+                    for (size_t p = start; p < start + 4; ++p) {
+                        if (p < pages) {
+                            response.insert(response.end(), nfc_unit_ntag_mem_.begin() + static_cast<ptrdiff_t>(p * 4),
+                                            nfc_unit_ntag_mem_.begin() + static_cast<ptrdiff_t>(p * 4 + 4));
+                        } else {
+                            response.insert(response.end(), 4, 0x00);
+                        }
+                    }
+                }
+            } else if (cmd == 0x3A && frame.size() >= 3 && frame[1] <= frame[2]) {
+                const size_t pages = nfc_unit_ntag_mem_.size() / 4;
+                const size_t start = frame[1];
+                const size_t end = std::min(static_cast<size_t>(frame[2]), pages > 0 ? pages - 1 : 0);
+                if (start < pages && start <= end) {
+                    const size_t len = (end - start + 1) * 4;
+                    if (len <= 0xFF) {
+                        response.assign(nfc_unit_ntag_mem_.begin() + static_cast<ptrdiff_t>(start * 4),
+                                        nfc_unit_ntag_mem_.begin() + static_cast<ptrdiff_t>(start * 4 + len));
+                    }
+                }
+            } else if (cmd == 0x60 && frame.size() == 1) {
+                response.assign(version, version + sizeof(version));
+            } else if (cmd == 0x3C && frame.size() >= 2 && frame[1] == 0x00) {
+                response.assign(32, 0x00);
+            } else if (cmd == 0x39 && frame.size() >= 2 && frame[1] == 0x02) {
+                response = {static_cast<uint8_t>(counter0 & 0xFF), static_cast<uint8_t>((counter0 >> 8) & 0xFF), static_cast<uint8_t>((counter0 >> 16) & 0xFF)};
+            } else if (cmd == 0x3E && frame.size() >= 2 && frame[1] == 0x02) {
+                response = {kTearing};
+            } else if (cmd == 0xA2 && frame.size() == 6) {
+                const uint8_t page = frame[1];
+                const size_t off = static_cast<size_t>(page) * 4;
+                if (page >= 4 && page <= 39 && off + 4 <= nfc_unit_ntag_mem_.size()) {
+                    std::memcpy(nfc_unit_ntag_mem_.data() + off, frame.data() + 2, 4);
+                    response = {kAck};
+                }
+            } else if (cmd == 0x1B && frame.size() >= 5) {
+                response = {nfc_unit_ntag_mem_[176], nfc_unit_ntag_mem_[177]};
+            }
+            if (response.empty()) response = {kNak};
+
+            {
+                bool tx_ok = false;
+                I2cGroveNfcDevice *tx_dev = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    tx_dev = i2c_device_.get();
+                }
+                if (tx_dev && tx_dev->is_open() && tx_dev->is_nfc_unit()) {
+                    tx_ok = tx_dev->nfcunit_send_listener_frame(response.data(), static_cast<uint8_t>(response.size()));
+                    if (!tx_ok && !nfc_unit_emu_cancel_.load()) {
+                        NfcHexLog::get().log_event("NFC-I2C", "NTAG tx failed, auto-restart listener");
+                        tx_dev->nfcunit_stop_listener();
+                        if (tx_dev->nfcunit_start_listener_a(uid, 0x0044, 0x00)) {
+                            NfcHexLog::get().log_event("NFC-I2C", "NTAG listener restarted");
+                        } else {
+                            NfcHexLog::get().log_event("NFC-I2C", "NTAG listener restart failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void nfcunit_felica_worker()
+    {
+        while (!nfc_unit_emu_cancel_.load()) {
+            std::vector<uint8_t> frame;
+            bool got = false;
+            I2cGroveNfcDevice *dev = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                dev = i2c_device_.get();
+            }
+            if (dev && dev->is_open() && dev->is_nfc_unit()) {
+                got = dev->nfcunit_poll_listener_frame(frame, 20);
+            }
+            if (!got || frame.size() < 2) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            const uint8_t cmd = frame[1];
+            if (cmd != 0x06 && cmd != 0x08) {
+                continue;
+            }
+            push_log(cmd == 0x06 ? "[NFCUnit] NFC-F read request received" : "[NFCUnit] NFC-F write request received");
+        }
+    }
+
     bool open_transport_locked(const TransportEndpoint &endpoint, std::string *error)
     {
         if (transport_) {
@@ -3075,23 +4092,27 @@ private:
         TransportEndpoint endpoint;
         DeviceKind device_kind = DeviceKind::Unknown;
         INfcTransport *transport_raw = nullptr;
+        I2cGroveNfcDevice *i2c_dev = nullptr;
+        bool use_i2c_path = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             endpoint    = connection_.endpoint;
             device_kind = connection_.device_kind;
             transport_raw = transport_.get();
+            i2c_dev = i2c_device_.get();
+            use_i2c_path = (i2c_dev && i2c_dev->is_open() &&
+                            (endpoint.kind == TransportKind::I2cBus ||
+                             device_kind == DeviceKind::NFCUnit ||
+                             device_kind == DeviceKind::GroveNFC));
         }
 
         SavedRecord record;
         std::string error;
         bool success = false;
 
-        if (endpoint.kind == TransportKind::I2cBus) {
-            I2cGroveNfcDevice *dev = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                dev = i2c_device_.get();
-            }
+        if (use_i2c_path) {
+            NfcHexLog::get().log_event("scan", "path i2c");
+            I2cGroveNfcDevice *dev = i2c_dev;
             if (!dev || !dev->is_open()) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 scan_.running = false;
@@ -3099,8 +4120,35 @@ private:
                 scan_.error = "No I2C device";
                 return;
             }
+            if (dev->is_nfc_unit()) {
+                push_log("> Reset NFC Unit reader...");
+                std::string reset_err;
+                if (!nfcunit_reopen_i2c_for_worker(&reset_err)) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    scan_.running = false;
+                    scan_.status = "I2C reset failed";
+                    scan_.error = reset_err.empty() ? "NFC Unit reset failed" : reset_err;
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    endpoint = connection_.endpoint;
+                    device_kind = connection_.device_kind;
+                    dev = i2c_device_.get();
+                }
+                if (!dev || !dev->is_open()) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    scan_.running = false;
+                    scan_.status = "I2C device not open";
+                    scan_.error = "No I2C device after reset";
+                    return;
+                }
+            }
             push_log("> Scanning I2C NFC...");
             I2cCardInfo card;
+            if (dev->is_nfc_unit()) {
+                dev->nfcunit_stop_listener();
+            }
             const bool card_ok = dev->readCard(card);
             if (card_ok && card.valid) {
                 TagInfo tag;
@@ -3147,7 +4195,16 @@ private:
             scan_.status = success ? "Card found" : "No card";
             scan_.error = error;
             return;
+        } else if (endpoint.kind == TransportKind::I2cBus) {
+            NfcHexLog::get().log_event("scan", "path i2c-missing-device");
+            std::lock_guard<std::mutex> lock(mutex_);
+            scan_.running = false;
+            scan_.status = "I2C device not open";
+            scan_.error = "No I2C device";
+            return;
         }
+
+        NfcHexLog::get().log_event("scan", "path transport");
 
         if (endpoint.kind == TransportKind::Mock) {
             record = build_mock_record(endpoint);
@@ -4067,6 +5124,22 @@ private:
     std::atomic<bool> cancel_hw_upload_{false};
     std::thread hw_mfkey_thread_;
     std::atomic<bool> cancel_hw_mfkey_{false};
+    std::thread nfc_unit_mfkey_sniff_thread_;
+    std::atomic<bool> nfc_unit_mfkey_sniff_cancel_{false};
+    std::atomic<bool> nfc_unit_mfkey_sniff_running_{false};
+    std::thread nfc_unit_emu_start_thread_;
+    std::thread nfc_unit_emu_thread_;
+    std::atomic<bool> nfc_unit_emu_cancel_{false};
+    std::atomic<bool> nfc_unit_emu_running_{false};
+    ProtocolKind nfc_unit_emu_protocol_ = ProtocolKind::Iso14443A;
+    int nfc_unit_emu_profile_ = 0;  // 0=NTAG213, 1=ISO15693
+    std::string nfc_unit_ndef_uri_ = "https://m5stack.com";
+    size_t nfc_unit_ntag_pages_ = kNfcUnitNtag213Pages;
+    std::vector<uint8_t> nfc_unit_ntag_mem_;
+    mutable std::mutex nfc_unit_mfkey_mutex_;
+    std::vector<NfcUnitMfkeyEntry> nfc_unit_mfkey_entries_;
+    std::string mfkey_sniff_uid_hex_ = "A0A1A2A3";
+    uint32_t nfc_unit_mfkey_uid_ = 0xA0A1A2A3;
     std::map<std::pair<ProtocolKind,int>, EmuSlotInfo> emu_slot_cache_;
     bool emu_probe_running_ = false;
     bool emu_dump_running_  = false;
@@ -4075,6 +5148,12 @@ private:
     bool hw_upload_ok_       = false;
     bool hw_mfkey_running_   = false;
     int  hw_mfkey_progress_  = 0;
+    bool nfc_unit_emu_start_running_ = false;
+    bool nfc_unit_emu_start_has_result_ = false;
+    bool nfc_unit_emu_start_ok_ = false;
+    std::string nfc_unit_emu_start_status_;
+    std::string nfc_unit_emu_start_error_;
+    std::string nfc_unit_emu_start_profile_;
     std::vector<MfkeyResult> hw_mfkey_results_;
     std::string emu_probe_error_;
     mutable int scan_mock_counter_ = 0;
@@ -4303,18 +5382,47 @@ private:
         std::this_thread::sleep_for(std::chrono::milliseconds(600));
         NfcHexLog::get().log_event(with_card ? "mfkey64" : "mfkey32v2", "fetching nonce entries");
         INfcTransport *transport_raw = nullptr;
+        DeviceKind kind = DeviceKind::Unknown;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             transport_raw = transport_.get();
+            kind = connection_.device_kind;
         }
-        // Serialize transport access against probe/dump/upload threads
-        std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
-
         std::vector<MfkeyResult> results;
 
-        if (transport_raw && transport_raw->is_open()) {
-            Pn532KillerClient client(transport_raw);
-            const auto entries = client.sniff_get_mfkey_entries(with_card);
+        std::vector<Pn532KillerClient::MfkeyEntry> entries;
+        if (kind == DeviceKind::NFCUnit) {
+            if (with_card) {
+                NfcHexLog::get().log_event("mfkey64", "NFCUnit path supports mfkey32v2 only");
+            } else {
+                std::vector<NfcUnitMfkeyEntry> local_entries;
+                {
+                    std::lock_guard<std::mutex> lk(nfc_unit_mfkey_mutex_);
+                    local_entries = nfc_unit_mfkey_entries_;
+                }
+                for (const auto &e : local_entries) {
+                    Pn532KillerClient::MfkeyEntry pe{};
+                    pe.uid = e.uid;
+                    pe.nt = e.nt;
+                    pe.nr = e.nr;
+                    pe.ar = e.ar;
+                    pe.at = 0;
+                    pe.sector = e.sector;
+                    pe.key_type = e.key_type;
+                    pe.has_at = false;
+                    entries.push_back(pe);
+                }
+            }
+        } else {
+            // Serialize transport access against probe/dump/upload threads
+            std::lock_guard<std::mutex> op_lock(transport_op_mutex_);
+            if (transport_raw && transport_raw->is_open()) {
+                Pn532KillerClient client(transport_raw);
+                entries = client.sniff_get_mfkey_entries(with_card);
+            }
+        }
+
+        if (!entries.empty()) {
             const int total = static_cast<int>(entries.size());
             {
                 char msg[64];
@@ -4380,6 +5488,8 @@ private:
                     hw_mfkey_progress_ = done * 100 / std::max(1, group_count);
                 }
             }
+        } else {
+            NfcHexLog::get().log_event(with_card ? "mfkey64" : "mfkey32v2", "no nonce entries captured");
         }
 
         {

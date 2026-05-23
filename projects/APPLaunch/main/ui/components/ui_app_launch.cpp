@@ -15,11 +15,15 @@
 #include <string>
 #include <functional>
 #include <chrono>
+#include <atomic>
+#include <thread>
+#include <array>
 #include <fstream>
 #include <sstream>
 #include "ui_launch_page.hpp"
 #include "../ui_loading.h"
 #include "page_app.h"
+#include "nfc/nfc_i2c_device.hpp"
 
 /* img_path() now defined in ui_app_page.hpp */
 
@@ -217,6 +221,7 @@ public:
         // 状态栏定时刷新（时间 + 电量），每5秒更新一次
         update_home_status_bar();
         status_timer = lv_timer_create(home_status_timer_cb, 5000, this);
+
     }
 
     void launch_app()

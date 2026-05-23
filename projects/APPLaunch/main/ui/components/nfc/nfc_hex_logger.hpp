@@ -179,20 +179,9 @@ private:
 
     static bool should_suppress_event(const char *tag, const char *msg)
     {
-        if (!msg || !msg[0]) return false;
-
-        // Keep hex-only style in I2C logs: drop timeout text noise globally.
-        if (std::strstr(msg, "timeout") != nullptr) return true;
-
-        if (!tag || !tag[0]) return false;
-
-        // For NFC Unit magic detection path, keep hex RX/TX only.
-        const bool i2c_magic_tag = (std::strcmp(tag, "NFC-I2C") == 0) ||
-                                   (std::strcmp(tag, "GEN3") == 0);
-        if (i2c_magic_tag) {
-            return true;
-        }
-
+        (void)tag;
+        (void)msg;
+        // Keep all event logs so READ path debugging can see each NFC-I2C step.
         return false;
     }
 

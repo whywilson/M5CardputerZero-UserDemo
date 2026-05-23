@@ -162,6 +162,9 @@ public:
     void close()
     {
         if (fd_ >= 0) {
+            if (is_nfc_unit()) {
+                nfcunit_stop_listener();
+            }
             stopRF();
             ::close(fd_);
             fd_ = -1;
@@ -739,6 +742,230 @@ public:
         return writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
     }
 
+    // ── NFC Unit (ST25R3916) listener-mode emulation helpers ───────────────
+
+    // Start NFC-A listener mode using ST25R3916 passive target memory.
+    // uid size must be 4 or 7 bytes.
+    bool nfcunit_start_listener_a(const std::vector<uint8_t> &uid, uint16_t atqa, uint8_t sak)
+    {
+        if (!is_open() || !is_nfc_unit()) return false;
+        if (!(uid.size() == 4 || uid.size() == 7)) return false;
+
+        nfcunit_stop_listener();
+
+        // Match M5Unit-NFC behavior: touch NFC-V mode once before NFC-A emulation
+        // to avoid stale internal state on some firmware/board combinations.
+        (void)writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
+        delay_ms(3);
+        (void)writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_ISO15);
+        delay_ms(3);
+        (void)writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
+        delay_ms(3);
+
+        // Configure target NFC-A listener mode close to upstream M5Unit-NFC
+        // sequence to keep IRQ/state transitions consistent.
+        st25r_cmd(0xD6);  // ADJUST_REGULATORS
+        delay_ms(5);
+
+        // Upstream default passive-target definition for NFC-A emulation.
+        if (!st25r_write_reg(0x08, 0x5C)) return false;
+
+        // External field detector thresholds + auto mode (required for I_eon).
+        if (!st25r_write_reg(0x2A, 0x13)) return false;
+        if (!st25r_write_reg(0x2B, 0x02)) return false;
+        if (!st25r_change_bits(0x02, 0x03, 0x00)) return false;
+        if (!st25r_write_reg(0x29, 0x5F)) return false;       // passive target modulation
+        (void)st25r_write_spaceb(0x05, 0x40);                 // EMD suppression start on first bits
+
+        // Disable GPT trigger source and set MRT step to 512/fc.
+        if (!st25r_change_bits(0x12, 0x00, 0xE0)) return false;
+        if (!st25r_change_bits(0x12, 0x08, 0x00)) return false;
+        if (!st25r_write_reg(0x0F, 0x04)) return false;  // ~100us mask-receive timer (ceil + clamp)
+
+        // 14443-A parity on, NFC-F off.
+        if (!st25r_change_bits(0x05, 0x00, 0xE0)) return false;
+
+        // Match M5Unit-NFC listener defaults.
+        st25r_write_reg(0x26, 0x00);
+        st25r_write_reg(0x27, 0xFF);
+        st25r_write_spaceb(0x30, 0x00);
+        st25r_write_spaceb(0x31, 0x00);
+        st25r_write_spaceb(0x32, 0x00);
+        st25r_write_spaceb(0x33, 0x00);
+
+        uint8_t pt_mem_a[15] = {0};
+        std::memcpy(pt_mem_a, uid.data(), uid.size());
+        pt_mem_a[10] = static_cast<uint8_t>(atqa & 0xFF);
+        pt_mem_a[11] = static_cast<uint8_t>((atqa >> 8) & 0xFF);
+        pt_mem_a[12] = (uid.size() == 4)
+                         ? static_cast<uint8_t>(sak & static_cast<uint8_t>(~0x04))
+                         : static_cast<uint8_t>(sak | 0x04);
+        pt_mem_a[13] = static_cast<uint8_t>(sak & static_cast<uint8_t>(~0x04));
+        pt_mem_a[14] = static_cast<uint8_t>(sak & static_cast<uint8_t>(~0x04));
+
+        // UID length bit in AUX(0x0A): uid_7=0x10, uid_4=0x00 (mask 0x30).
+        const uint8_t uid_bits = (uid.size() == 7) ? 0x10 : 0x00;
+        if (!st25r_change_bits(0x0A, uid_bits, static_cast<uint8_t>(0x30 & ~uid_bits))) return false;
+        if (!st25r_write_pt_memory_a(pt_mem_a, sizeof(pt_mem_a))) return false;
+
+        st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
+
+        nfcunit_listener_running_ = true;
+        nfcunit_listener_target_active_ = false;
+        nfcunit_listener_wakeup_ = false;
+        nfcunit_listener_data_flag_ = false;
+        nfcunit_listener_active_idle_ticks_ = 0;
+        nfcunit_listener_bitrate_ = 0xFF;
+        nfcunit_listener_irq_latch_ = 0;
+        nfcunit_listener_mode_f_ = false;
+
+        return nfcunit_listener_enter_off();
+    }
+
+    bool nfcunit_start_listener_f(const uint8_t idm[8], const uint8_t pmm[8], uint16_t system_code)
+    {
+        if (!is_open() || !is_nfc_unit() || !idm || !pmm) return false;
+
+        nfcunit_stop_listener();
+
+        (void)writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
+        delay_ms(3);
+        (void)writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_ISO15);
+        delay_ms(3);
+        (void)writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
+        delay_ms(3);
+
+        st25r_cmd(0xD6);  // ADJUST_REGULATORS
+        delay_ms(5);
+
+        uint8_t pt_mem_f[21] = {0};
+        pt_mem_f[0] = static_cast<uint8_t>((system_code >> 8) & 0xFF);
+        pt_mem_f[1] = static_cast<uint8_t>(system_code & 0xFF);
+        pt_mem_f[2] = 0x01;  // SENSF_RES response code
+        std::memcpy(pt_mem_f + 3, idm, 8);
+        std::memcpy(pt_mem_f + 11, pmm, 8);
+        if (!st25r_write_pt_memory_f(pt_mem_f, sizeof(pt_mem_f))) return false;
+
+        uint8_t tsn[12] = {0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x01, 0x23, 0x45, 0x67};
+        if (!st25r_write_pt_memory_tsn(tsn, sizeof(tsn))) return false;
+
+        // Auto response only for NFC-F: set d_ac_ap2p|d_106_ac_a, clear d_212_424_1r.
+        if (!st25r_change_bits(0x08, 0x09, 0x04)) return false;
+        if (!st25r_change_bits(0x12, 0x00, 0xE0)) return false;
+        if (!st25r_change_bits(0x12, 0x08, 0x00)) return false;
+        if (!st25r_write_reg(0x0F, 0x04)) return false;
+        if (!st25r_change_bits(0x05, 0x00, 0xE0)) return false;
+
+        st25r_write_reg(0x26, 0x00);
+        st25r_write_reg(0x27, 0xFF);
+        st25r_write_spaceb(0x30, 0x00);
+        st25r_write_spaceb(0x31, 0x00);
+        st25r_write_spaceb(0x32, 0x00);
+        st25r_write_spaceb(0x33, 0x00);
+        st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
+
+        nfcunit_listener_running_ = true;
+        nfcunit_listener_target_active_ = false;
+        nfcunit_listener_wakeup_ = false;
+        nfcunit_listener_data_flag_ = false;
+        nfcunit_listener_active_idle_ticks_ = 0;
+        nfcunit_listener_bitrate_ = 0xFF;
+        nfcunit_listener_irq_latch_ = 0;
+        nfcunit_listener_mode_f_ = true;
+
+        return nfcunit_listener_enter_off();
+    }
+
+    bool nfcunit_stop_listener()
+    {
+        if (!is_open() || !is_nfc_unit()) return false;
+        nfcunit_listener_running_ = false;
+        nfcunit_listener_target_active_ = false;
+        nfcunit_listener_wakeup_ = false;
+        nfcunit_listener_data_flag_ = false;
+        nfcunit_listener_active_idle_ticks_ = 0;
+        nfcunit_listener_bitrate_ = 0xFF;
+        nfcunit_listener_irq_latch_ = 0;
+        nfcunit_listener_mode_f_ = false;
+        nfcunit_listener_state_ = NfcUnitListenerState::Off;
+
+        st25r_cmd(0xC2);               // STOP_ALL_ACTIVITIES
+        st25r_change_bits(0x08, 0x0D, 0x00);  // restore passive-target defaults
+        st25r_write_reg(0x03, 0x00);          // mode off
+        st25r_write_reg(0x02, 0x80);          // oscillator on, RF off
+        st25r_cmd(0xD0);               // MASK_RECEIVE_DATA
+        st25r_cmd(0xDB);               // CLEAR_FIFO
+        st25r_clear_irq_regs();
+        return true;
+    }
+
+    bool nfcunit_listener_running() const
+    {
+        return nfcunit_listener_running_;
+    }
+
+    // Poll one listener frame. Returns true when a frame is received.
+    // Output frame excludes trailing CRC_A bytes when present.
+    bool nfcunit_poll_listener_frame(std::vector<uint8_t> &frame, int timeout_ms = 20)
+    {
+        frame.clear();
+        if (!is_open() || !is_nfc_unit() || !nfcunit_listener_running_) return false;
+
+        const auto start = std::chrono::steady_clock::now();
+        while (true) {
+            const NfcUnitListenerState state_before = nfcunit_listener_state_;
+            switch (nfcunit_listener_state_) {
+            case NfcUnitListenerState::Off:
+                nfcunit_listener_update_off();
+                break;
+            case NfcUnitListenerState::Idle:
+                nfcunit_listener_update_idle(frame);
+                break;
+            case NfcUnitListenerState::Ready:
+                nfcunit_listener_update_ready();
+                break;
+            case NfcUnitListenerState::Active:
+                if (nfcunit_listener_update_active(frame)) return true;
+                break;
+            case NfcUnitListenerState::Halt:
+                nfcunit_listener_update_halt();
+                break;
+            }
+
+            if (!frame.empty()) return true;
+
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed >= timeout_ms) break;
+            if (nfcunit_listener_state_ != state_before ||
+                nfcunit_listener_state_ == NfcUnitListenerState::Ready ||
+                nfcunit_listener_state_ == NfcUnitListenerState::Active) {
+                continue;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        return false;
+    }
+
+    // Send one listener response frame with CRC auto-appended by ST25R3916.
+    bool nfcunit_send_listener_frame(const uint8_t *tx, uint8_t tx_len)
+    {
+        if (!is_open() || !is_nfc_unit() || !nfcunit_listener_running_) return false;
+        if (nfcunit_listener_state_ != NfcUnitListenerState::Active) return false;
+        if (!tx || tx_len == 0) return false;
+
+        st25r_cmd(0xDB);  // CLEAR_FIFO
+        if (!st25r_fifo_write(tx, tx_len)) return false;
+        st25r_set_ntx(tx_len, 0);
+        {
+            uint8_t dummy = 0;
+            st25r_read_reg(0x1A, dummy);
+        }
+        if (!st25r_cmd(0xC4)) return false;  // TRANSMIT_WITH_CRC
+        (void)st25r_wait_irq(0x08, 25);      // TXE best effort
+        return true;
+    }
+
     // ── Slot selection (GroveNFC / NFC Unit) ─────────────────────────────────
 
     bool setSlot(uint8_t slot_index)
@@ -814,9 +1041,27 @@ public:
     }
 
 private:
+    enum class NfcUnitListenerState {
+        Off,
+        Idle,
+        Ready,
+        Active,
+        Halt,
+    };
+
     int      fd_   = -1;
     uint8_t  addr_ = 0;
     std::string bus_path_;
+    bool nfcunit_listener_running_ = false;
+    bool nfcunit_listener_target_active_ = false;
+    bool nfcunit_listener_wakeup_ = false;
+    bool nfcunit_listener_data_flag_ = false;
+    bool nfcunit_listener_mode_f_ = false;
+    uint16_t nfcunit_listener_active_idle_ticks_ = 0;
+    uint8_t nfcunit_listener_bitrate_ = 0xFF;  // 0:106, 1:212, 2:424, 0xFF:invalid
+    uint32_t nfcunit_listener_irq_latch_ = 0;
+    uint32_t nfcunit_listener_irq_mask_ = 0xFFFFFFFFu;
+    NfcUnitListenerState nfcunit_listener_state_ = NfcUnitListenerState::Off;
 
     // ── ST25R3916B I2C protocol helpers (M5 NFC Unit at 0x50) ────────────────
     //
@@ -890,6 +1135,545 @@ private:
         uint16_t v = ((bytes_count & 0x1FF) << 3) | (last_bits & 0x07);
         st25r_write_reg(0x22, (uint8_t)((v >> 8) & 0xFF));
         st25r_write_reg(0x23, (uint8_t)(v & 0xFF));
+    }
+
+    bool st25r_write_pt_memory_a(const uint8_t *data, uint8_t len)
+    {
+        if (!data || len == 0 || len > 15) return false;
+        std::vector<uint8_t> buf;
+        buf.reserve(static_cast<size_t>(len) + 1);
+        buf.push_back(0xA0);  // OP_LOAD_PT_MEMORY_A_CONFIG
+        buf.insert(buf.end(), data, data + len);
+        return ::write(fd_, buf.data(), buf.size()) == static_cast<ssize_t>(buf.size());
+    }
+
+    bool st25r_write_pt_memory_f(const uint8_t *data, uint8_t len)
+    {
+        if (!data || len == 0 || len > 21) return false;
+        std::vector<uint8_t> buf;
+        buf.reserve(static_cast<size_t>(len) + 1);
+        buf.push_back(0xA8);  // OP_LOAD_PT_MEMORY_F_CONFIG
+        buf.insert(buf.end(), data, data + len);
+        return ::write(fd_, buf.data(), buf.size()) == static_cast<ssize_t>(buf.size());
+    }
+
+    bool st25r_write_pt_memory_tsn(const uint8_t *data, uint8_t len)
+    {
+        if (!data || len == 0 || len > 12) return false;
+        std::vector<uint8_t> buf;
+        buf.reserve(static_cast<size_t>(len) + 1);
+        buf.push_back(0xAC);  // OP_LOAD_PT_MEMORY_TSN_DATA
+        buf.insert(buf.end(), data, data + len);
+        return ::write(fd_, buf.data(), buf.size()) == static_cast<ssize_t>(buf.size());
+    }
+
+    bool st25r_change_bits(uint8_t reg, uint8_t set_mask, uint8_t clear_mask)
+    {
+        uint8_t v = 0;
+        if (!st25r_read_reg(reg, v)) return false;
+        v = static_cast<uint8_t>((v | set_mask) & static_cast<uint8_t>(~clear_mask));
+        return st25r_write_reg(reg, v);
+    }
+
+    uint32_t st25r_read_irq32()
+    {
+        uint8_t m = 0, t = 0, e = 0, p = 0;
+        if (!st25r_read_reg(0x1A, m)) return 0;
+        if (!st25r_read_reg(0x1B, t)) return 0;
+        if (!st25r_read_reg(0x1C, e)) return 0;
+        if (!st25r_read_reg(0x1D, p)) return 0;
+        uint32_t irq32 = 0;
+        irq32 |= static_cast<uint32_t>(m) << 24;
+        irq32 |= static_cast<uint32_t>(t) << 16;
+        irq32 |= static_cast<uint32_t>(e) << 8;
+        irq32 |= static_cast<uint32_t>(p);
+        return irq32;
+    }
+
+    static constexpr uint32_t ST25R_I_OSC32     = (0x80u << 24);
+    static constexpr uint32_t ST25R_I_RXS32     = (0x20u << 24);
+    static constexpr uint32_t ST25R_I_RXE32     = (0x10u << 24);
+    static constexpr uint32_t ST25R_I_EON32     = (0x10u << 16);
+    static constexpr uint32_t ST25R_I_EOF32     = (0x08u << 16);
+    static constexpr uint32_t ST25R_I_NFCT32    = (0x01u << 16);
+    static constexpr uint32_t ST25R_I_CRC32     = (0x80u << 8);
+    static constexpr uint32_t ST25R_I_PAR32     = (0x40u << 8);
+    static constexpr uint32_t ST25R_I_ERR232    = (0x20u << 8);
+    static constexpr uint32_t ST25R_I_ERR132    = (0x10u << 8);
+    static constexpr uint32_t ST25R_I_RXE_PTA32 = 0x10u;
+    static constexpr uint32_t ST25R_I_WU_F32    = 0x08u;
+    static constexpr uint32_t ST25R_I_WU_AX32   = 0x02u;
+    static constexpr uint32_t ST25R_I_WU_A32    = 0x01u;
+
+    static constexpr uint8_t ST25R_MODE_BITRATE_DETECTION = 0xC8;  // targ | (0x09 << 3)
+    static constexpr uint8_t ST25R_MODE_LISTEN_NFCA       = 0x88;  // targ | (0x01 << 3)
+
+    static constexpr uint32_t ST25R_LISTENER_MODE_IRQ = ST25R_I_WU_A32 | ST25R_I_WU_AX32 | ST25R_I_WU_F32 | ST25R_I_RXE_PTA32;
+    static constexpr uint32_t ST25R_LISTENER_DEFAULT_IRQ =
+        ST25R_I_NFCT32 | ST25R_I_RXS32 | ST25R_I_EON32 | ST25R_I_EOF32 |
+        ST25R_I_CRC32 | ST25R_I_ERR132 | ST25R_I_ERR232 | ST25R_I_PAR32;
+
+    void nfcunit_listener_trace(const char *label, uint32_t detail = 0xFFFFFFFFu)
+    {
+        if (detail == 0xFFFFFFFFu) {
+            std::fprintf(stderr, "[NFC-EMU] %s\n", label);
+        } else {
+            std::fprintf(stderr, "[NFC-EMU] %s 0x%08X\n", label, detail);
+        }
+    }
+
+    void nfcunit_listener_trace_bytes(const char *label, const uint8_t *data, size_t len, size_t max_show = 24)
+    {
+        std::fprintf(stderr, "[NFC-EMU] %s len=%zu", label, len);
+        const size_t show = std::min(len, max_show);
+        for (size_t i = 0; i < show; ++i) {
+            std::fprintf(stderr, " %02X", data[i]);
+        }
+        if (len > show) {
+            std::fprintf(stderr, " ...");
+        }
+        std::fprintf(stderr, "\n");
+    }
+
+    bool st25r_read_mask_interrupts(uint32_t &value)
+    {
+        uint8_t main = 0, timer = 0, err = 0, pta = 0;
+        if (!st25r_read_reg(0x16, main)) return false;
+        if (!st25r_read_reg(0x17, timer)) return false;
+        if (!st25r_read_reg(0x18, err)) return false;
+        if (!st25r_read_reg(0x19, pta)) return false;
+        value = (static_cast<uint32_t>(main) << 24) |
+                (static_cast<uint32_t>(timer) << 16) |
+                (static_cast<uint32_t>(err) << 8) |
+                static_cast<uint32_t>(pta);
+        return true;
+    }
+
+    bool st25r_write_mask_interrupts(uint32_t value)
+    {
+        const bool ok = st25r_write_reg(0x16, static_cast<uint8_t>((value >> 24) & 0xFF)) &&
+                        st25r_write_reg(0x17, static_cast<uint8_t>((value >> 16) & 0xFF)) &&
+                        st25r_write_reg(0x18, static_cast<uint8_t>((value >> 8) & 0xFF)) &&
+                        st25r_write_reg(0x19, static_cast<uint8_t>(value & 0xFF));
+        if (ok) nfcunit_listener_irq_mask_ = value;
+        return ok;
+    }
+
+    bool st25r_enable_interrupts(uint32_t mask_bits)
+    {
+        uint32_t current = nfcunit_listener_irq_mask_;
+        if (current == 0xFFFFFFFFu) {
+            (void)st25r_read_mask_interrupts(current);
+        }
+        return st25r_write_mask_interrupts(current & ~mask_bits);
+    }
+
+    bool st25r_disable_interrupts(uint32_t mask_bits)
+    {
+        uint32_t current = nfcunit_listener_irq_mask_;
+        if (current == 0xFFFFFFFFu) {
+            (void)st25r_read_mask_interrupts(current);
+        }
+        return st25r_write_mask_interrupts(current | mask_bits);
+    }
+
+    uint32_t nfcunit_listener_take_irq(uint32_t mask_bits)
+    {
+        const uint32_t latest = st25r_read_irq32();
+        if (latest) nfcunit_listener_irq_latch_ |= latest;
+
+        const uint32_t hit = nfcunit_listener_irq_latch_ & mask_bits;
+        if (hit) {
+            nfcunit_listener_irq_latch_ &= ~hit;
+        }
+        return hit;
+    }
+
+    bool nfcunit_listener_is_extra_field()
+    {
+        uint8_t v = 0;
+        return st25r_read_reg(0x31, v) && ((v & 0x40u) != 0);
+    }
+
+    bool nfcunit_listener_enter_off()
+    {
+        if (!is_open() || !is_nfc_unit()) return false;
+
+        nfcunit_listener_trace("state -> OFF");
+
+        nfcunit_listener_state_ = NfcUnitListenerState::Off;
+        nfcunit_listener_target_active_ = false;
+        nfcunit_listener_wakeup_ = false;
+        nfcunit_listener_data_flag_ = false;
+        nfcunit_listener_active_idle_ticks_ = 0;
+        nfcunit_listener_bitrate_ = 0xFF;
+
+        st25r_cmd(0xC2);  // CMD_STOP_ALL_ACTIVITIES
+        st25r_change_bits(0x02, 0x03, 0x00);  // enable external field detector auto mode
+        st25r_change_bits(0x02, 0x40, 0x00);  // set rx_en
+
+        if (nfcunit_listener_mode_f_) {
+            st25r_change_bits(0x08, 0x09, 0x04);  // Enable auto response for NFC-F only
+        } else {
+            st25r_change_bits(0x08, 0x00, 0x01);  // Enable auto response for NFC-A
+        }
+        st25r_cmd(0xCD);                      // CMD_GO_TO_SENSE
+        st25r_change_bits(0x05, 0x00, 0x20);  // clear nfc_f0
+
+        st25r_write_mask_interrupts(0xFFFFFFFFu);
+        st25r_clear_irq_regs();
+        st25r_enable_interrupts(ST25R_I_OSC32 | ST25R_LISTENER_DEFAULT_IRQ | ST25R_LISTENER_MODE_IRQ);
+
+        st25r_change_bits(0x0A, 0x80, 0x00);  // set no_crc_rx
+        st25r_change_bits(0x03, nfcunit_listener_mode_f_ ? 0xE0 : 0xC8,
+                  nfcunit_listener_mode_f_ ? 0x18 : 0x30);
+
+        if (nfcunit_listener_is_extra_field()) {
+            return nfcunit_listener_enter_idle();
+        }
+        // Keep oscillator/RX on to avoid missing short reader polling bursts.
+        st25r_change_bits(0x02, 0xC0, 0x00);
+        return true;
+    }
+
+    bool nfcunit_listener_enter_idle()
+    {
+        if (!is_open() || !is_nfc_unit()) return false;
+
+        nfcunit_listener_trace("state -> IDLE");
+
+        uint8_t op = 0;
+        uint8_t aux = 0;
+        nfcunit_listener_state_ = NfcUnitListenerState::Idle;
+        nfcunit_listener_target_active_ = false;
+        nfcunit_listener_data_flag_ = false;
+        nfcunit_listener_active_idle_ticks_ = 0;
+
+        if (st25r_read_reg(0x02, op) && ((op & 0x80u) == 0)) {
+            st25r_change_bits(0x02, 0xC0, 0x00);  // set en|rx_en
+            if (st25r_read_reg(0x31, aux) && ((aux & 0x10u) == 0)) {
+                if ((st25r_wait_irq(0x80, 1000) & 0x80u) == 0) {
+                    return nfcunit_listener_enter_off();
+                }
+            }
+        } else {
+            (void)nfcunit_listener_take_irq(ST25R_I_OSC32);
+        }
+
+        st25r_change_bits(0x0A, 0x80, 0x00);  // set no_crc_rx
+
+        if (nfcunit_listener_mode_f_) {
+            st25r_change_bits(0x08, 0x09, 0x04);  // Enable auto response for NFC-F only
+        } else {
+            st25r_change_bits(0x08, 0x00, 0x01);  // Enable auto response for NFC-A
+        }
+        st25r_cmd(0xCD);                      // GO_TO_SENSE
+
+        st25r_cmd(0xDB);  // CLEAR_FIFO
+        st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
+
+        nfcunit_listener_wakeup_ = false;
+        return true;
+    }
+
+    bool nfcunit_listener_enter_ready()
+    {
+        if (!is_open() || !is_nfc_unit()) return false;
+
+        nfcunit_listener_trace("state -> READY");
+
+        nfcunit_listener_state_ = NfcUnitListenerState::Ready;
+        nfcunit_listener_data_flag_ = false;
+        nfcunit_listener_target_active_ = false;
+
+        if (nfcunit_listener_take_irq(ST25R_I_EOF32)) {
+            return nfcunit_listener_enter_off();
+        }
+
+        st25r_change_bits(0x0A, 0x00, 0x80);  // clear no_crc_rx
+        if (nfcunit_listener_bitrate_ <= 2) {
+            const uint8_t br = nfcunit_listener_bitrate_ & 0x03u;
+            st25r_write_reg(0x04, static_cast<uint8_t>((br << 4) | br));
+        }
+        st25r_change_bits(0x02, 0x00, 0x04);  // clear wakeup bit
+        st25r_write_reg(0x03, nfcunit_listener_mode_f_ ? 0xA0 : ST25R_MODE_LISTEN_NFCA);
+        return true;
+    }
+
+    bool nfcunit_listener_enter_active()
+    {
+        if (!is_open() || !is_nfc_unit()) return false;
+
+        nfcunit_listener_trace("state -> ACTIVE");
+
+        nfcunit_listener_state_ = NfcUnitListenerState::Active;
+        nfcunit_listener_target_active_ = true;
+        nfcunit_listener_data_flag_ = false;
+        nfcunit_listener_active_idle_ticks_ = 0;
+
+        if (nfcunit_listener_mode_f_) {
+            st25r_change_bits(0x08, 0x04, 0x09);  // Disable NFC-F auto response
+        } else {
+            st25r_change_bits(0x08, 0x01, 0x00);  // Disable auto response for NFC-A
+        }
+        (void)nfcunit_listener_take_irq(ST25R_I_PAR32 | ST25R_I_CRC32 | ST25R_I_ERR232 | ST25R_I_ERR132);
+        st25r_enable_interrupts(ST25R_I_RXE32);
+        return true;
+    }
+
+    bool nfcunit_listener_enter_halt()
+    {
+        if (!is_open() || !is_nfc_unit()) return false;
+
+        nfcunit_listener_trace("state -> HALT");
+
+        nfcunit_listener_state_ = NfcUnitListenerState::Halt;
+        nfcunit_listener_target_active_ = false;
+        nfcunit_listener_data_flag_ = false;
+        nfcunit_listener_active_idle_ticks_ = 0;
+
+        if (nfcunit_listener_mode_f_) {
+            st25r_change_bits(0x08, 0x09, 0x04);  // Enable auto response for NFC-F only
+        } else {
+            st25r_change_bits(0x08, 0x00, 0x01);  // Enable auto response for NFC-A
+        }
+        st25r_cmd(0xCE);                      // GO_TO_SLEEP
+        st25r_change_bits(0x03, nfcunit_listener_mode_f_ ? 0xE0 : 0xC8,
+                          nfcunit_listener_mode_f_ ? 0x18 : 0x30);
+        st25r_change_bits(0x05, 0x00, 0x20);  // clear nfc_f0
+        st25r_cmd(0xD1);                      // UNMASK_RECEIVE_DATA
+        st25r_write_mask_interrupts(0xFFFFFFFFu);
+        st25r_enable_interrupts(ST25R_LISTENER_DEFAULT_IRQ | ST25R_LISTENER_MODE_IRQ);
+
+        if (!nfcunit_listener_is_extra_field()) {
+            return nfcunit_listener_enter_off();
+        }
+        return true;
+    }
+
+    bool nfcunit_listener_update_off()
+    {
+        if (nfcunit_listener_take_irq(ST25R_I_EON32) & ST25R_I_EON32) {
+            nfcunit_listener_trace("irq EON");
+            return nfcunit_listener_enter_idle();
+        }
+        return true;
+    }
+
+    bool nfcunit_listener_update_idle(std::vector<uint8_t> &frame)
+    {
+        frame.clear();
+        const uint32_t mode_wake = nfcunit_listener_mode_f_ ? ST25R_I_WU_F32 : ST25R_I_RXE_PTA32;
+        uint32_t irq32 = nfcunit_listener_take_irq(ST25R_I_NFCT32 | ST25R_I_RXE32 | ST25R_I_EOF32 | mode_wake);
+        if (!irq32) return true;
+        nfcunit_listener_trace("idle irq", irq32);
+
+        if (irq32 & ST25R_I_NFCT32) {
+            uint8_t br = 0;
+            if (st25r_read_reg(0x24, br)) {
+                br = static_cast<uint8_t>((br >> 4) & 0x03);
+                if (br > 2) br = 2;
+                nfcunit_listener_bitrate_ = br;
+                nfcunit_listener_trace("irq NFCT bitrate", static_cast<uint32_t>(br));
+            }
+        }
+
+        if ((irq32 & ST25R_I_EOF32) && !nfcunit_listener_data_flag_) {
+            uint16_t fifo_cnt = 0;
+            if (st25r_read_fifo_count(fifo_cnt) && fifo_cnt > 0) {
+                uint8_t raw[16] = {0};
+                const uint16_t to_read = std::min<uint16_t>(fifo_cnt, sizeof(raw));
+                if (st25r_fifo_read(raw, static_cast<uint8_t>(to_read))) {
+                    nfcunit_listener_trace_bytes("idle eof raw", raw, to_read);
+                    if ((to_read > 0) && (raw[0] == 0x26u || raw[0] == 0x52u)) {
+                        nfcunit_listener_bitrate_ = 0;
+                        nfcunit_listener_trace("idle short poll", raw[0]);
+                        st25r_cmd(0xDB);  // CLEAR_FIFO
+                        st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
+                        return nfcunit_listener_enter_ready();
+                    }
+
+                    // Some readers send anti-collision/select frames directly after short poll.
+                    // Keep those frames and hand them to the upper emulation worker immediately.
+                    if (to_read > 0) {
+                        const uint16_t use_len = (to_read > 2) ? static_cast<uint16_t>(to_read - 2) : to_read;
+                        if (use_len > 0) {
+                            frame.assign(raw, raw + use_len);
+                            nfcunit_listener_data_flag_ = true;
+                            nfcunit_listener_trace("idle eof frame", use_len);
+                            st25r_cmd(0xDB);  // CLEAR_FIFO
+                            st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
+                            (void)nfcunit_listener_enter_active();
+                            return true;
+                        }
+                    }
+                }
+            }
+            // Keep listener alive for follow-up frames (e.g. anti-collision/select)
+            // instead of resetting to OFF on every EOF.
+            st25r_cmd(0xDB);  // CLEAR_FIFO
+            st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
+            nfcunit_listener_trace("idle eof -> keep");
+            return true;
+        }
+
+        if ((irq32 & ST25R_I_RXE32) && nfcunit_listener_bitrate_ != 0xFF) {
+            irq32 |= nfcunit_listener_take_irq(ST25R_I_RXE32 | ST25R_I_EOF32 | ST25R_I_CRC32 | ST25R_I_PAR32 |
+                                               ST25R_I_ERR232 | ST25R_I_ERR132);
+            const uint32_t err_bits = irq32 & (ST25R_I_CRC32 | ST25R_I_PAR32 | ST25R_I_ERR132 | ST25R_I_ERR232);
+            if (err_bits) {
+                nfcunit_listener_trace("idle err bits", err_bits);
+            }
+            if (irq32 & (ST25R_I_CRC32 | ST25R_I_PAR32 | ST25R_I_ERR132)) {
+                st25r_cmd(0xDB);  // CLEAR_FIFO
+                st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
+                st25r_change_bits(0x02, 0x00, 0x08);  // clear tx_en
+                return true;
+            }
+
+            uint16_t fifo_cnt = 0;
+            if (!st25r_read_fifo_count(fifo_cnt)) {
+                nfcunit_listener_trace("idle fifo read failed");
+            } else {
+                nfcunit_listener_trace("idle fifo cnt", fifo_cnt);
+            }
+            if (fifo_cnt > 0) {
+                uint8_t raw[96] = {0};
+                const uint16_t to_read = std::min<uint16_t>(fifo_cnt, sizeof(raw));
+                if (st25r_fifo_read(raw, static_cast<uint8_t>(to_read))) {
+                    nfcunit_listener_trace_bytes("idle fifo raw", raw, to_read);
+                    const uint16_t use_len = (to_read > 2) ? static_cast<uint16_t>(to_read - 2) : to_read;
+                    nfcunit_listener_data_flag_ = (use_len > 0);
+                } else {
+                    nfcunit_listener_trace("idle fifo read op failed", to_read);
+                }
+            }
+        }
+
+        if (nfcunit_listener_mode_f_ && (irq32 & ST25R_I_WU_F32) && nfcunit_listener_bitrate_ != 0xFF) {
+            return nfcunit_listener_enter_ready();
+        }
+
+        if (!nfcunit_listener_mode_f_ && (irq32 & ST25R_I_RXE_PTA32) && nfcunit_listener_bitrate_ == 0) {
+            uint8_t pta = 0;
+            if (st25r_read_reg(0x21, pta)) {
+                nfcunit_listener_trace("idle pta", pta);
+                if ((pta & 0x0Fu) > 0x01u) {
+                    return nfcunit_listener_enter_ready();
+                }
+            }
+        }
+
+        return true;
+    }
+
+    bool nfcunit_listener_update_ready()
+    {
+        const uint32_t wake_irq = nfcunit_listener_mode_f_ ? ST25R_I_WU_F32 :
+                      (nfcunit_listener_wakeup_ ? ST25R_I_WU_AX32 : ST25R_I_WU_A32);
+        uint32_t irq32 = nfcunit_listener_take_irq(ST25R_I_EOF32 | wake_irq);
+        if (!irq32) return true;
+
+        if (irq32 & ST25R_I_EOF32) {
+            st25r_cmd(0xDB);  // CLEAR_FIFO
+            st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
+            nfcunit_listener_trace("ready eof -> idle");
+            return nfcunit_listener_enter_idle();
+        }
+        if (irq32 & (ST25R_I_WU_A32 | ST25R_I_WU_AX32 | ST25R_I_WU_F32)) {
+            nfcunit_listener_trace("irq WAKE", irq32);
+            return nfcunit_listener_enter_active();
+        }
+        return true;
+    }
+
+    bool nfcunit_listener_update_active(std::vector<uint8_t> &frame)
+    {
+        frame.clear();
+        uint32_t irq32 = nfcunit_listener_take_irq(ST25R_I_EOF32 | ST25R_I_RXE32);
+        if (!irq32) return false;
+        nfcunit_listener_trace("active irq", irq32);
+
+        if (irq32 & ST25R_I_RXE32) {
+            irq32 |= nfcunit_listener_take_irq(ST25R_I_PAR32 | ST25R_I_CRC32 | ST25R_I_ERR232 | ST25R_I_ERR132);
+
+            uint16_t fifo_cnt = 0;
+            if (!st25r_read_fifo_count(fifo_cnt) || fifo_cnt == 0) {
+                return false;
+            }
+
+            const bool bad_frame = nfcunit_listener_mode_f_
+                ? (irq32 & (ST25R_I_CRC32 | ST25R_I_ERR132 | ST25R_I_ERR232))
+                : ((irq32 & (ST25R_I_PAR32 | ST25R_I_CRC32 | ST25R_I_ERR132 | ST25R_I_ERR232)) || fifo_cnt <= 2);
+            if (bad_frame) {
+                uint8_t raw[96] = {0};
+                const uint16_t to_read = std::min<uint16_t>(fifo_cnt, sizeof(raw));
+                (void)st25r_fifo_read(raw, static_cast<uint8_t>(to_read));
+
+                st25r_cmd(0xDB);  // CLEAR_FIFO
+                st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
+                if (nfcunit_listener_wakeup_) {
+                    (void)nfcunit_listener_enter_halt();
+                } else {
+                    (void)nfcunit_listener_enter_idle();
+                }
+                return false;
+            }
+
+            const uint16_t payload_len = nfcunit_listener_mode_f_ ? fifo_cnt : static_cast<uint16_t>(fifo_cnt - 2);
+            const uint16_t to_read = std::min<uint16_t>(payload_len, 96);
+            uint8_t raw[96] = {0};
+            if (st25r_fifo_read(raw, static_cast<uint8_t>(to_read))) {
+                nfcunit_listener_data_flag_ = true;
+                frame.assign(raw, raw + to_read);
+                nfcunit_listener_trace("rx frame bytes", static_cast<uint32_t>(to_read));
+                if (!frame.empty()) return true;
+            }
+        }
+
+        if (irq32 & ST25R_I_EOF32) {
+            nfcunit_listener_trace("active eof -> off");
+            (void)nfcunit_listener_enter_off();
+            return false;
+        }
+
+        return false;
+    }
+
+    bool nfcunit_listener_update_halt()
+    {
+        uint32_t irq32 = nfcunit_listener_take_irq(ST25R_I_NFCT32 | ST25R_I_RXE32 | ST25R_I_EOF32 | ST25R_I_RXE_PTA32);
+        if (!irq32) return true;
+
+        if ((irq32 & ST25R_I_NFCT32) && nfcunit_listener_bitrate_ == 0xFF) {
+            uint8_t br = 0;
+            if (st25r_read_reg(0x24, br)) {
+                br = static_cast<uint8_t>((br >> 4) & 0x03);
+                if (br > 2) br = 2;
+                nfcunit_listener_bitrate_ = br;
+            }
+        }
+
+        if (irq32 & ST25R_I_EOF32) {
+            nfcunit_listener_trace("halt eof -> off");
+            return nfcunit_listener_enter_off();
+        }
+
+        if ((irq32 & ST25R_I_RXE32) && nfcunit_listener_bitrate_ != 0xFF) {
+            st25r_cmd(0xDB);  // CLEAR_FIFO
+            st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
+            return true;
+        }
+
+        if ((irq32 & ST25R_I_RXE_PTA32) && nfcunit_listener_bitrate_ == 0) {
+            uint8_t pta = 0;
+            if (st25r_read_reg(0x21, pta) && ((pta & 0x0Fu) > 0x09u)) {
+                nfcunit_listener_wakeup_ = true;
+                return nfcunit_listener_enter_ready();
+            }
+        }
+
+        return true;
     }
 
     static constexpr uint8_t ST25R_IRQ_MAIN_FWL = 0x40;
@@ -2677,6 +3461,12 @@ private:
         card.sak_hex.clear();
 
         auto &hexlog = NfcHexLog::get();
+
+        if (nfcunit_listener_running_) {
+            nfcunit_stop_listener();
+        } else {
+            restore_iso14443a();
+        }
 
         // Init sequence per M5UnitNFC library reference (confirmed via hardware testing):
         // 1. Enable oscillator only, configure mode/bitrate/receiver.
