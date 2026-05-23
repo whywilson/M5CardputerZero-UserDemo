@@ -3172,7 +3172,7 @@ private:
             }
         }
         if (ok) {
-            push_log("[NFCUnit] MFC 1K emulation started");
+            push_log("[NFCUnit] MFC 1K ID emulation started (UID/SAK/ATQA only)");
             if (error) error->clear();
         } else if (error) {
             *error = "NFC Unit MFC 1K emulation start failed";
@@ -3248,7 +3248,7 @@ private:
             nfc_unit_emu_thread_ = std::thread([this]() { nfcunit_mifare_listener_worker(); });
         }
         if (ok) {
-            push_log("[NFCUnit] MFC 1K emulation started");
+            push_log("[NFCUnit] MFC 1K ID emulation started (UID/SAK/ATQA only)");
             if (error) error->clear();
         } else if (error) {
             *error = "NFC Unit MFC 1K emulation start failed";

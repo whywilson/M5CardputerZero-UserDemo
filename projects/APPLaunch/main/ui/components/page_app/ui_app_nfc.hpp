@@ -2015,7 +2015,7 @@ private:
                     create_text(right, 6, 78, start_state.running ? "starting in background" : "background worker", 0x666666, 10);
                 } else {
                     const char *emu_text = (emu_protocol == nfc_app::ProtocolKind::MifareClassic)
-                        ? "MFC 1K emulation"
+                        ? "MFC 1K ID-only emulation"
                         : "ISO15693 emulation";
                     create_text(right, 6, 52, emu_text, 0x9E9E9E, 10);
                     create_text(right, 6, 66, start_state.running ? "starting in background" : "background worker", 0x666666, 10);
