@@ -1990,6 +1990,44 @@ public:
                (static_cast<uint32_t>(p[3]) << 24);
     }
 
+    static uint16_t bswap16_u16(uint16_t value)
+    {
+        return static_cast<uint16_t>((value >> 8) | (value << 8));
+    }
+
+    static uint16_t mfclassic_weak_prng_step16(uint16_t value)
+    {
+        return static_cast<uint16_t>(
+            (value >> 1) |
+            (((value ^ (value >> 2) ^ (value >> 3) ^ (value >> 5)) & 0x01u) << 15));
+    }
+
+    // Match Flipper's weak-PRNG nonce shape used by MIFARE Classic.
+    static bool mfclassic_is_weak_prng_nonce(uint32_t nonce)
+    {
+        if (nonce == 0) return false;
+        uint16_t x = static_cast<uint16_t>(nonce >> 16);
+        x = bswap16_u16(x);
+        for (uint8_t i = 0; i < 16; ++i) {
+            x = mfclassic_weak_prng_step16(x);
+        }
+        x = bswap16_u16(x);
+        return x == static_cast<uint16_t>(nonce & 0xFFFFu);
+    }
+
+    static uint32_t mfclassic_make_weak_nonce(uint16_t *state)
+    {
+        if (!state) return 0;
+        const uint16_t upper_raw = *state;
+        uint16_t lower_raw = upper_raw;
+        for (uint8_t i = 0; i < 16; ++i) {
+            lower_raw = mfclassic_weak_prng_step16(lower_raw);
+        }
+        *state = mfclassic_weak_prng_step16(upper_raw);
+        return (static_cast<uint32_t>(bswap16_u16(upper_raw)) << 16) |
+               static_cast<uint32_t>(bswap16_u16(lower_raw));
+    }
+
     static uint8_t mfc_block_to_sector(uint8_t block)
     {
         if (block < 128) return static_cast<uint8_t>(block / 4);
@@ -2019,7 +2057,8 @@ public:
     {
         NfcHexLog::get().log_event("mfkey32v2", "NFCUnit sniff worker started");
 
-        std::mt19937 rng(std::random_device{}());
+        uint16_t weak_nonce_state = static_cast<uint16_t>(std::random_device{}());
+        uint32_t last_nt = 0;
         bool pending_auth = false;
         uint8_t pending_sector = 0;
         uint8_t pending_key_type = 0;
@@ -2046,7 +2085,15 @@ public:
                 pending_auth = true;
                 pending_sector = mfc_block_to_sector(frame[1]);
                 pending_key_type = (frame[0] == 0x61) ? 1 : 0;
-                pending_nt = static_cast<uint32_t>(rng());
+                pending_nt = mfclassic_make_weak_nonce(&weak_nonce_state);
+                if (pending_nt == 0 || pending_nt == last_nt || !mfclassic_is_weak_prng_nonce(pending_nt)) {
+                    pending_nt = mfclassic_make_weak_nonce(&weak_nonce_state);
+                }
+                if (pending_nt == 0) {
+                    // Keep a valid weak nonce fallback for atypical RNG edge cases.
+                    pending_nt = 0x1AD31AD3;
+                }
+                last_nt = pending_nt;
 
                 uint8_t nt_resp[4] = {
                     static_cast<uint8_t>(pending_nt & 0xFF),
@@ -5607,8 +5654,12 @@ private:
                 // mfkey32v2: no-card — needs 2 nonce pairs per (uid, sector, key_type)
                 using GroupKey = std::tuple<uint32_t, uint8_t, uint8_t>;
                 std::map<GroupKey, std::vector<Pn532KillerClient::MfkeyEntry>> groups;
-                for (const auto &e : entries)
+                std::set<std::tuple<uint32_t, uint8_t, uint8_t, uint32_t, uint32_t, uint32_t>> seen_caps;
+                for (const auto &e : entries) {
+                    auto cap = std::make_tuple(e.uid, e.sector, e.key_type, e.nt, e.nr, e.ar);
+                    if (!seen_caps.insert(cap).second) continue;
                     groups[{e.uid, e.sector, e.key_type}].push_back(e);
+                }
                 const int group_count = static_cast<int>(groups.size());
                 int done = 0;
                 for (auto &[gk, caps] : groups) {
