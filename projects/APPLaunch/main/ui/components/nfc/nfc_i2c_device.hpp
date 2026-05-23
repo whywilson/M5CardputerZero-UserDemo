@@ -723,9 +723,31 @@ public:
     {
         writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_NONE);
         delay_ms(5);
+        // Keep ISO15693 RF path explicit for firmwares that do not auto-select by mode only.
+        writeSysReg(i2c_reg::SET_RFCFG, i2c_rfcfg::R15 | i2c_rfcfg::T15);
+        delay_ms(2);
         writeSysReg(i2c_reg::SET_TAGADDR, TAG_ADDR_ISO15);
         delay_ms(5);
         return writeSysReg(i2c_reg::SET_MODE, i2c_mode::DEFAULT | i2c_mode::TAG_ISO15);
+    }
+
+    bool nfcunit_refresh_iso15_emulation()
+    {
+        if (!is_open() || !is_nfc_unit()) return false;
+
+        const uint16_t mode = readSysReg(i2c_reg::SET_MODE);
+        if ((mode & 0x00FFu) != i2c_mode::TAG_ISO15) {
+            return startEmulationISO15();
+        }
+
+        const uint16_t status = readSysReg(i2c_reg::NFC_STATUS);
+        const uint16_t err_bits = STATUS_RECV_TIMEOUT | STATUS_RECV_CRCERR | STATUS_RECV_BITERR;
+        if ((status & err_bits) != 0) {
+            // Recover from stale receive/error state by fully re-applying ISO15 config.
+            return startEmulationISO15();
+        }
+
+        return true;
     }
 
     bool startEmulationChinaII()
@@ -746,7 +768,10 @@ public:
 
     // Start NFC-A listener mode using ST25R3916 passive target memory.
     // uid size must be 4 or 7 bytes.
-    bool nfcunit_start_listener_a(const std::vector<uint8_t> &uid, uint16_t atqa, uint8_t sak)
+    bool nfcunit_start_listener_a(const std::vector<uint8_t> &uid,
+                                  uint16_t atqa,
+                                  uint8_t sak,
+                                  bool keep_auto_collision = false)
     {
         if (!is_open() || !is_nfc_unit()) return false;
         if (!(uid.size() == 4 || uid.size() == 7)) return false;
@@ -806,10 +831,11 @@ public:
         // UID length bit in AUX(0x0A): uid_7=0x10, uid_4=0x00 (mask 0x30).
         const uint8_t uid_bits = (uid.size() == 7) ? 0x10 : 0x00;
         if (!st25r_change_bits(0x0A, uid_bits, static_cast<uint8_t>(0x30 & ~uid_bits))) return false;
+        delay_ms(5);
         if (!st25r_write_pt_memory_a(pt_mem_a, sizeof(pt_mem_a))) return false;
+        delay_ms(2);
 
         st25r_cmd(0xD1);  // UNMASK_RECEIVE_DATA
-
         nfcunit_listener_running_ = true;
         nfcunit_listener_target_active_ = false;
         nfcunit_listener_wakeup_ = false;
@@ -818,6 +844,7 @@ public:
         nfcunit_listener_bitrate_ = 0xFF;
         nfcunit_listener_irq_latch_ = 0;
         nfcunit_listener_mode_f_ = false;
+        nfcunit_listener_keep_auto_collision_ = keep_auto_collision;
 
         return nfcunit_listener_enter_off();
     }
@@ -1057,6 +1084,7 @@ private:
     bool nfcunit_listener_wakeup_ = false;
     bool nfcunit_listener_data_flag_ = false;
     bool nfcunit_listener_mode_f_ = false;
+    bool nfcunit_listener_keep_auto_collision_ = false;
     uint16_t nfcunit_listener_active_idle_ticks_ = 0;
     uint8_t nfcunit_listener_bitrate_ = 0xFF;  // 0:106, 1:212, 2:424, 0xFF:invalid
     uint32_t nfcunit_listener_irq_latch_ = 0;
@@ -1582,6 +1610,7 @@ private:
         }
         if (irq32 & (ST25R_I_WU_A32 | ST25R_I_WU_AX32 | ST25R_I_WU_F32)) {
             nfcunit_listener_trace("irq WAKE", irq32);
+            if (nfcunit_listener_keep_auto_collision_) return true;
             return nfcunit_listener_enter_active();
         }
         return true;
@@ -2288,9 +2317,24 @@ private:
 
     static int mfc_sector_count_from_sak_tag(uint8_t sak, const std::string &tag_type)
     {
-        if (sak == 0x18 || tag_type.find("4K") != std::string::npos) return 40;
+        const uint8_t sak_norm = normalize_mifare_classic_sak(sak);
+        if (sak_norm == 0x18 || tag_type.find("4K") != std::string::npos) return 40;
         if (sak == 0x09 || tag_type.find("Mini") != std::string::npos) return 5;
         return 16;
+    }
+
+    static uint8_t normalize_mifare_classic_sak(uint8_t sak)
+    {
+        if (sak == 0x88) return 0x08;
+        if (sak == 0x98) return 0x18;
+        return sak;
+    }
+
+    static bool is_mifare_classic_family_sak(uint8_t sak)
+    {
+        const uint8_t normalized = normalize_mifare_classic_sak(sak);
+        return (normalized == 0x08 || normalized == 0x09 || normalized == 0x18 ||
+                normalized == 0x28 || normalized == 0x38 || normalized == 0x1C);
     }
 
     static int mfc_sector_first_block(int sector)
@@ -3987,8 +4031,7 @@ private:
         }
 
         const bool magic_probe_candidate =
-            (sak == 0x08 || sak == 0x09 || sak == 0x18 || sak == 0x28 || sak == 0x38 ||
-             sak == 0x1C ||
+            (is_mifare_classic_family_sak(sak) ||
              card.protocol == "MFC1K" || card.protocol == "MFC4K" ||
              card.protocol == "MFCMini" || card.protocol == "MFCPlus");
 
@@ -4168,22 +4211,23 @@ private:
         card.valid = true;
 
         // Identify by SAK
-        if (sak == 0x08) {
+        const uint8_t mfc_sak = normalize_mifare_classic_sak(sak);
+        if (mfc_sak == 0x08) {
             card.protocol = "MFC1K";
-            card.detail = "MIFARE Classic 1K (SAK:08)";
-        } else if (sak == 0x18) {
+            card.detail = (sak == 0x88) ? "MIFARE Classic 1K (SAK:88)" : "MIFARE Classic 1K (SAK:08)";
+        } else if (mfc_sak == 0x18) {
             card.protocol = "MFC4K";
-            card.detail = "MIFARE Classic 4K (SAK:18)";
-        } else if (sak == 0x09) {
+            card.detail = (sak == 0x98) ? "MIFARE Classic 4K (SAK:98)" : "MIFARE Classic 4K (SAK:18)";
+        } else if (mfc_sak == 0x09) {
             card.protocol = "MFCMini";
             card.detail = "MIFARE Classic Mini (SAK:09)";
-        } else if (sak == 0x10) {
+        } else if (mfc_sak == 0x10) {
             card.protocol = "MFPlus2K";
             card.detail = "MIFARE Plus 2K (SAK:10)";
-        } else if (sak == 0x11) {
+        } else if (mfc_sak == 0x11) {
             card.protocol = "MFPlus4K";
             card.detail = "MIFARE Plus 4K (SAK:11)";
-        } else if (sak == 0x20 || sak == 0x28) {
+        } else if (mfc_sak == 0x20) {
             card.protocol = "DESFire";
             char buf[32]; std::snprintf(buf, sizeof(buf), "DESFire/JCOP (SAK:%02X)", sak);
             card.detail = buf;

@@ -1080,10 +1080,10 @@ public:
                 // First I2C connect: force a short Grove power-cycle to recover
                 // from stale peripheral state after previous EMU/reader mode.
                 NfcTransportFactory::grove_gpio_enable_bcm(17, false);
-                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 NfcTransportFactory::grove_gpio_enable_bcm(4, true);
                 NfcTransportFactory::grove_gpio_enable_bcm(17, true);
-                std::this_thread::sleep_for(std::chrono::milliseconds(240));
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
                 i2c_device_ = std::make_unique<I2cGroveNfcDevice>();
                 std::string i2c_error;
@@ -2106,9 +2106,9 @@ public:
         }
 
         std::string uid_hex = mfkey_sniff_uid_hex_;
-        if (uid_hex.size() < 8) uid_hex = "A0A1A2A3";
+        if (uid_hex.size() < 8) uid_hex = "11223344";
         uid_hex = keep_hex_chars_upper(uid_hex);
-        if (uid_hex.size() < 8) uid_hex = "A0A1A2A3";
+        if (uid_hex.size() < 8) uid_hex = "11223344";
         uid_hex = uid_hex.substr(0, 8);
 
         uint8_t uid[4] = {};
@@ -2118,7 +2118,7 @@ public:
         const uint32_t uid_u32 = static_cast<uint32_t>(std::stoul(uid_hex, nullptr, 16));
 
         const std::vector<uint8_t> uid_vec = {uid[0], uid[1], uid[2], uid[3]};
-        const bool emu_ok = i2c_device_->nfcunit_start_listener_a(uid_vec, 0x0004, 0x08);
+        const bool emu_ok = i2c_device_->nfcunit_start_listener_a(uid_vec, kNfcUnitMfc1kAtqa, kNfcUnitMfc1kSak);
         if (!emu_ok) {
             if (error) *error = "NFC Unit listener init failed";
             return false;
@@ -2301,6 +2301,32 @@ public:
         return selected_emulator_protocol_;
     }
 
+    static ProtocolKind nfcunit_profile_protocol_for_index(int profile)
+    {
+        switch (profile) {
+        case 1: return ProtocolKind::MifareClassic;
+        case 2: return ProtocolKind::Iso15693;
+        case 0:
+        default:
+            return ProtocolKind::Iso14443A;
+        }
+    }
+
+    bool set_nfcunit_profile_index(int profile)
+    {
+        if (profile < 0 || profile > 2) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        nfc_unit_emu_profile_ = profile;
+        selected_emulator_protocol_ = nfcunit_profile_protocol_for_index(nfc_unit_emu_profile_);
+        return true;
+    }
+
+    int nfcunit_profile_index() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return nfc_unit_emu_profile_;
+    }
+
     void toggle_slot_protocol()
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -2313,10 +2339,8 @@ public:
     void toggle_nfcunit_profile_protocol()
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        nfc_unit_emu_profile_ = (nfc_unit_emu_profile_ == 0) ? 1 : 0;
-        selected_emulator_protocol_ = (nfc_unit_emu_profile_ == 1)
-            ? ProtocolKind::Iso15693
-            : ProtocolKind::Iso14443A;
+        nfc_unit_emu_profile_ = (nfc_unit_emu_profile_ + 1) % 3;
+        selected_emulator_protocol_ = nfcunit_profile_protocol_for_index(nfc_unit_emu_profile_);
     }
 
     bool start_nfcunit_current_profile_emulation(std::string *error = nullptr)
@@ -2324,13 +2348,15 @@ public:
         stop_nfcunit_emulation_worker(true);
 
         ProtocolKind protocol = ProtocolKind::Iso14443A;
+        int profile = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
                 if (error) *error = "NFC Unit not connected";
                 return false;
             }
-            protocol = (nfc_unit_emu_profile_ == 1) ? ProtocolKind::Iso15693 : ProtocolKind::Iso14443A;
+            profile = nfc_unit_emu_profile_;
+            protocol = nfcunit_profile_protocol_for_index(profile);
             selected_emulator_protocol_ = protocol;
 
             std::string reset_err;
@@ -2338,6 +2364,8 @@ public:
                 if (error) *error = reset_err.empty() ? "NFC Unit power-cycle failed" : reset_err;
                 return false;
             }
+            nfc_unit_emu_profile_ = profile;
+            selected_emulator_protocol_ = protocol;
         }
         return grovenfc_activate(protocol, 0, error);
     }
@@ -2353,12 +2381,15 @@ public:
                 if (error) *error = "NFC Unit not connected";
                 return false;
             }
-            protocol = (nfc_unit_emu_profile_ == 1) ? ProtocolKind::Iso15693 : ProtocolKind::Iso14443A;
+            protocol = nfcunit_profile_protocol_for_index(nfc_unit_emu_profile_);
             selected_emulator_protocol_ = protocol;
         }
 
-        if (protocol == ProtocolKind::Iso14443A || protocol == ProtocolKind::MifareClassic) {
+        if (protocol == ProtocolKind::Iso14443A) {
             return start_nfcunit_ntag_emulation_unlocked(error);
+        }
+        if (protocol == ProtocolKind::MifareClassic) {
+            return start_nfcunit_mifare_emulation_unlocked(error);
         }
         if (protocol == ProtocolKind::Iso15693) {
             return start_nfcunit_iso15693_emulation_unlocked(error);
@@ -2413,7 +2444,8 @@ public:
     {
         switch (profile) {
         case 0: return "NTAG213";
-        case 1: return "ISO15693";
+        case 1: return "MFC 1K";
+        case 2: return "ISO15693";
         default: return "NTAG213";
         }
     }
@@ -2459,8 +2491,11 @@ public:
         const int clamped_slot = (slot_index < 0 ? 0 : slot_index > 7 ? 7 : slot_index);
 
         if (i2c_device_->is_nfc_unit()) {
-            if (protocol == ProtocolKind::Iso14443A || protocol == ProtocolKind::MifareClassic) {
+            if (protocol == ProtocolKind::Iso14443A) {
                 return start_nfcunit_ntag_emulation_locked(clamped_slot, error);
+            }
+            if (protocol == ProtocolKind::MifareClassic) {
+                return start_nfcunit_mifare_emulation_locked(error);
             }
             if (protocol == ProtocolKind::Iso15693) {
                 return start_nfcunit_iso15693_emulation_locked(error);
@@ -2773,7 +2808,7 @@ private:
             connection_.pn532_ready = true;
             connection_.status = "Connected NFCUnit";
             connection_.detail = std::string("NFCUnit @") + endpoint.path;
-            selected_emulator_protocol_ = (nfc_unit_emu_profile_ == 1) ? ProtocolKind::Iso15693 : ProtocolKind::Iso14443A;
+            selected_emulator_protocol_ = nfcunit_profile_protocol_for_index(nfc_unit_emu_profile_);
         }
 
         if (error) error->clear();
@@ -2802,10 +2837,10 @@ private:
 
         // Equivalent to unplug/replug: power-cycle Grove 5V and keep mux in I2C mode.
         NfcTransportFactory::grove_gpio_enable_bcm(17, false);
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
         NfcTransportFactory::grove_gpio_enable_bcm(4, true);
         NfcTransportFactory::grove_gpio_enable_bcm(17, true);
-        std::this_thread::sleep_for(std::chrono::milliseconds(260));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
         i2c_device_ = std::make_unique<I2cGroveNfcDevice>();
         std::string i2c_error;
@@ -3047,18 +3082,53 @@ private:
         }
 
         dev->nfcunit_stop_listener();
-        const bool ok = dev->startEmulationISO15();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            nfc_unit_emu_running_.store(false);
+            nfc_unit_emu_protocol_ = ProtocolKind::Iso15693;
+        }
+        push_log("[NFCUnit] ISO15693 emulation unsupported: transparent listener requires MCU GPIO timing");
+        if (error) *error = "NFC Unit ISO15693 emulation requires transparent GPIO timing";
+        return false;
+    }
+
+    bool start_nfcunit_mifare_emulation_unlocked(std::string *error)
+    {
+        I2cGroveNfcDevice *dev = nullptr;
+        uint32_t uid_value = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
+                if (error) *error = "NFC Unit not connected";
+                return false;
+            }
+            dev = i2c_device_.get();
+            uid_value = nfc_unit_mfkey_uid_;
+        }
+
+        dev->nfcunit_stop_listener();
+        const std::vector<uint8_t> uid = {
+            static_cast<uint8_t>((uid_value >> 24) & 0xFF),
+            static_cast<uint8_t>((uid_value >> 16) & 0xFF),
+            static_cast<uint8_t>((uid_value >> 8) & 0xFF),
+            static_cast<uint8_t>(uid_value & 0xFF)
+        };
+        const bool ok = dev->nfcunit_start_listener_a(uid, kNfcUnitMfc1kAtqa, kNfcUnitMfc1kSak, true);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
             nfc_unit_emu_running_.store(ok);
-            nfc_unit_emu_protocol_ = ProtocolKind::Iso15693;
+            nfc_unit_emu_protocol_ = ProtocolKind::MifareClassic;
+            if (ok) {
+                nfc_unit_emu_cancel_.store(false);
+                nfc_unit_emu_thread_ = std::thread([this]() { nfcunit_mifare_listener_worker(); });
+            }
         }
         if (ok) {
-            push_log("[NFCUnit] ISO15693 emulation started");
+            push_log("[NFCUnit] MFC 1K emulation started");
             if (error) error->clear();
         } else if (error) {
-            *error = "NFC Unit ISO15693 emulation start failed";
+            *error = "NFC Unit MFC 1K emulation start failed";
         }
         return ok;
     }
@@ -3103,14 +3173,38 @@ private:
             return false;
         }
         i2c_device_->nfcunit_stop_listener();
-        const bool ok = i2c_device_->startEmulationISO15();
-        nfc_unit_emu_running_.store(ok);
+        nfc_unit_emu_running_.store(false);
         nfc_unit_emu_protocol_ = ProtocolKind::Iso15693;
+        push_log("[NFCUnit] ISO15693 emulation unsupported: transparent listener requires MCU GPIO timing");
+        if (error) *error = "NFC Unit ISO15693 emulation requires transparent GPIO timing";
+        return false;
+    }
+
+    bool start_nfcunit_mifare_emulation_locked(std::string *error)
+    {
+        if (!i2c_device_ || !i2c_device_->is_open() || !i2c_device_->is_nfc_unit()) {
+            if (error) *error = "NFC Unit not connected";
+            return false;
+        }
+        i2c_device_->nfcunit_stop_listener();
+        const std::vector<uint8_t> uid = {
+            static_cast<uint8_t>((nfc_unit_mfkey_uid_ >> 24) & 0xFF),
+            static_cast<uint8_t>((nfc_unit_mfkey_uid_ >> 16) & 0xFF),
+            static_cast<uint8_t>((nfc_unit_mfkey_uid_ >> 8) & 0xFF),
+            static_cast<uint8_t>(nfc_unit_mfkey_uid_ & 0xFF)
+        };
+        const bool ok = i2c_device_->nfcunit_start_listener_a(uid, kNfcUnitMfc1kAtqa, kNfcUnitMfc1kSak, true);
+        nfc_unit_emu_running_.store(ok);
+        nfc_unit_emu_protocol_ = ProtocolKind::MifareClassic;
         if (ok) {
-            push_log("[NFCUnit] ISO15693 emulation started");
+            nfc_unit_emu_cancel_.store(false);
+            nfc_unit_emu_thread_ = std::thread([this]() { nfcunit_mifare_listener_worker(); });
+        }
+        if (ok) {
+            push_log("[NFCUnit] MFC 1K emulation started");
             if (error) error->clear();
         } else if (error) {
-            *error = "NFC Unit ISO15693 emulation start failed";
+            *error = "NFC Unit MFC 1K emulation start failed";
         }
         return ok;
     }
@@ -3311,6 +3405,55 @@ private:
                 continue;
             }
             push_log(cmd == 0x06 ? "[NFCUnit] NFC-F read request received" : "[NFCUnit] NFC-F write request received");
+        }
+    }
+
+    void nfcunit_mifare_listener_worker()
+    {
+        while (!nfc_unit_emu_cancel_.load()) {
+            std::vector<uint8_t> frame;
+            bool got = false;
+            I2cGroveNfcDevice *dev = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                dev = i2c_device_.get();
+            }
+            if (dev && dev->is_open() && dev->is_nfc_unit()) {
+                // MIFARE emulation relies on the same listener state machine.
+                // Keep polling even when payload frames are ignored.
+                got = dev->nfcunit_poll_listener_frame(frame, 20);
+            }
+            if (!got) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+    }
+
+    void nfcunit_iso15693_keepalive_worker()
+    {
+        int fail_streak = 0;
+        while (!nfc_unit_emu_cancel_.load()) {
+            bool ok = false;
+            I2cGroveNfcDevice *dev = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                dev = i2c_device_.get();
+            }
+            if (dev && dev->is_open() && dev->is_nfc_unit()) {
+                ok = dev->nfcunit_refresh_iso15_emulation();
+            }
+
+            if (!ok) {
+                ++fail_streak;
+                if (fail_streak == 1 || (fail_streak % 100) == 0) {
+                    NfcHexLog::get().log_event("NFC-I2C", "ISO15693 keepalive refresh failed");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                continue;
+            }
+
+            fail_streak = 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     }
 
@@ -4074,7 +4217,8 @@ private:
                 (type_up.find("MFC4K") != std::string::npos) ||
                 (type_up.find("MFCMINI") != std::string::npos) ||
                 (sak_norm == "08" || sak_norm == "09" || sak_norm == "18" ||
-                 sak_norm == "28" || sak_norm == "38") ||
+                 sak_norm == "28" || sak_norm == "38" ||
+                 sak_norm == "88" || sak_norm == "98") ||
                 ((proto_up.find("MIFARE") != std::string::npos || proto_up.find("MFC") != std::string::npos) &&
                  (type_up.find("1K") != std::string::npos ||
                   type_up.find("4K") != std::string::npos ||
@@ -4265,7 +4409,8 @@ private:
                     std::string sak = normalize_identity_hex(find_identity(tag, "SAK"));
                     if (sak.size() >= 2) {
                         if (sak == "08" || sak == "09" || sak == "18" ||
-                            sak == "28" || sak == "38") return true;
+                            sak == "28" || sak == "38" ||
+                            sak == "88" || sak == "98") return true;
                     }
                     return false;
                 };
@@ -4389,7 +4534,8 @@ private:
             if (type_up.find(" S20") != std::string::npos || type_up.find(" S50") != std::string::npos ||
                 type_up.find(" S70") != std::string::npos) return true;
             const std::string sak = normalize_hex(find_identity_field(tag, "SAK"));
-            return (sak == "08" || sak == "09" || sak == "18" || sak == "28" || sak == "38");
+                return (sak == "08" || sak == "09" || sak == "18" ||
+                    sak == "28" || sak == "38" || sak == "88" || sak == "98");
         };
 
         auto is_desfire_family = [&](const TagInfo &tag) {
@@ -5132,14 +5278,17 @@ private:
     std::atomic<bool> nfc_unit_emu_cancel_{false};
     std::atomic<bool> nfc_unit_emu_running_{false};
     ProtocolKind nfc_unit_emu_protocol_ = ProtocolKind::Iso14443A;
-    int nfc_unit_emu_profile_ = 0;  // 0=NTAG213, 1=ISO15693
+    int nfc_unit_emu_profile_ = 0;  // 0=NTAG213, 1=MFC 1K, 2=ISO15693
     std::string nfc_unit_ndef_uri_ = "https://m5stack.com";
     size_t nfc_unit_ntag_pages_ = kNfcUnitNtag213Pages;
     std::vector<uint8_t> nfc_unit_ntag_mem_;
     mutable std::mutex nfc_unit_mfkey_mutex_;
     std::vector<NfcUnitMfkeyEntry> nfc_unit_mfkey_entries_;
-    std::string mfkey_sniff_uid_hex_ = "A0A1A2A3";
-    uint32_t nfc_unit_mfkey_uid_ = 0xA0A1A2A3;
+    std::string mfkey_sniff_uid_hex_ = "11223344";
+    static constexpr uint32_t kNfcUnitMfc1kUid = 0x11223344;
+    static constexpr uint16_t kNfcUnitMfc1kAtqa = 0x0004;
+    static constexpr uint8_t kNfcUnitMfc1kSak = 0x08;
+    uint32_t nfc_unit_mfkey_uid_ = kNfcUnitMfc1kUid;
     std::map<std::pair<ProtocolKind,int>, EmuSlotInfo> emu_slot_cache_;
     bool emu_probe_running_ = false;
     bool emu_dump_running_  = false;

@@ -5,9 +5,12 @@
 #include "compat/input_keys.h"
 #include "keyboard_input.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -151,6 +154,9 @@ private:
     std::vector<nfc_app::TransportEndpoint> usb_select_list_;
     bool pending_usb_connect_ = false;
     std::string pending_usb_connect_path_;
+    uint32_t nfc_automation_last_tick_ = 0;
+    static constexpr const char *kNfcAutomationCmdPath = "/tmp/applaunch_nfc_automation.cmd";
+    static constexpr const char *kNfcAutomationStatusPath = "/tmp/applaunch_nfc_automation.status";
     bool pending_nfcunit_emu_autostart_result_ = false;
     bool nfcunit_emu_autostart_running_ = false;
     bool nfcunit_emu_autostart_ok_ = false;
@@ -286,6 +292,7 @@ private:
             self->perform_pending_usb_connect();
         }
         self->consume_nfcunit_emu_autostart_result();
+        self->process_nfc_automation_command();
         // Long-press scroll: hold 400ms→scroll, hold 1500ms→fast scroll, hold 2000ms→jump to top/bottom
         // Works for Read tab scan log AND for HexLog modal
         if (self->held_scroll_key_ != 0) {
@@ -761,6 +768,200 @@ private:
             std::lock_guard<std::mutex> lock(nfcunit_emu_autostart_mutex_);
             nfcunit_emu_autostart_result_consumed_ = true;
         }
+    }
+
+    static std::string trim_ascii(const std::string &in)
+    {
+        size_t begin = 0;
+        while (begin < in.size() && std::isspace(static_cast<unsigned char>(in[begin]))) ++begin;
+        size_t end = in.size();
+        while (end > begin && std::isspace(static_cast<unsigned char>(in[end - 1]))) --end;
+        return in.substr(begin, end - begin);
+    }
+
+    static std::string upper_ascii(std::string text)
+    {
+        for (char &ch : text) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        return text;
+    }
+
+    static std::string normalize_profile_token(const std::string &token)
+    {
+        std::string out;
+        out.reserve(token.size());
+        for (unsigned char ch : token) {
+            if (std::isalnum(ch)) out.push_back(static_cast<char>(std::toupper(ch)));
+        }
+        return out;
+    }
+
+    static int nfcunit_profile_index_from_token(const std::string &token)
+    {
+        const std::string n = normalize_profile_token(token);
+        if (n == "NTAG" || n == "NTAG213" || n == "ISO14443A" || n == "NFCA") return 0;
+        if (n == "MIFARE" || n == "MIFARE1K" || n == "MIFARECLASSIC" || n == "MIFARECLASSIC1K" || n == "MFC") return 1;
+        if (n == "ISO15693" || n == "NFCV") return 2;
+        return -1;
+    }
+
+    void write_nfc_automation_status(const std::string &line) const
+    {
+        std::ofstream out(kNfcAutomationStatusPath, std::ios::trunc);
+        if (!out.good()) return;
+        out << line << '\n';
+    }
+
+    bool pop_nfc_automation_command(std::string *command)
+    {
+        if (!command) return false;
+        std::ifstream in(kNfcAutomationCmdPath);
+        if (!in.good()) return false;
+        std::string line;
+        std::getline(in, line);
+        in.close();
+        std::remove(kNfcAutomationCmdPath);
+        line = trim_ascii(line);
+        if (line.empty()) return false;
+        *command = line;
+        return true;
+    }
+
+    bool ensure_nfcunit_connected_for_automation(std::string *error)
+    {
+        auto conn = service_.connection_state();
+        if (conn.connected && conn.device_kind == nfc_app::DeviceKind::NFCUnit) return true;
+
+        auto i2c_endpoints = service_.scan_i2c_devices();
+        if (i2c_endpoints.empty()) {
+            if (error) *error = "No NFC Unit I2C endpoint";
+            return false;
+        }
+
+        size_t pick = 0;
+        for (size_t i = 0; i < i2c_endpoints.size(); ++i) {
+            if (i2c_endpoints[i].path.find(":0x50") != std::string::npos ||
+                i2c_endpoints[i].path.find(":28") != std::string::npos) {
+                pick = i;
+                break;
+            }
+        }
+
+        service_.select_i2c_endpoint(i2c_endpoints[pick]);
+        if (!service_.connect_current()) {
+            conn = service_.connection_state();
+            if (error) *error = conn.detail.empty() ? "NFC Unit connect failed" : conn.detail;
+            return false;
+        }
+
+        conn = service_.connection_state();
+        if (!conn.connected || conn.device_kind != nfc_app::DeviceKind::NFCUnit) {
+            if (error) *error = "Connected device is not NFC Unit";
+            return false;
+        }
+        return true;
+    }
+
+    void process_nfc_automation_command()
+    {
+        const uint32_t now = lv_tick_get();
+        if (now - nfc_automation_last_tick_ < 150) return;
+        nfc_automation_last_tick_ = now;
+
+        std::string command;
+        if (!pop_nfc_automation_command(&command)) return;
+
+        std::istringstream iss(command);
+        std::string verb;
+        iss >> verb;
+        const std::string verb_upper = upper_ascii(verb);
+
+        auto emit_ok = [this](const std::string &line) {
+            write_nfc_automation_status("OK " + line);
+        };
+        auto emit_err = [this](const std::string &line) {
+            write_nfc_automation_status("ERR " + line);
+        };
+
+        if (verb_upper == "STATUS") {
+            const auto conn = service_.connection_state();
+            std::ostringstream oss;
+            oss << "status connected=" << (conn.connected ? 1 : 0)
+                << " device=" << nfc_app::to_string(conn.device_kind)
+                << " profile=" << service_.nfcunit_profile_label()
+                << " running=" << (service_.nfcunit_emulation_running() ? 1 : 0);
+            emit_ok(oss.str());
+            ui_message_ = "Automation status exported";
+            return;
+        }
+
+        if (verb_upper == "STOP") {
+            const bool ok = service_.grovenfc_deactivate();
+            if (ok) {
+                emit_ok("stop emulation");
+                ui_message_ = "Automation: emulation stopped";
+            } else {
+                emit_err("stop failed");
+                ui_message_ = "Automation: stop failed";
+            }
+            return;
+        }
+
+        std::string arg;
+        std::getline(iss, arg);
+        arg = trim_ascii(arg);
+
+        if (verb_upper == "PROFILE") {
+            const int profile = nfcunit_profile_index_from_token(arg);
+            if (profile < 0) {
+                emit_err("unknown profile: " + arg);
+                ui_message_ = "Automation: bad profile";
+                return;
+            }
+            service_.set_nfcunit_profile_index(profile);
+            emit_ok("profile=" + service_.nfcunit_profile_label());
+            ui_message_ = "Automation profile: " + service_.nfcunit_profile_label();
+            return;
+        }
+
+        if (verb_upper == "START" || verb_upper == "RUN") {
+            int run_profile = -1;
+            if (verb_upper == "RUN") {
+                run_profile = nfcunit_profile_index_from_token(arg);
+                if (run_profile < 0) {
+                    emit_err("unknown profile: " + arg);
+                    ui_message_ = "Automation: bad profile";
+                    return;
+                }
+                if (run_profile != service_.nfcunit_profile_index()) {
+                    (void)service_.grovenfc_deactivate();
+                    service_.disconnect();
+                }
+            }
+
+            std::string err;
+            if (!ensure_nfcunit_connected_for_automation(&err)) {
+                emit_err(err.empty() ? "connect failed" : err);
+                ui_message_ = "Automation connect failed";
+                return;
+            }
+            if (run_profile >= 0) service_.set_nfcunit_profile_index(run_profile);
+
+            if (service_.start_nfcunit_current_profile_emulation(&err)) {
+                std::ostringstream oss;
+                oss << "run profile=" << service_.nfcunit_profile_label()
+                    << " running=" << (service_.nfcunit_emulation_running() ? 1 : 0);
+                emit_ok(oss.str());
+                current_tab_ = Tab::Emulator;
+                ui_message_ = "Automation: " + service_.nfcunit_profile_label() + " emulating";
+            } else {
+                emit_err(err.empty() ? "start failed" : err);
+                ui_message_ = "Automation start failed";
+            }
+            return;
+        }
+
+        emit_err("unknown command: " + command);
+        ui_message_ = "Automation: unknown command";
     }
 
     void navigate(int delta)
@@ -1804,7 +2005,8 @@ private:
             create_text(right, 6, 4,  is_nfc_unit ? nfc_unit_profile.c_str() : proto_name.c_str(), 0x00D2FF, 12);
             const auto start_state = service_.nfcunit_emu_start_state();
             if (is_nfc_unit) {
-                const bool nfc_unit_url_mode = (service_.current_emulator_protocol() != nfc_app::ProtocolKind::Iso15693);
+                const auto emu_protocol = service_.current_emulator_protocol();
+                const bool nfc_unit_url_mode = (emu_protocol == nfc_app::ProtocolKind::Iso14443A);
                 create_text(right, 6, 20, "S:start P:stop OK:menu", 0xD8D8D8, 10);
                 create_text(right, 6, 34, start_state.running ? "Status: STARTING" : (service_.nfcunit_emulation_running() ? "Status: RUNNING" : "Status: READY"), 0x9E9E9E, 10);
                 if (nfc_unit_url_mode) {
@@ -1812,7 +2014,10 @@ private:
                     create_text(right, 6, 64, to_compact(service_.nfcunit_ndef_uri(), 30).c_str(), 0x00D2FF, 10);
                     create_text(right, 6, 78, start_state.running ? "starting in background" : "background worker", 0x666666, 10);
                 } else {
-                    create_text(right, 6, 52, "ISO15693 emulation", 0x9E9E9E, 10);
+                    const char *emu_text = (emu_protocol == nfc_app::ProtocolKind::MifareClassic)
+                        ? "MFC 1K emulation"
+                        : "ISO15693 emulation";
+                    create_text(right, 6, 52, emu_text, 0x9E9E9E, 10);
                     create_text(right, 6, 66, start_state.running ? "starting in background" : "background worker", 0x666666, 10);
                 }
             } else {
@@ -1857,7 +2062,7 @@ private:
         const bool nfc_unit_mode = (conn.device_kind == nfc_app::DeviceKind::NFCUnit ||
                                     endpoint.kind == nfc_app::TransportKind::I2cBus);
         const bool nfc_unit_url_mode = nfc_unit_mode &&
-            service_.current_emulator_protocol() != nfc_app::ProtocolKind::Iso15693;
+            service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso14443A;
         const int emu_slot = nfc_unit_mode ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
         const int n_opts = pn532_ndef_menu ? 3 :
@@ -4055,7 +4260,7 @@ private:
         const bool nfc_unit_mode = (dev_kind == nfc_app::DeviceKind::NFCUnit ||
                                     endpoint.kind == nfc_app::TransportKind::I2cBus);
         const bool nfc_unit_url_mode = nfc_unit_mode &&
-            service_.current_emulator_protocol() != nfc_app::ProtocolKind::Iso15693;
+            service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso14443A;
         const int emu_slot = nfc_unit_mode ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
         const int n_opts = pn532_ndef_menu ? 3 :
