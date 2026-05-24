@@ -5508,29 +5508,56 @@ private:
             const uint8_t actual_slot = static_cast<uint8_t>(slot);
             const bool is_uart = (endpoint.kind == TransportKind::UartSerial);
 
+            auto parse_mfc_block_hex = [](const std::string &raw, std::vector<uint8_t> *out) -> bool {
+                if (!out) return false;
+                std::string line = raw;
+                // Accept optional "NN:" prefix used by dump views.
+                if (line.size() >= 3 && std::isxdigit(static_cast<unsigned char>(line[0])) &&
+                    std::isxdigit(static_cast<unsigned char>(line[1])) && line[2] == ':') {
+                    line = line.substr(3);
+                }
+
+                std::string compact;
+                compact.reserve(32);
+                for (unsigned char ch : line) {
+                    if (std::isxdigit(ch)) compact.push_back(static_cast<char>(std::toupper(ch)));
+                }
+                if (compact.size() != 32) return false;
+
+                out->clear();
+                out->reserve(16);
+                auto from_hex = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    return -1;
+                };
+                for (int i = 0; i < 16; ++i) {
+                    const int hi = from_hex(compact[static_cast<size_t>(i * 2)]);
+                    const int lo = from_hex(compact[static_cast<size_t>(i * 2 + 1)]);
+                    if (hi < 0 || lo < 0) return false;
+                    out->push_back(static_cast<uint8_t>((hi << 4) | lo));
+                }
+                return true;
+            };
+
             // Do NOT call set_work_mode before uploading.
             // pn532-python hf_mf_load uploads all blocks first, then calls set_work_mode(EMULATOR)
             // after upload_done.  Calling set_work_mode before may cause the device to reject
             // subsequent setEmulatorData frames.
 
             bool any_fail = false;
+            std::vector<std::vector<uint8_t>> uploaded_blocks(64);
             for (int blk = 0; blk < 64; ++blk) {
                 if (cancel_hw_upload_.load()) break;
                 // Parse hex string to 16 bytes
                 const std::string &hex = record.tag.raw_data[static_cast<size_t>(blk)];
-                if (hex.size() < 32) { any_fail = true; break; }
                 std::vector<uint8_t> data;
-                data.reserve(16);
-                for (int b = 0; b < 16; ++b) {
-                    const char hi = hex[static_cast<size_t>(b * 2)];
-                    const char lo = hex[static_cast<size_t>(b * 2 + 1)];
-                    auto from_hex = [](char c) -> uint8_t {
-                        if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
-                        if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
-                        if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
-                        return 0;
-                    };
-                    data.push_back(static_cast<uint8_t>((from_hex(hi) << 4) | from_hex(lo)));
+                if (!parse_mfc_block_hex(hex, &data)) {
+                    char msg[96] = {};
+                    std::snprintf(msg, sizeof(msg), "upload failed: invalid block format at %02d", blk);
+                    NfcHexLog::get().log_event("upload", msg);
+                    any_fail = true;
+                    break;
                 }
                 // Retry each block up to 3 times to handle UART noise
                 bool blk_ok = false;
@@ -5543,6 +5570,7 @@ private:
                     std::this_thread::sleep_for(std::chrono::milliseconds(is_uart ? 20 : 5));
                 }
                 if (!blk_ok) { any_fail = true; break; }
+                uploaded_blocks[static_cast<size_t>(blk)] = data;
                 {
                     std::lock_guard<std::mutex> lk(pending_log_mutex_);
                     hw_upload_progress_ = blk + 1;
@@ -5551,12 +5579,46 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(is_uart ? 20 : 5));
             }
             if (!any_fail && !cancel_hw_upload_.load()) {
-                client.emu_upload_done(type_mfc, actual_slot);
+                if (!client.emu_upload_done(type_mfc, actual_slot)) {
+                    NfcHexLog::get().log_event("upload", "upload_done failed");
+                    any_fail = true;
+                }
                 // Switch to emulator mode AFTER uploading (pn532-python hf_mf_load flow:
                 // upload_data_block * N -> upload_data_block_done -> set_work_mode EMULATOR).
                 std::string sw_err;
-                client.set_work_mode(0x02, type_mfc, actual_slot, &sw_err);
-                ok = true;
+                if (!any_fail && !client.set_work_mode(0x02, type_mfc, actual_slot, &sw_err)) {
+                    NfcHexLog::get().log_event("upload", ("set_work_mode failed: " + sw_err).c_str());
+                    any_fail = true;
+                }
+
+                if (!any_fail) {
+                    client.emu_prepare_read(type_mfc, actual_slot);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(is_uart ? 40 : 15));
+                    const int verify_blocks[] = {0, 1, 2, 3, 63};
+                    for (int vblk : verify_blocks) {
+                        std::vector<uint8_t> readback;
+                        if (!client.emu_download_block(type_mfc, actual_slot,
+                                                       static_cast<uint16_t>(vblk), &readback) ||
+                            readback.size() < 16) {
+                            char msg[96] = {};
+                            std::snprintf(msg, sizeof(msg), "verify failed: read block %02d", vblk);
+                            NfcHexLog::get().log_event("upload", msg);
+                            any_fail = true;
+                            break;
+                        }
+                        if (!std::equal(uploaded_blocks[static_cast<size_t>(vblk)].begin(),
+                                        uploaded_blocks[static_cast<size_t>(vblk)].end(),
+                                        readback.begin())) {
+                            char msg[96] = {};
+                            std::snprintf(msg, sizeof(msg), "verify failed: mismatch block %02d", vblk);
+                            NfcHexLog::get().log_event("upload", msg);
+                            any_fail = true;
+                            break;
+                        }
+                    }
+                }
+
+                ok = !any_fail;
             }
         }
 

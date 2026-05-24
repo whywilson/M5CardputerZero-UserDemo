@@ -131,7 +131,21 @@ public:
         const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0xAC, {mode, type, index});
         if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) return false;
         std::vector<uint8_t> rx;
-        collect_response(&rx, nullptr);
+        if (!collect_response(&rx, error)) return false;
+        std::vector<uint8_t> fd;
+        if (!Pn532FrameCodec::parse_first_frame(rx, &fd) || fd.size() < 3 ||
+            fd[0] != 0xD5 || fd[1] != 0xAD) {
+            if (error) *error = "unexpected SetWorkMode response";
+            return false;
+        }
+        if (fd[2] != 0x00) {
+            if (error) {
+                char msg[64] = {};
+                std::snprintf(msg, sizeof(msg), "SetWorkMode failed: status=0x%02X", fd[2]);
+                *error = msg;
+            }
+            return false;
+        }
         return true;
     }
 
