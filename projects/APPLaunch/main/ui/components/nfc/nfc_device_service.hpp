@@ -3657,6 +3657,16 @@ private:
         return !all_zero;
     }
 
+    static bool is_accepted_uhf_inventory_epc(const std::string &epc)
+    {
+        if (!looks_like_epc(epc)) return false;
+        const std::string up = to_upper_ascii(epc);
+        // Keep mtools baseline acceptance (E2*) while dropping known ghost EPC prefix.
+        if (up.rfind("E2", 0) != 0) return false;
+        if (up.rfind("E280690000", 0) == 0) return false;
+        return true;
+    }
+
     static std::vector<uint8_t> build_uhf_bb_frame(uint8_t cmd, const std::vector<uint8_t> &payload)
     {
         const uint16_t len = static_cast<uint16_t>(payload.size());
@@ -3898,7 +3908,7 @@ private:
                 row.epc = keep_hex_chars_upper(
                     bytes_to_hex_string(data.data() + epc_offset, static_cast<size_t>(epc_len)));
 
-                if (!looks_like_epc(row.epc)) return false;
+                if (!is_accepted_uhf_inventory_epc(row.epc)) return false;
 
                 char pc_buf[8];
                 std::snprintf(pc_buf, sizeof(pc_buf), "%04X", pc & 0xFFFF);
@@ -3959,7 +3969,7 @@ private:
             row.epc = keep_hex_chars_upper(
                 bytes_to_hex_string(data.data() + inv_start + 2, static_cast<size_t>(inv_data_len - 4)));
 
-            if (!looks_like_epc(row.epc)) return;
+            if (!is_accepted_uhf_inventory_epc(row.epc)) return;
 
             const uint32_t rssi =
                 ((data[meta_offset + 0] & 0xFFu) << 24) |
@@ -4014,14 +4024,14 @@ private:
                 std::sort(tokens.begin(), tokens.end(),
                           [](const std::string &a, const std::string &b) { return a.size() > b.size(); });
                 for (const auto &token : tokens) {
-                    if (looks_like_epc(token) && token.size() <= 96) {
+                    if (is_accepted_uhf_inventory_epc(token) && token.size() <= 96) {
                         row.epc = token;
                         break;
                     }
                 }
             }
 
-            if (!looks_like_epc(row.epc)) return;
+            if (!is_accepted_uhf_inventory_epc(row.epc)) return;
             row.raw_hex = bytes_to_hex_string(chunk.data(), chunk.size(), 64);
             row.read_count = 1;
             out.push_back(row);
@@ -4074,7 +4084,7 @@ private:
     void merge_uhf_tags(const std::vector<UhfTagSnapshot> &detected, const TransportEndpoint &endpoint)
     {
         for (const auto &row : detected) {
-            if (!looks_like_epc(row.epc)) continue;
+            if (!is_accepted_uhf_inventory_epc(row.epc)) continue;
 
             UhfTagSnapshot snapshot;
             bool first_seen = false;
