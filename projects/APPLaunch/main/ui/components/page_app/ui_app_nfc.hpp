@@ -42,6 +42,7 @@ class UINfcPage : public app_base
         PortSettings,  // TX / RX / BAUD config popup
         UsbSelect,     // Multiple USB ports: choose which to connect
         I2cSelect,     // I2C bus scan: choose which device to connect
+        SpiSelect,     // SPI bus scan: choose which device to connect
         HexLog,        // Ctrl+L full-screen hex TX/RX log overlay
         Pn532NdefInput,// PN532 NDEF URI input popup
     };
@@ -168,6 +169,12 @@ private:
     int i2c_select_idx_ = 0;
     // Cached I2C endpoint list for I2cSelect modal
     std::vector<nfc_app::TransportEndpoint> i2c_select_list_;
+    // SPI device selection (index into spi_select_list_)
+    int spi_select_idx_ = 0;
+    // Cached SPI endpoint list for SpiSelect modal
+    std::vector<nfc_app::TransportEndpoint> spi_select_list_;
+    // Read-tab transport pill scroll offset (0=USB+UART, 1=UART+I2C, 2=I2C+SPI)
+    int read_transport_offset_ = 0;
     // PN532 NDEF URI input buffer
     std::string pn532_ndef_uri_      = "https://m5stack.com";
     int         pn532_ndef_type_idx_ = 0; // 0=https 1=http 2=tel 3=mailto 4=custom
@@ -512,6 +519,25 @@ private:
         case KEY_TAB:
             if (current_tab_ == Tab::Read) {
                 service_.cycle_device_mode(&ui_message_);
+                // Auto-scroll pill bar so the newly active transport is visible
+                {
+                    const nfc_app::TransportKind new_kind = service_.current_endpoint().kind;
+                    static const nfc_app::TransportKind kKindOrder[] = {
+                        nfc_app::TransportKind::UsbSerial,
+                        nfc_app::TransportKind::UartSerial,
+                        nfc_app::TransportKind::I2cBus,
+                        nfc_app::TransportKind::SpiBus,
+                    };
+                    int active_idx = 0;
+                    for (int i = 0; i < 4; ++i)
+                        if (kKindOrder[i] == new_kind) { active_idx = i; break; }
+                    if (active_idx < read_transport_offset_)
+                        read_transport_offset_ = active_idx;
+                    else if (active_idx >= read_transport_offset_ + 2)
+                        read_transport_offset_ = active_idx - 1;
+                    if (read_transport_offset_ < 0) read_transport_offset_ = 0;
+                    if (read_transport_offset_ > 2) read_transport_offset_ = 2;
+                }
                 render_all();
             } else if (current_tab_ == Tab::Emulator) {
                 const auto conn = service_.connection_state();
@@ -651,6 +677,21 @@ private:
                     return;
                 }
                 service_.select_i2c_endpoint(i2c_select_list_[0]);
+            }
+
+            if (endpoint.kind == nfc_app::TransportKind::SpiBus) {
+                spi_select_list_ = service_.enumerate_spi_devices();
+                if (spi_select_list_.empty()) {
+                    ui_message_ = "No SPI device";
+                    return;
+                }
+                if (spi_select_list_.size() > 1) {
+                    spi_select_idx_ = 0;
+                    modal_ = Modal::SpiSelect;
+                    modal_idx_ = 0;
+                    return;
+                }
+                service_.select_spi_endpoint(spi_select_list_[0]);
             }
 
             const auto connect_ep = service_.current_endpoint();
@@ -1060,6 +1101,21 @@ private:
                                 modal_idx_ = 0;
                             }
                         }
+                    } else if (ep.kind == nfc_app::TransportKind::SpiBus) {
+                        const auto conn = service_.connection_state();
+                        if (conn.connected) {
+                            modal_ = Modal::ReadMenu;
+                            modal_idx_ = 0;
+                        } else {
+                            spi_select_list_ = service_.enumerate_spi_devices();
+                            if (spi_select_list_.empty()) {
+                                ui_message_ = "No SPI device connected";
+                            } else {
+                                spi_select_idx_ = 0;
+                                modal_ = Modal::SpiSelect;
+                                modal_idx_ = 0;
+                            }
+                        }
                     }
                 }
             }
@@ -1274,6 +1330,7 @@ private:
             else if (modal_ == Modal::PortSettings) render_port_settings_modal(content);
             else if (modal_ == Modal::UsbSelect) render_usb_select_modal(content);
             else if (modal_ == Modal::I2cSelect) render_i2c_select_modal(content);
+            else if (modal_ == Modal::SpiSelect) render_spi_select_modal(content);
             break;
         case Tab::Saved:
             render_saved_tab(content);
@@ -1428,6 +1485,19 @@ private:
             };
         }
 
+        if (ep.kind == nfc_app::TransportKind::SpiBus) {
+            if (!conn.connected) {
+                return {
+                    ReadMenuAction::ConnectDevice,
+                };
+            }
+            return {
+                ReadMenuAction::Scan,
+                ReadMenuAction::Dump,
+                ReadMenuAction::Clear,
+            };
+        }
+
         if (conn.connected && conn.device_kind == nfc_app::DeviceKind::UHFReader) {
             return make_uhf_actions(false);
         }
@@ -1478,6 +1548,8 @@ private:
             return "PN532, PN532Killer, UHFReader";
         case nfc_app::TransportKind::I2cBus:
             return "NFC Unit, GroveNFC";
+        case nfc_app::TransportKind::SpiBus:
+            return "ST25R3916";
         default:
             return "Demo/Unknown";
         }
@@ -1626,16 +1698,47 @@ private:
         lv_obj_t *summary = create_panel(parent, 0, 0, 320, 18, 0x161616);
         {
             const nfc_app::TransportKind cur = endpoint.kind;
-            struct { const char *label; nfc_app::TransportKind kind; int x; } modes[] = {
-                {"USB",  nfc_app::TransportKind::UsbSerial,   4},
-                {"UART", nfc_app::TransportKind::UartSerial, 52},
-                {"I2C",  nfc_app::TransportKind::I2cBus,    100},
+            // 4 transport kinds in fixed order; show 2 at a time with arrows
+            struct TransportEntry { const char *label; nfc_app::TransportKind kind; };
+            static const TransportEntry kModes[] = {
+                {"USB",  nfc_app::TransportKind::UsbSerial},
+                {"UART", nfc_app::TransportKind::UartSerial},
+                {"I2C",  nfc_app::TransportKind::I2cBus},
+                {"SPI",  nfc_app::TransportKind::SpiBus},
             };
-            for (auto &m : modes) {
-                const bool active = (m.kind == cur);
+            static constexpr int kModeCount = 4;
+
+            // Clamp offset so the active kind is always visible
+            {
+                int active_idx = 0;
+                for (int i = 0; i < kModeCount; ++i)
+                    if (kModes[i].kind == cur) { active_idx = i; break; }
+                if (active_idx < read_transport_offset_)
+                    read_transport_offset_ = active_idx;
+                else if (active_idx >= read_transport_offset_ + 2)
+                    read_transport_offset_ = active_idx - 1;
+                if (read_transport_offset_ > kModeCount - 2) read_transport_offset_ = kModeCount - 2;
+                if (read_transport_offset_ < 0) read_transport_offset_ = 0;
+            }
+
+            // Left arrow (shown when offset > 0)
+            if (read_transport_offset_ > 0) {
+                lv_obj_t *arr = lv_label_create(summary);
+                lv_label_set_text(arr, "<");
+                lv_obj_set_pos(arr, 2, 4);
+                lv_obj_set_style_text_color(arr, lv_color_hex(0x707070), LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_font(arr, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
+            }
+
+            // Two visible pills
+            const int pill_x[2] = {16, 62};
+            for (int vi = 0; vi < 2; ++vi) {
+                const int mi = read_transport_offset_ + vi;
+                if (mi >= kModeCount) break;
+                const bool active = (kModes[mi].kind == cur);
                 lv_obj_t *pill = lv_obj_create(summary);
                 lv_obj_set_size(pill, 44, 14);
-                lv_obj_set_pos(pill, m.x, 2);
+                lv_obj_set_pos(pill, pill_x[vi], 2);
                 lv_obj_set_style_radius(pill, 3, LV_PART_MAIN | LV_STATE_DEFAULT);
                 lv_obj_set_style_bg_color(pill, lv_color_hex(active ? 0xF7A600 : 0x303030), LV_PART_MAIN | LV_STATE_DEFAULT);
                 lv_obj_set_style_bg_opa(pill, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -1643,10 +1746,19 @@ private:
                 lv_obj_set_style_pad_all(pill, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
                 lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
                 lv_obj_t *lbl = lv_label_create(pill);
-                lv_label_set_text(lbl, m.label);
+                lv_label_set_text(lbl, kModes[mi].label);
                 lv_obj_set_style_text_color(lbl, lv_color_hex(active ? 0x000000 : 0x909090), LV_PART_MAIN | LV_STATE_DEFAULT);
                 lv_obj_set_style_text_font(lbl, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
                 lv_obj_center(lbl);
+            }
+
+            // Right arrow (shown when there are more pills to the right)
+            if (read_transport_offset_ + 2 < kModeCount) {
+                lv_obj_t *arr = lv_label_create(summary);
+                lv_label_set_text(arr, ">");
+                lv_obj_set_pos(arr, 110, 4);
+                lv_obj_set_style_text_color(arr, lv_color_hex(0x707070), LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_font(arr, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
             }
         }
         {
@@ -2440,6 +2552,23 @@ private:
                     service_.select_i2c_endpoint(i2c_select_list_[0]);
                 }
 
+                if (ep.kind == nfc_app::TransportKind::SpiBus) {
+                    scan_log_lines_.push_back("> Scanning SPI devices...");
+                    spi_select_list_ = service_.enumerate_spi_devices();
+                    if (spi_select_list_.empty()) {
+                        scan_log_lines_.push_back("No SPI device found");
+                        ui_message_ = "No SPI device";
+                        break;
+                    }
+                    if (spi_select_list_.size() > 1) {
+                        spi_select_idx_ = 0;
+                        modal_ = Modal::SpiSelect;
+                        modal_idx_ = 0;
+                        break;
+                    }
+                    service_.select_spi_endpoint(spi_select_list_[0]);
+                }
+
                 const auto conn0 = service_.connection_state();
                 if (conn0.connected) service_.disconnect();
                 const auto connect_ep = service_.current_endpoint();
@@ -2831,9 +2960,85 @@ private:
         }
     }
 
-    // ── PortSettings modal (TX / RX GPIO / BAUD / Test) ──────────────────────
-    void render_port_settings_modal(lv_obj_t *parent)
+    // ── SpiSelect modal (enumerate SPI devices, choose which to connect) ─────
+    void render_spi_select_modal(lv_obj_t *parent)
     {
+        lv_obj_t *overlay = lv_obj_create(parent);
+        lv_obj_remove_style_all(overlay);
+        lv_obj_set_size(overlay, 320, CONTENT_H);
+        lv_obj_set_pos(overlay, 0, 0);
+        lv_obj_set_style_radius(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(overlay, 160, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+        const int n = static_cast<int>(spi_select_list_.size());
+        const int card_h = 42 + std::max(1, n) * 20;
+        lv_obj_t *card = make_modal_card(overlay, 220, card_h, 0x00B4FF);
+        create_text(card, 8, 5, "Select SPI Device", 0x00B4FF, 12);
+
+        for (int i = 0; i < n; ++i) {
+            const bool sel = (spi_select_idx_ == i);
+            const std::string &lbl = spi_select_list_[i].label;
+            lv_obj_t *row = lv_obj_create(card);
+            lv_obj_remove_style_all(row);
+            lv_obj_set_size(row, 204, 18);
+            lv_obj_set_pos(row, 8, 22 + i * 20);
+            lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0x00B4FF : 0x242424), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            create_text(row, 6, 3, to_compact(lbl, 24).c_str(), sel ? 0x000000 : 0xD0D0D0, 11);
+        }
+        if (n == 0) {
+            create_text(card, 8, 26, "No SPI device found", 0xFF4444, 11);
+        }
+    }
+
+    void handle_spi_select_key(uint32_t key)
+    {
+        const int n = static_cast<int>(spi_select_list_.size());
+        switch (key) {
+        case KEY_UP:
+        case KEY_F:
+            if (n > 0) spi_select_idx_ = (spi_select_idx_ - 1 + n) % n;
+            break;
+        case KEY_DOWN:
+        case KEY_X:
+            if (n > 0) spi_select_idx_ = (spi_select_idx_ + 1) % n;
+            break;
+        case KEY_ENTER:
+            if (n > 0 && spi_select_idx_ < n) {
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                const auto &selected_ep = spi_select_list_[spi_select_idx_];
+                service_.select_spi_endpoint(selected_ep);
+                scan_log_lines_.clear();
+                log_scroll_offset_ = 0;
+                scan_log_lines_.push_back("> Connect " + selected_ep.label.substr(0, 22) + "...");
+                render_all();
+                const bool ok = service_.connect_current();
+                const auto conn2 = service_.connection_state();
+                if (!ok) {
+                    scan_log_lines_.push_back("ERR " + compact_read_connection_detail(conn2));
+                    ui_message_ = "Connect failed";
+                } else {
+                    scan_log_lines_.push_back("OK  " + compact_read_connection_detail(conn2));
+                    scan_log_lines_.push_back(supported_protocols_text());
+                    ui_message_ = std::string("Connected: ") + nfc_app::to_string(conn2.device_kind);
+                }
+            }
+            break;
+        case KEY_ESC:
+            modal_     = Modal::None;
+            modal_idx_ = 0;
+            break;
+        default: break;
+        }
+    }
+
+    // ── PortSettings modal (TX / RX GPIO / BAUD / Test) ──────────────────────
+    void render_port_settings_modal(lv_obj_t *parent)    {
         lv_obj_t *overlay = lv_obj_create(parent);
         lv_obj_remove_style_all(overlay);
         lv_obj_set_size(overlay, 320, CONTENT_H);
@@ -4162,6 +4367,9 @@ private:
             break;
         case Modal::I2cSelect:
             handle_i2c_select_key(key);
+            break;
+        case Modal::SpiSelect:
+            handle_spi_select_key(key);
             break;
         case Modal::HexLog:
             handle_hex_log_key(key);

@@ -452,8 +452,37 @@ public:
 #if defined(__linux__)
         for (auto &ep : probe_i2c_devices())
             endpoints.push_back(ep);
+        // Add SPI endpoints (ST25R3916 HAT)
+        for (auto &ep : enumerate_spi_devices())
+            endpoints.push_back(ep);
 #endif
         return endpoints;
+    }
+
+    // Enumerate /dev/spidev* devices as SpiBus endpoints.
+    static std::vector<TransportEndpoint> enumerate_spi_devices()
+    {
+        std::vector<TransportEndpoint> result;
+#if defined(__linux__)
+        DIR *d = opendir("/dev");
+        if (!d) return result;
+        struct dirent *entry = nullptr;
+        while ((entry = readdir(d)) != nullptr) {
+            const std::string name(entry->d_name);
+            if (!starts_with(name, "spidev")) continue;
+            TransportEndpoint ep;
+            ep.kind      = TransportKind::SpiBus;
+            ep.path      = std::string("/dev/") + name;
+            ep.label     = std::string("ST25R NFC ") + name;
+            ep.baud_rate = 0;
+            result.push_back(ep);
+        }
+        closedir(d);
+        std::sort(result.begin(), result.end(), [](const TransportEndpoint &a, const TransportEndpoint &b) {
+            return a.path < b.path;
+        });
+#endif
+        return result;
     }
 
     // Probe all /dev/i2c-* buses for known NFC devices (NFCUnit @0x50, GroveNFC @0x48).
@@ -632,7 +661,8 @@ public:
 
     static std::unique_ptr<INfcTransport> create(const TransportEndpoint &endpoint)
     {
-        if (endpoint.kind == TransportKind::I2cBus) {
+        if (endpoint.kind == TransportKind::I2cBus ||
+            endpoint.kind == TransportKind::SpiBus) {
             return std::unique_ptr<INfcTransport>(new MockTransport());
         }
         return std::unique_ptr<INfcTransport>(new SerialTransport());

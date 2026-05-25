@@ -2,6 +2,7 @@
 
 #include "nfc_hex_logger.hpp"
 #include "nfc_i2c_device.hpp"
+#include "nfc_spi_device.hpp"
 #include "nfc_protocol.hpp"
 #include "nfc_storage.hpp"
 
@@ -543,6 +544,30 @@ public:
         return NfcTransportFactory::probe_i2c_devices();
     }
 
+    // Enumerate SPI spidev* devices for the SpiSelect modal.
+    std::vector<TransportEndpoint> enumerate_spi_devices()
+    {
+        return NfcTransportFactory::enumerate_spi_devices();
+    }
+
+    // Select a specific SPI endpoint for connection.
+    void select_spi_endpoint(const TransportEndpoint &ep)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (transport_) { transport_->close(); transport_.reset(); }
+        connection_ = ConnectionState{};
+        intended_kind_ = TransportKind::SpiBus;
+        for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
+            if (endpoints_[i].kind == TransportKind::SpiBus &&
+                endpoints_[i].path == ep.path) {
+                selected_endpoint_ = i;
+                return;
+            }
+        }
+        endpoints_.push_back(ep);
+        selected_endpoint_ = static_cast<int>(endpoints_.size()) - 1;
+    }
+
     // Select a specific I2C endpoint for connection. If the endpoint is not
     // already in the cached list (e.g. from an on-demand scan), it is appended.
     void select_i2c_endpoint(const TransportEndpoint &ep)
@@ -639,11 +664,12 @@ public:
             }
         }
 
-        // Build cycle: USB → UART → I2C (always; Mock removed).
+        // Build cycle: USB → UART → I2C → SPI (always; Mock removed).
         std::vector<TransportKind> cycle;
         cycle.push_back(TransportKind::UsbSerial);
         cycle.push_back(TransportKind::UartSerial);
         cycle.push_back(TransportKind::I2cBus);
+        cycle.push_back(TransportKind::SpiBus);
 
         // current_kind already determined above (stable after refresh)
 
@@ -1106,6 +1132,24 @@ public:
                     }
                 }
             }
+        } else if (connection_.endpoint.kind == TransportKind::SpiBus) {
+            spi_device_ = std::make_unique<NfcSpiDevice>();
+            std::string spi_error;
+            if (!spi_device_->open(connection_.endpoint.path, &spi_error)) {
+                connection_.connected = false;
+                connection_.device_kind = DeviceKind::NotConnected;
+                connection_.detail = "SPI open failed: " + spi_error;
+                spi_device_.reset();
+            } else {
+                connection_.device_kind = spi_device_->device_kind();
+                connection_.pn532_ready = true;
+                connection_.status = std::string("Connected ") + to_string(connection_.device_kind);
+                char ver[128];
+                std::snprintf(ver, sizeof(ver), "%s @%s",
+                    to_string(connection_.device_kind),
+                    connection_.endpoint.path.c_str());
+                connection_.detail = ver;
+            }
         }
         return true;
     }
@@ -1118,6 +1162,7 @@ public:
         if (transport_) transport_->close();
         transport_.reset();
         i2c_device_.reset();
+        spi_device_.reset();
         connection_ = ConnectionState{};
     }
 
@@ -1704,16 +1749,19 @@ public:
                                     (connection_.endpoint.kind == TransportKind::I2cBus ||
                                      connection_.device_kind == DeviceKind::NFCUnit ||
                                      connection_.device_kind == DeviceKind::GroveNFC));
+        const bool spi_connected = (spi_device_ && spi_device_->is_open() &&
+                                    connection_.endpoint.kind == TransportKind::SpiBus);
         const bool transport_connected = (transport_ && transport_->is_open());
-        if (!i2c_connected && !transport_connected) {
+        if (!i2c_connected && !spi_connected && !transport_connected) {
             scan_.running = false;
             scan_.status = "No device";
             const bool i2c_expected = (connection_.endpoint.kind == TransportKind::I2cBus ||
                                        connection_.device_kind == DeviceKind::NFCUnit ||
                                        connection_.device_kind == DeviceKind::GroveNFC);
-            scan_.error = i2c_expected
-                ? "Connect I2C device first"
-                : "Connect USB/UART first";
+            const bool spi_expected = (connection_.endpoint.kind == TransportKind::SpiBus);
+            scan_.error = spi_expected  ? "Connect SPI device first"
+                        : i2c_expected  ? "Connect I2C device first"
+                                        : "Connect USB/UART first";
             return false;
         }
         if (scan_.running) return false;
@@ -4341,17 +4389,22 @@ private:
         DeviceKind device_kind = DeviceKind::Unknown;
         INfcTransport *transport_raw = nullptr;
         I2cGroveNfcDevice *i2c_dev = nullptr;
+        NfcSpiDevice *spi_dev = nullptr;
         bool use_i2c_path = false;
+        bool use_spi_path = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             endpoint    = connection_.endpoint;
             device_kind = connection_.device_kind;
             transport_raw = transport_.get();
             i2c_dev = i2c_device_.get();
+            spi_dev = spi_device_.get();
             use_i2c_path = (i2c_dev && i2c_dev->is_open() &&
                             (endpoint.kind == TransportKind::I2cBus ||
                              device_kind == DeviceKind::NFCUnit ||
                              device_kind == DeviceKind::GroveNFC));
+            use_spi_path = (spi_dev && spi_dev->is_open() &&
+                            endpoint.kind == TransportKind::SpiBus);
         }
 
         SavedRecord record;
@@ -4449,6 +4502,56 @@ private:
             scan_.running = false;
             scan_.status = "I2C device not open";
             scan_.error = "No I2C device";
+            return;
+        } else if (use_spi_path) {
+            NfcHexLog::get().log_event("scan", "path spi");
+            push_log("> Scanning SPI NFC (ST25R3916)...");
+            I2cCardInfo card;
+            const bool card_ok = spi_dev->readCard(&card);
+            if (card_ok && card.valid) {
+                TagInfo tag;
+                std::string uid_norm;
+                uid_norm.reserve(card.uid.size());
+                for (char ch : card.uid) {
+                    if (std::isxdigit(static_cast<unsigned char>(ch))) {
+                        uid_norm.push_back(static_cast<char>(
+                            std::toupper(static_cast<unsigned char>(ch))));
+                    }
+                }
+                tag.uid = uid_norm.empty() ? card.uid : uid_norm;
+                tag.protocol = i2c_protocol_to_kind(card.protocol);
+                tag.tag_type = i2c_protocol_to_tag_type(card.protocol);
+                tag.magic_type = card.magic_type;
+                tag.raw_data.clear();
+                if (!card.atqa_hex.empty()) tag.identity_fields["ATQA"] = card.atqa_hex;
+                if (!card.sak_hex.empty()) tag.identity_fields["SAK"] = card.sak_hex;
+                emit_scan_summary(to_string(tag.protocol),
+                                  tag.uid,
+                                  tag.tag_type,
+                                  card.atqa_hex,
+                                  card.sak_hex,
+                                  tag.magic_type);
+                emit_scan_tail();
+                record = make_record_from_tag(tag, endpoint, false, "st25r");
+                success = true;
+            } else {
+                push_log("No card detected");
+                emit_scan_tail();
+                error = card_ok ? "no card present" : card.detail;
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            scan_.running = false;
+            scan_.last_record = record;
+            scan_.has_result = success;
+            scan_.status = success ? "Card found" : "No card";
+            scan_.error = error;
+            return;
+        } else if (endpoint.kind == TransportKind::SpiBus) {
+            NfcHexLog::get().log_event("scan", "path spi-missing-device");
+            std::lock_guard<std::mutex> lock(mutex_);
+            scan_.running = false;
+            scan_.status = "SPI device not open";
+            scan_.error = "No SPI device";
             return;
         }
 
@@ -5352,6 +5455,7 @@ private:
     TransportKind intended_kind_ = TransportKind::UsbSerial; // tracks user intent even when no device
     std::unique_ptr<INfcTransport> transport_;
     std::unique_ptr<I2cGroveNfcDevice> i2c_device_;
+    std::unique_ptr<NfcSpiDevice> spi_device_;
     ConnectionState connection_;
     ScanState scan_;
     std::unordered_map<std::string, UhfTagSnapshot> uhf_tags_;
