@@ -3726,12 +3726,12 @@ private:
         if (len < 3) return false;
         if (frame.size() != static_cast<size_t>(len + 2)) return false;
 
-        int checksum_source = 0;
-        for (size_t i = 0; i + 1 < frame.size(); ++i) {
-            checksum_source = (checksum_source + (frame[i] & 0xFF)) & 0xFF;
+        // Android mtools parity: full frame checksum must fold to 0x00.
+        int checksum_total = 0;
+        for (uint8_t b : frame) {
+            checksum_total = (checksum_total + (b & 0xFF)) & 0xFF;
         }
-        const uint8_t checksum = static_cast<uint8_t>(((~checksum_source) + 1) & 0xFF);
-        if (checksum != frame.back()) return false;
+        if (checksum_total != 0) return false;
 
         if (cmd) *cmd = frame[3];
         if (data) {
@@ -3938,6 +3938,49 @@ private:
             (void)try_layout(2, 4, true, 1);
         };
 
+        auto parse_a0_inventory_buffer_data = [&](const std::vector<uint8_t> &data) {
+            if (data.size() < 11) return;
+
+            const int inv_data_len = data[0] & 0xFF;
+            if (inv_data_len < 4) return;
+
+            const size_t required_len = 1u + static_cast<size_t>(inv_data_len) + 4u + 3u + 1u + 1u;
+            if (data.size() < required_len) return;
+
+            const size_t inv_start = 1;
+            const size_t inv_end = inv_start + static_cast<size_t>(inv_data_len);
+            const size_t meta_offset = inv_end;
+
+            UhfTagSnapshot row;
+            row.pc = keep_hex_chars_upper(
+                bytes_to_hex_string(data.data() + inv_start, 2));
+            row.crc = keep_hex_chars_upper(
+                bytes_to_hex_string(data.data() + inv_end - 2, 2));
+            row.epc = keep_hex_chars_upper(
+                bytes_to_hex_string(data.data() + inv_start + 2, static_cast<size_t>(inv_data_len - 4)));
+
+            if (!looks_like_epc(row.epc)) return;
+
+            const uint32_t rssi =
+                ((data[meta_offset + 0] & 0xFFu) << 24) |
+                ((data[meta_offset + 1] & 0xFFu) << 16) |
+                ((data[meta_offset + 2] & 0xFFu) << 8) |
+                (data[meta_offset + 3] & 0xFFu);
+            row.rssi = std::to_string(static_cast<unsigned long long>(rssi));
+
+            const uint32_t freq_hz =
+                ((data[meta_offset + 4] & 0xFFu) << 16) |
+                ((data[meta_offset + 5] & 0xFFu) << 8) |
+                (data[meta_offset + 6] & 0xFFu);
+            row.frequency = std::to_string(static_cast<unsigned long long>(freq_hz));
+
+            row.antenna = std::to_string(static_cast<int>(data[meta_offset + 7] & 0xFF));
+            row.read_count = static_cast<int>(data[meta_offset + 8] & 0xFF);
+            if (row.read_count <= 0) row.read_count = 1;
+            row.raw_hex = bytes_to_hex_string(data.data(), data.size(), 64);
+            out.push_back(row);
+        };
+
         std::vector<std::vector<uint8_t>> a0_frames;
         if (extract_a0_frames(raw, &a0_frames)) {
             for (const auto &frame : a0_frames) {
@@ -3945,7 +3988,11 @@ private:
                 std::vector<uint8_t> data;
                 if (!parse_a0_frame(frame, &cmd, &data)) continue;
                 if (cmd == 0x72) continue; // firmware response, not EPC payload
-                parse_a0_realtime_data(data);
+                if (cmd == 0x89) {
+                    parse_a0_realtime_data(data);
+                } else if (cmd == 0x8A) {
+                    parse_a0_inventory_buffer_data(data);
+                }
             }
             if (!out.empty()) return out;
         }
