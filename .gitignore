@@ -21,5 +21,8 @@ projects/RFID/static_lib/
 projects/RFID/build/
 projects/RFID/dist/
 projects/RFID/nfc_i2c_magic_probe
+projects/RFID/nfc_unit_autotest.sh
+projects/RFID/nfc_unit_i2c_mode.py
+projects/RFID/nfc_unit_raw_autotest.sh
 projects/APPLaunch/overlay-diag-*/
 
