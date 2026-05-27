@@ -531,7 +531,9 @@ public:
             if (endpoints_[i].path == path) {
                 if (transport_) { transport_->close(); transport_.reset(); }
                 connection_ = ConnectionState{};
+                intended_kind_ = endpoints_[i].kind;
                 selected_endpoint_ = i;
+                storage_.save_last_transport_kind(intended_kind_);
                 return true;
             }
         }
@@ -557,6 +559,7 @@ public:
         if (transport_) { transport_->close(); transport_.reset(); }
         connection_ = ConnectionState{};
         intended_kind_ = TransportKind::SpiBus;
+        storage_.save_last_transport_kind(intended_kind_);
         for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
             if (endpoints_[i].kind == TransportKind::SpiBus &&
                 endpoints_[i].path == ep.path) {
@@ -577,6 +580,7 @@ public:
         if (transport_) { transport_->close(); transport_.reset(); }
         connection_ = ConnectionState{};
         intended_kind_ = TransportKind::I2cBus;
+        storage_.save_last_transport_kind(intended_kind_);
         // Reuse existing slot if the path is already known
         for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
             if (endpoints_[i].kind == TransportKind::I2cBus &&
@@ -704,6 +708,7 @@ public:
         if (transport_) { transport_->close(); transport_.reset(); }
         connection_ = ConnectionState{};
         intended_kind_ = target_kind;
+        storage_.save_last_transport_kind(target_kind);
 
         if (target_index < 0) {
             // No physical device for this kind – stay in the slot, report it
@@ -712,7 +717,6 @@ public:
         }
 
         selected_endpoint_ = target_index;
-        storage_.save_last_transport_kind(target_kind);
         if (status) *status = std::string("Mode: ") + to_string(target_kind);
         return true;
     }
@@ -914,12 +918,7 @@ public:
                     return true;
                 }
 
-                push_log("[Detect] USB2.0 direct UHF probe failed");
-                connection_.device_kind = DeviceKind::OtherSerial;
-                connection_.pn532_ready = false;
-                connection_.status = "Connected Serial";
-                connection_.detail = "USB2.0 device, UHF probe failed";
-                return true;
+                push_log("[Detect] USB2.0 direct UHF probe failed, fallback to PN532 probe");
             }
 
             if (!force_pn_by_name &&
@@ -1139,6 +1138,10 @@ public:
                 connection_.connected = false;
                 connection_.device_kind = DeviceKind::NotConnected;
                 connection_.detail = "SPI open failed: " + spi_error;
+                std::fprintf(stderr,
+                    "[NFC][ST25R3916] SPI open failed on %s: %s\n",
+                    connection_.endpoint.path.c_str(),
+                    spi_error.c_str());
                 spi_device_.reset();
             } else {
                 connection_.device_kind = spi_device_->device_kind();
@@ -1149,6 +1152,15 @@ public:
                     to_string(connection_.device_kind),
                     connection_.endpoint.path.c_str());
                 connection_.detail = ver;
+                if (spi_device_->accepted_nonstandard_ic()) {
+                    std::fprintf(stderr,
+                        "[NFC][ST25R3916] SPI connected via debug fallback (non-standard IC_ID): %s\n",
+                        connection_.detail.c_str());
+                } else {
+                    std::fprintf(stderr,
+                        "[NFC][ST25R3916] SPI connected: %s\n",
+                        connection_.detail.c_str());
+                }
             }
         }
         return true;

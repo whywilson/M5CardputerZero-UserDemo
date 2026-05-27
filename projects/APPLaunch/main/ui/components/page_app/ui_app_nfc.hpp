@@ -125,6 +125,7 @@ private:
     uint32_t    toast_expire_tick_ = 0;  // 0 = no active toast
     // EMU dump completion tracking (to show toast when async dump finishes)
     bool last_emu_dump_running_   = false;
+    bool last_emu_probe_running_  = false;
     // HW upload completion tracking
     bool last_hw_upload_running_  = false;
     // MFKey tool state
@@ -181,6 +182,7 @@ private:
     std::string pn532_ndef_body_     = "m5stack.com";
     bool        uri_edit_for_nfcunit_ = false;
     uint32_t    last_key_codepoint_  = 0; // Unicode codepoint of last key event
+    nfc_app::DeviceKind last_serial_device_kind_ = nfc_app::DeviceKind::Unknown;
     // Hex log overlay scroll offset (line index from top)
     int hex_log_scroll_ = 0;
     // UID Changer state
@@ -277,6 +279,50 @@ private:
                !uhf_table_rows_.empty();
     }
 
+    nfc_app::TransportEndpoint active_endpoint_for_ui(const nfc_app::ConnectionState &conn) const
+    {
+        return conn.connected ? conn.endpoint : service_.current_endpoint();
+    }
+
+    void cache_serial_device_kind(const nfc_app::ConnectionState &conn)
+    {
+        if (!conn.connected) return;
+        if (conn.endpoint.kind != nfc_app::TransportKind::UsbSerial &&
+            conn.endpoint.kind != nfc_app::TransportKind::UartSerial) {
+            return;
+        }
+        if (conn.device_kind == nfc_app::DeviceKind::PN532Killer ||
+            conn.device_kind == nfc_app::DeviceKind::PN532) {
+            last_serial_device_kind_ = conn.device_kind;
+        }
+    }
+
+    nfc_app::DeviceKind effective_emu_device_kind(const nfc_app::ConnectionState &conn) const
+    {
+        if (conn.device_kind != nfc_app::DeviceKind::Unknown &&
+            conn.device_kind != nfc_app::DeviceKind::NotConnected) {
+            return conn.device_kind;
+        }
+        if (conn.connected &&
+            (conn.endpoint.kind == nfc_app::TransportKind::UsbSerial ||
+             conn.endpoint.kind == nfc_app::TransportKind::UartSerial) &&
+            (last_serial_device_kind_ == nfc_app::DeviceKind::PN532Killer ||
+             last_serial_device_kind_ == nfc_app::DeviceKind::PN532)) {
+            return last_serial_device_kind_;
+        }
+        return conn.device_kind;
+    }
+
+    static bool is_identified_device_kind(nfc_app::DeviceKind kind)
+    {
+        return kind == nfc_app::DeviceKind::PN532 ||
+               kind == nfc_app::DeviceKind::PN532Killer ||
+               kind == nfc_app::DeviceKind::UHFReader ||
+               kind == nfc_app::DeviceKind::GroveNFC ||
+               kind == nfc_app::DeviceKind::NFCUnit ||
+               kind == nfc_app::DeviceKind::ST25RNFC;
+    }
+
     int read_scroll_max_offset() const
     {
         if (read_uses_uhf_table()) {
@@ -300,6 +346,14 @@ private:
         }
         self->consume_nfcunit_emu_autostart_result();
         self->process_nfc_automation_command();
+        const bool emu_probe_running_now = self->service_.emu_probe_running();
+        if (self->last_emu_probe_running_ && !emu_probe_running_now) {
+            // Probe finished: refresh once so slot block0/UID appears immediately.
+            if (self->current_tab_ == Tab::Emulator) {
+                self->render_all();
+            }
+        }
+        self->last_emu_probe_running_ = emu_probe_running_now;
         // Long-press scroll: hold 400ms→scroll, hold 1500ms→fast scroll, hold 2000ms→jump to top/bottom
         // Works for Read tab scan log AND for HexLog modal
         if (self->held_scroll_key_ != 0) {
@@ -487,7 +541,8 @@ private:
         if (current_tab_ == Tab::Emulator && modal_ == Modal::None &&
             (raw_key == KEY_F || raw_key == KEY_X)) {
             const auto conn = service_.connection_state();
-            if (conn.device_kind == nfc_app::DeviceKind::PN532Killer) {
+            cache_serial_device_kind(conn);
+            if (effective_emu_device_kind(conn) == nfc_app::DeviceKind::PN532Killer) {
                 const int delta = (raw_key == KEY_F) ? -1 : 1;
                 hw_emu_slot_ = (hw_emu_slot_ + delta + 8) % 8;
                 emu_dump_scroll_ = 0;
@@ -541,15 +596,20 @@ private:
                 render_all();
             } else if (current_tab_ == Tab::Emulator) {
                 const auto conn = service_.connection_state();
-                if (conn.device_kind == nfc_app::DeviceKind::PN532Killer) {
+                cache_serial_device_kind(conn);
+                const auto emu_device_kind = effective_emu_device_kind(conn);
+                if (emu_device_kind == nfc_app::DeviceKind::PN532Killer) {
                     service_.cycle_hw_emu_protocol();
-                } else if (conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+                    emu_dump_scroll_ = 0;
+                    const auto proto = service_.current_emulator_protocol();
+                    service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
+                } else if (emu_device_kind == nfc_app::DeviceKind::NFCUnit) {
                     service_.toggle_nfcunit_profile_protocol();
                     ui_message_ = std::string("Profile -> ") + service_.nfcunit_profile_label();
                 } else {
                     service_.toggle_slot_protocol();
                 }
-                if (conn.device_kind != nfc_app::DeviceKind::NFCUnit) {
+                if (emu_device_kind != nfc_app::DeviceKind::NFCUnit) {
                     ui_message_ = std::string("Protocol -> ") + nfc_app::to_string(service_.current_emulator_protocol());
                 }
                 render_all();
@@ -572,9 +632,10 @@ private:
             break;
         case KEY_S:
             if (current_tab_ == Tab::Emulator) {
-                const auto endpoint = service_.current_endpoint();
                 const auto conn = service_.connection_state();
-                if (endpoint.kind == nfc_app::TransportKind::I2cBus || conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+                cache_serial_device_kind(conn);
+                const auto endpoint = active_endpoint_for_ui(conn);
+                if (endpoint.kind == nfc_app::TransportKind::I2cBus || effective_emu_device_kind(conn) == nfc_app::DeviceKind::NFCUnit) {
                     if (service_.nfcunit_emulation_running()) {
                         ui_message_ = "NFC Unit already running";
                     } else if (nfcunit_emu_autostart_running_) {
@@ -599,9 +660,10 @@ private:
             break;
         case KEY_P:
             if (current_tab_ == Tab::Emulator) {
-                const auto endpoint = service_.current_endpoint();
                 const auto conn = service_.connection_state();
-                if (endpoint.kind == nfc_app::TransportKind::I2cBus || conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+                cache_serial_device_kind(conn);
+                const auto endpoint = active_endpoint_for_ui(conn);
+                if (endpoint.kind == nfc_app::TransportKind::I2cBus || effective_emu_device_kind(conn) == nfc_app::DeviceKind::NFCUnit) {
                     service_.grovenfc_deactivate();
                     ui_message_ = "NFC Unit emulation stopped";
                     render_all();
@@ -747,6 +809,14 @@ private:
         }
         if (current_tab_ == Tab::Emulator) {
             ui_message_ = "EMU ready";
+            const auto conn = service_.connection_state();
+            cache_serial_device_kind(conn);
+            if (conn.connected &&
+                effective_emu_device_kind(conn) == nfc_app::DeviceKind::PN532Killer) {
+                emu_dump_scroll_ = 0;
+                const auto proto = service_.current_emulator_protocol();
+                service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
+            }
         } else if (current_tab_ == Tab::Read) {
             // When entering READ tab with PN532Killer: always switch back to reader mode
             // regardless of which tab we came from (e.g. from Tools or Emulator).
@@ -1025,7 +1095,8 @@ private:
             break;
         case Tab::Emulator: {
             const auto conn = service_.connection_state();
-            if (conn.device_kind == nfc_app::DeviceKind::PN532Killer) {
+            cache_serial_device_kind(conn);
+            if (effective_emu_device_kind(conn) == nfc_app::DeviceKind::PN532Killer) {
                 const auto info = service_.emu_slot_info(
                     service_.current_emulator_protocol(), hw_emu_slot_);
                 if (info.dump_loaded && !info.dump_lines.empty()) {
@@ -1125,19 +1196,19 @@ private:
             break;
         case Tab::Emulator:
             {
-                const auto endpoint = service_.current_endpoint();
+                const auto conn0 = service_.connection_state();
+                cache_serial_device_kind(conn0);
+                const auto endpoint = active_endpoint_for_ui(conn0);
                 if (endpoint.kind == nfc_app::TransportKind::I2cBus) {
                     modal_ = Modal::EmulatorAction;
                     modal_idx_ = 0;
                     break;
                 }
 
-                const auto conn0 = service_.connection_state();
                 const bool ep0_unidentified =
-                    (conn0.device_kind == nfc_app::DeviceKind::Unknown ||
-                     conn0.device_kind == nfc_app::DeviceKind::NotConnected);
-                if ((!conn0.connected || ep0_unidentified) &&
-                    service_.current_endpoint().kind == nfc_app::TransportKind::I2cBus) {
+                    (effective_emu_device_kind(conn0) == nfc_app::DeviceKind::Unknown ||
+                     effective_emu_device_kind(conn0) == nfc_app::DeviceKind::NotConnected);
+                if ((!conn0.connected || ep0_unidentified) && endpoint.kind == nfc_app::TransportKind::I2cBus) {
                     start_nfcunit_emu_autostart_async();
                     ui_message_ = "NFC Unit connecting...";
                     break;
@@ -1288,6 +1359,7 @@ private:
     void render_all()
     {
         update_scan_log();
+        cache_serial_device_kind(service_.connection_state());
         if (current_tab_ == Tab::Tools) {
             if (modal_ == Modal::DeviceProbe) set_page_title("RFID > Device Probe");
             else if (modal_ == Modal::UartConfig) set_page_title("RFID > UART Config");
@@ -1370,9 +1442,14 @@ private:
         // Always drain real-time block lines pushed during Gen1A dump
         {
             auto lines = service_.drain_pending_log();
+            const auto conn = service_.connection_state();
+            const bool suppress_detect_trace = conn.connected && is_identified_device_kind(conn.device_kind);
             for (auto &l : lines) {
                 // UHF scan hits can be very frequent; the table view already shows live counts.
                 if (l.size() >= 4 && l[0] == 'E' && l[1] == 'P' && l[2] == 'C' && l[3] == ' ') {
+                    continue;
+                }
+                if (suppress_detect_trace && l.rfind("[Detect]", 0) == 0) {
                     continue;
                 }
                 scan_log_lines_.push_back(std::move(l));
@@ -1967,13 +2044,15 @@ private:
     void render_emulator_tab(lv_obj_t *parent)
     {
         const auto connection = service_.connection_state();
-        const auto endpoint = service_.current_endpoint();
+        cache_serial_device_kind(connection);
+        const auto endpoint = active_endpoint_for_ui(connection);
+        const auto emu_device_kind = effective_emu_device_kind(connection);
         const auto protocol = service_.current_emulator_protocol();
 
         lv_obj_t *left  = create_panel(parent, 0, 0, 116, 104, 0x101010);
         lv_obj_t *right = create_panel(parent, 120, 0, 200, 104, 0x101010);
 
-        if (connection.device_kind == nfc_app::DeviceKind::PN532Killer) {
+        if (emu_device_kind == nfc_app::DeviceKind::PN532Killer) {
             // ── HW EMU mode: show PN532Killer hardware slot ──────────────────
             const std::string proto_name =
                 (protocol == nfc_app::ProtocolKind::MifareClassic) ? "MFC" :
@@ -2069,7 +2148,7 @@ private:
                 create_text(right, 6, 20, "(no data)", 0x555555, 10);
                 create_text(right, 6, 36, "F/X to probe slot", 0x444444, 10);
             }
-        } else if (connection.device_kind == nfc_app::DeviceKind::PN532) {
+        } else if (emu_device_kind == nfc_app::DeviceKind::PN532) {
             // ── PN532 NDEF target emulation ───────────────────────────────────
             const auto ndef = service_.pn532_ndef_state();
             create_text(left, 6, 4,  "NDEF EMU", 0x00D2FF, 12);
@@ -2085,8 +2164,8 @@ private:
                 create_text(right, 6, 50, to_compact(std::string("ERR: ") + ndef.error, 30).c_str(), 0xFF8888, 10);
             }
             create_text(right, 6, 76, "OK: Start / Edit URI / Stop", 0x555555, 10);
-        } else if (connection.device_kind == nfc_app::DeviceKind::GroveNFC ||
-                   connection.device_kind == nfc_app::DeviceKind::NFCUnit ||
+        } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC ||
+               emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
                    endpoint.kind == nfc_app::TransportKind::I2cBus) {
             // ── I2C EMU mode (GroveNFC / NFC Unit), 8 slots ───────────────────
             const std::string proto_name =
@@ -2095,15 +2174,15 @@ private:
                 (protocol == nfc_app::ProtocolKind::Iso15693)      ? "ISO15693" :
                                                                                  "NFC-A";
             const bool is_nfc_unit =
-                (connection.device_kind == nfc_app::DeviceKind::NFCUnit) ||
+                (emu_device_kind == nfc_app::DeviceKind::NFCUnit) ||
                 (endpoint.kind == nfc_app::TransportKind::I2cBus &&
-                 (connection.device_kind == nfc_app::DeviceKind::Unknown ||
-                  connection.device_kind == nfc_app::DeviceKind::NotConnected));
+                 (emu_device_kind == nfc_app::DeviceKind::Unknown ||
+                  emu_device_kind == nfc_app::DeviceKind::NotConnected));
             const std::string nfc_unit_profile = is_nfc_unit ? service_.nfcunit_profile_label() : std::string();
             create_text(left, 6, 4,  "SW EMU", 0x00FF88, 12);
             if (is_nfc_unit) {
                 create_text(left, 6, 18,
-                            (connection.device_kind == nfc_app::DeviceKind::NFCUnit) ? "Profile mode" : "I2C pending",
+                            (emu_device_kind == nfc_app::DeviceKind::NFCUnit) ? "Profile mode" : "I2C pending",
                             0xFFFFFF, 12);
             } else {
                 const std::string slot_str = "Slot " + std::to_string(hw_emu_slot_ + 1) + "/8";
@@ -2148,9 +2227,10 @@ private:
 
             create_text(right, 6, 4,  "Hardware EMU:", 0x8E8E8E, 11);
             create_text(right, 6, 18, "PN532Killer", 0xFFD700, 11);
-            create_text(right, 6, 30, "Software EMU:", 0x8E8E8E, 11);
-            create_text(right, 6, 44, "GroveNFC (I2C)", 0x00FF88, 11);
-            create_text(right, 6, 66, (std::string("Status: ") + nfc_app::to_string(connection.device_kind)).c_str(), 0x555555, 10);
+            create_text(right, 6, 30, "I2C mode for SW EMU", 0x00FF88, 11);
+            create_text(right, 6, 44, "Use Read tab Tab-key", 0x9E9E9E, 10);
+            create_text(right, 6, 66, (std::string("Mode: ") + nfc_app::to_string(endpoint.kind)).c_str(), 0x555555, 10);
+            create_text(right, 6, 80, (std::string("Status: ") + nfc_app::to_string(emu_device_kind)).c_str(), 0x555555, 10);
         }
 
         create_footer(parent, ui_message_);
@@ -2169,9 +2249,11 @@ private:
         lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
 
         const auto conn = service_.connection_state();
-        const auto endpoint = service_.current_endpoint();
-        const bool pn532_ndef_menu = (conn.device_kind == nfc_app::DeviceKind::PN532);
-        const bool nfc_unit_mode = (conn.device_kind == nfc_app::DeviceKind::NFCUnit ||
+        cache_serial_device_kind(conn);
+        const auto endpoint = active_endpoint_for_ui(conn);
+        const auto emu_device_kind = effective_emu_device_kind(conn);
+        const bool pn532_ndef_menu = (emu_device_kind == nfc_app::DeviceKind::PN532);
+        const bool nfc_unit_mode = (emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
                                     endpoint.kind == nfc_app::TransportKind::I2cBus);
         const bool nfc_unit_url_mode = nfc_unit_mode &&
             service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso14443A;
@@ -2845,7 +2927,6 @@ private:
                 scan_log_lines_.clear();
                 log_scroll_offset_ = 0;
                 scan_log_lines_.push_back("> Connect " + selected_ep.label.substr(0, 22) + "...");
-                scan_log_lines_.push_back("[Detect] PN532@115200 -> UHF@115200/9600");
                 pending_usb_connect_ = true;
                 pending_usb_connect_path_ = selected_ep.path;
                 ui_message_ = "Detecting device...";
@@ -4462,8 +4543,10 @@ private:
 
     void handle_emulator_action_key(uint32_t key)
     {
-        const auto dev_kind = service_.connection_state().device_kind;
-        const auto endpoint = service_.current_endpoint();
+        const auto conn = service_.connection_state();
+        cache_serial_device_kind(conn);
+        const auto dev_kind = effective_emu_device_kind(conn);
+        const auto endpoint = active_endpoint_for_ui(conn);
         const bool pn532_ndef_menu = (dev_kind == nfc_app::DeviceKind::PN532);
         const bool nfc_unit_mode = (dev_kind == nfc_app::DeviceKind::NFCUnit ||
                                     endpoint.kind == nfc_app::TransportKind::I2cBus);

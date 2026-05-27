@@ -1,0 +1,7 @@
+{
+  "package_name": "rfid",
+  "version": "0.1",
+  "app_name": "RFID",
+  "bin_name": "M5CardputerZero-RFID",
+  "description": "CardputerZero RFID Independent Application"
+}

@@ -9,4 +9,17 @@ doc
 tools
 setup.ini
 pi
+.vscode/
+
+# Keep diagnostics scripts and avoid committing timestamped overlay dumps.
+!projects/APPLaunch/tools/
+projects/APPLaunch/tools/*
+!projects/APPLaunch/tools/collect_overlay_diag.sh
+!projects/RFID/
+!projects/RFID/**
+projects/RFID/static_lib/
+projects/RFID/build/
+projects/RFID/dist/
+projects/RFID/nfc_i2c_magic_probe
+projects/APPLaunch/overlay-diag-*/
 
