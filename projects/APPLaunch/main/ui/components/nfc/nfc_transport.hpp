@@ -479,6 +479,14 @@ public:
         }
         closedir(d);
         std::sort(result.begin(), result.end(), [](const TransportEndpoint &a, const TransportEndpoint &b) {
+            auto score = [](const std::string &path) {
+                if (path.find("/dev/spidev0.1") != std::string::npos) return 0;
+                if (path.find("/dev/spidev0.0") != std::string::npos) return 1;
+                return 2;
+            };
+            const int sa = score(a.path);
+            const int sb = score(b.path);
+            if (sa != sb) return sa < sb;
             return a.path < b.path;
         });
 #endif
