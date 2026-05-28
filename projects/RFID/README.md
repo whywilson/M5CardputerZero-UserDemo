@@ -28,6 +28,46 @@ Exec path:
 
 - /usr/share/APPLaunch/bin/M5CardputerZero-RFID
 
+## Debian packaging (official layout)
+
+This project now includes an official-style Debian packaging script:
+
+- tools/package_deb.py
+
+The script creates a package layout compatible with the APPLaunch guide:
+
+- DEBIAN/control
+- DEBIAN/postinst
+- DEBIAN/prerm
+- usr/share/APPLaunch/applications/rfid.desktop
+- usr/share/APPLaunch/bin/M5CardputerZero-RFID
+- usr/share/APPLaunch/share/images/rfid.png
+
+Build and package:
+
+```bash
+cd projects/RFID
+scons -j$(nproc)
+python3 tools/package_deb.py --maintainer "yourname <you@example.com>"
+```
+
+Output package:
+
+- build/rfid_0.1-m5stack1_arm64.deb
+
+Install on device:
+
+```bash
+scp build/rfid_0.1-m5stack1_arm64.deb pi@<device-ip>:/tmp/
+ssh pi@<device-ip> "echo pi | sudo -S dpkg -i /tmp/rfid_0.1-m5stack1_arm64.deb"
+```
+
+If `dist/M5CardputerZero-RFID` is missing, you can let the script build it:
+
+```bash
+python3 tools/package_deb.py --build-if-missing --maintainer "yourname <you@example.com>"
+```
+
 ## Migration plan from APPLaunch NFC page
 
 1. Extract NFC domain service from APPLaunch into reusable modules:

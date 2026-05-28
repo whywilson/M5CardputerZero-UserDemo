@@ -128,6 +128,7 @@ private:
     bool last_emu_probe_running_  = false;
     // HW upload completion tracking
     bool last_hw_upload_running_  = false;
+    int pending_hw_upload_slot_   = -1;
     // MFKey tool state
     bool last_hw_mfkey_running_  = false;
     std::vector<nfc_app::NfcDeviceService::MfkeyResult> mfkey_results_;
@@ -417,10 +418,31 @@ private:
             }
         }
         self->last_emu_dump_running_ = emu_running_now;
-        // Detect HW upload completion → show toast
         const bool upload_running_now = self->service_.hw_upload_running();
+        // Keep footer status in sync while HW upload is running.
+        if (upload_running_now) {
+            int prog = self->service_.hw_upload_progress();
+            if (prog < 0) prog = 0;
+            if (prog > 64) prog = 64;
+            const int pct = (prog * 100) / 64;
+            if (self->pending_hw_upload_slot_ >= 0) {
+                self->ui_message_ = "Uploading to HW slot "
+                    + std::to_string(self->pending_hw_upload_slot_ + 1)
+                    + " " + std::to_string(pct) + "%";
+            } else {
+                self->ui_message_ = "Uploading " + std::to_string(pct) + "%";
+            }
+        }
+        // Detect HW upload completion → show toast
         if (self->last_hw_upload_running_ && !upload_running_now) {
-            self->show_toast(self->service_.hw_upload_ok() ? "Upload OK" : "Upload failed");
+            const bool ok = self->service_.hw_upload_ok();
+            self->show_toast(ok ? "Upload OK" : "Upload failed");
+            if (self->pending_hw_upload_slot_ >= 0) {
+                self->ui_message_ = ok
+                    ? ("Uploaded -> Slot " + std::to_string(self->pending_hw_upload_slot_ + 1))
+                    : "Upload failed";
+            }
+            self->pending_hw_upload_slot_ = -1;
         }
         self->last_hw_upload_running_ = upload_running_now;
         // Detect MFKey crack completion → cache results and advance wizard to step 3
@@ -3288,6 +3310,7 @@ private:
         lv_label_set_text(lbl, toast_text.c_str());
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
         lv_obj_set_width(lbl, W - 10);
+        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_color(lbl, lv_color_hex(0x00EE55), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(lbl, &lv_font_unscii_8, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_center(lbl);
@@ -4344,7 +4367,7 @@ private:
         // Text-editor style: fixed-width index + monospace hex data (unscii_8, 8px/char).
         // unscii_8 is exactly 8px per glyph so bytes always align perfectly.
         // 16 bytes raw hex = 32 chars × 8px = 256px, fits from x=32 to x=288 within 320px card.
-        constexpr int VISIBLE = 6;
+        constexpr int VISIBLE = 7;
         constexpr int ROW_H   = 13;
         int offset = edit_hex_line_ - 1;
         if (offset < 0) offset = 0;
@@ -4520,12 +4543,13 @@ private:
                 const auto dev_kind = service_.connection_state().device_kind;
                 if (dev_kind == nfc_app::DeviceKind::PN532Killer && record.tag.raw_data.size() == 64) {
                     if (service_.hw_start_upload_async(slot_select_idx_, record)) {
-                        ui_message_ = "Uploading to HW slot " + std::to_string(slot_select_idx_ + 1) + "...";
+                        pending_hw_upload_slot_ = slot_select_idx_;
+                        ui_message_ = "Uploading to HW slot " + std::to_string(slot_select_idx_ + 1) + " 0%";
                     } else {
                         ui_message_ = "Slot " + std::to_string(slot_select_idx_ + 1) + " saved (upload busy)";
                     }
                 } else {
-                    ui_message_ = "Uploaded -> Slot " + std::to_string(slot_select_idx_ + 1);
+                    ui_message_ = "Uploaded -> Slot " + std::to_string(slot_select_idx_ + 1) + " (100%)";
                 }
             } else {
                 ui_message_ = "Upload failed";
@@ -4629,7 +4653,7 @@ private:
                 } else if (modal_idx_ == 2) {
                     if (!saved_records_.empty()) {
                         if (service_.upload_record_to_profile(service_.current_emulator_protocol(), saved_records_[saved_idx_])) {
-                            ui_message_ = "Uploaded to NFC Unit profile";
+                            ui_message_ = "Uploaded to NFC Unit profile (100%)";
                         } else {
                             ui_message_ = "Upload failed";
                         }
@@ -4707,14 +4731,15 @@ private:
                 } else if (dev_kind == nfc_app::DeviceKind::PN532Killer
                            && saved_records_[saved_idx_].tag.raw_data.size() == 64) {
                     if (service_.hw_start_upload_async(emu_slot, saved_records_[saved_idx_])) {
-                        ui_message_ = "Uploading to HW slot " + std::to_string(emu_slot + 1) + "...";
+                        pending_hw_upload_slot_ = emu_slot;
+                        ui_message_ = "Uploading to HW slot " + std::to_string(emu_slot + 1) + " 0%";
                     } else {
                         ui_message_ = "Upload failed (busy?)";
                     }
                 } else {
                     // Fallback: local slot assignment only
                     if (service_.upload_record_to_slot(saved_records_[saved_idx_])) {
-                        ui_message_ = "Uploaded saved data";
+                        ui_message_ = "Uploaded saved data (100%)";
                     } else {
                         ui_message_ = "Upload failed";
                     }

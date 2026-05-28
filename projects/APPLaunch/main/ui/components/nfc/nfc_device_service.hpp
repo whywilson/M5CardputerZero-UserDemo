@@ -830,10 +830,13 @@ public:
         connection_.device_kind = DeviceKind::Unknown;
 
         // Set log file mode prefix based on transport type.
-        if (connection_.endpoint.kind == TransportKind::I2cBus)
+        if (connection_.endpoint.kind == TransportKind::I2cBus) {
             NfcHexLog::get().set_mode("iic");
-        else
+        } else if (connection_.endpoint.kind == TransportKind::SpiBus) {
+            NfcHexLog::get().set_mode("spi");
+        } else {
             NfcHexLog::get().set_mode("uart");
+        }
 
         if (connection_.endpoint.kind == TransportKind::UsbSerial ||
             connection_.endpoint.kind == TransportKind::UartSerial) {
@@ -1154,12 +1157,21 @@ public:
                 connection_.detail = ver;
                 if (spi_device_->accepted_nonstandard_ic()) {
                     std::fprintf(stderr,
-                        "[NFC][ST25R3916] SPI connected via debug fallback (non-standard IC_ID): %s\n",
+                        "[NFC][ST25R3916] SPI connected via debug fallback (non-standard IC_ID): %s",
                         connection_.detail.c_str());
                 } else {
                     std::fprintf(stderr,
-                        "[NFC][ST25R3916] SPI connected: %s\n",
+                        "[NFC][ST25R3916] SPI connected: %s",
                         connection_.detail.c_str());
+                }
+                if (spi_device_->has_probe_7f00()) {
+                    std::fprintf(stderr,
+                        " probe7f00=[%02X %02X] probe_ok=%u\n",
+                        static_cast<unsigned>(spi_device_->probe_7f00_rx0()),
+                        static_cast<unsigned>(spi_device_->probe_7f00_rx1()),
+                        spi_device_->probe_7f00_ok() ? 1u : 0u);
+                } else {
+                    std::fprintf(stderr, " probe7f00=[NA] probe_ok=0\n");
                 }
             }
         }

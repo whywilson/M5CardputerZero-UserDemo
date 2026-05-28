@@ -6,6 +6,7 @@
 
 #include "nfc_models.hpp"
 #include "nfc_i2c_device.hpp"  // reuse I2cCardInfo
+#include "nfc_hex_logger.hpp"
 
 #include <cerrno>
 #include <cctype>
@@ -142,6 +143,16 @@ public:
         bss_wait_before_transfer_ = (parse_env_int("NFC_SPI_BSS_WAIT_BEFORE_XFER", 0) != 0);
         bss_ready_level_ = parse_env_int("NFC_SPI_BSS_READY_LEVEL", 0);
         bss_xfer_ready_timeout_ms_ = parse_env_int("NFC_SPI_BSS_XFER_READY_TIMEOUT_MS", 0);
+        bss_manual_select_ = false;
+        bss_active_level_ = 0;
+        bss_inactive_level_ = 1;
+        bss_select_settle_us_ = 0;
+        bss_release_settle_us_ = 0;
+        spi_no_cs_enabled_ = false;
+        probe_7f00_valid_ = false;
+        probe_7f00_ok_ = false;
+        probe_7f00_rx0_ = 0x00;
+        probe_7f00_rx1_ = 0x00;
         rst_sysfs_gpio_ = -1;
         bss_sysfs_gpio_ = -1;
         irq_sysfs_gpio_ = -1;
@@ -153,7 +164,7 @@ public:
             return false;
         }
 
-        // SPI mode 0 (CPOL=0, CPHA=0)
+        // SPI mode is selected by probe candidates below.
         // 8 bits per word
         uint8_t bits = 8;
         if (::ioctl(fd_, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0) {
@@ -174,16 +185,14 @@ public:
         } best;
 
         const uint8_t mode_candidates_all[] = {
-            static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE0", SPI_MODE_1)),
-            static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE1", SPI_MODE_2)),
+            static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE0", SPI_MODE_2)),
+            static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE1", SPI_MODE_1)),
             static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE2", SPI_MODE_0)),
             static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE3", SPI_MODE_3)),
         };
+        // Keep ST25R CAP access conservative and stable: probe at 1 MHz only.
         const uint32_t speed_candidates_all[] = {
-            static_cast<uint32_t>(parse_env_int("NFC_SPI_SPEED0", 500000)),
-            static_cast<uint32_t>(parse_env_int("NFC_SPI_SPEED1", 1000000)),
-            static_cast<uint32_t>(parse_env_int("NFC_SPI_SPEED2", 2000000)),
-            static_cast<uint32_t>(parse_env_int("NFC_SPI_SPEED3", 4000000)),
+            static_cast<uint32_t>(parse_env_int("NFC_SPI_SPEED", 1000000)),
         };
         const bool read_dummy_candidates_all[] = {
             parse_env_int("NFC_SPI_READ_DUMMY_FIRST", 1) != 0,
@@ -210,10 +219,46 @@ public:
                              const std::vector<bool> &dummy_opts) -> bool {
             for (uint8_t mode : modes) {
                 for (uint32_t speed : speeds) {
-                    if (::ioctl(fd_, SPI_IOC_WR_MODE, &mode) < 0) continue;
+                    uint8_t mode_with_flags = mode;
+                    bool no_cs_enabled = false;
+                    if (bss_manual_select_) {
+                        mode_with_flags = static_cast<uint8_t>(mode_with_flags | SPI_NO_CS);
+                        if (::ioctl(fd_, SPI_IOC_WR_MODE, &mode_with_flags) < 0) {
+                            mode_with_flags = mode;
+                            if (::ioctl(fd_, SPI_IOC_WR_MODE, &mode_with_flags) < 0) continue;
+                        } else {
+                            no_cs_enabled = true;
+                        }
+                    } else {
+                        if (::ioctl(fd_, SPI_IOC_WR_MODE, &mode_with_flags) < 0) continue;
+                    }
                     if (::ioctl(fd_, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) continue;
                     spi_mode_ = mode;
+                    spi_no_cs_enabled_ = no_cs_enabled;
                     spi_speed_hz_ = speed;
+
+                    // 2-byte probe: send [0x7F, 0x00] (READ cmd + dummy),
+                    // rx[0]=cmd-phase MISO, rx[1]=data-phase MISO (IC identity).
+                    if (!probe_7f00_valid_) {
+                        uint8_t tx7f[2] = {0x7F, 0x00};
+                        uint8_t rx7f[2] = {0x00, 0x00};
+                        probe_7f00_ok_ = spi_transfer(tx7f, rx7f, sizeof(tx7f));
+
+                        probe_7f00_rx0_ = rx7f[0];
+                        probe_7f00_rx1_ = rx7f[1];
+                        probe_7f00_valid_ = true;
+                        char msg[160];
+                        std::snprintf(msg, sizeof(msg),
+                            "probe 0x7F00 mode=%u speed=%u no_cs=%u -> [%02X %02X] ok=%u",
+                            static_cast<unsigned>(spi_mode_),
+                            static_cast<unsigned>(spi_speed_hz_),
+                            spi_no_cs_enabled_ ? 1u : 0u,
+                            static_cast<unsigned>(probe_7f00_rx0_),
+                            static_cast<unsigned>(probe_7f00_rx1_),
+                            probe_7f00_ok_ ? 1u : 0u);
+                        NfcHexLog::get().log_event("SPI", msg);
+                    }
+
                     for (bool with_dummy : dummy_opts) {
                         read_reg_with_dummy_ = with_dummy;
                         if (parse_env_int("NFC_SPI_FLIPPER_PROBE_INIT", 1) != 0) {
@@ -290,7 +335,7 @@ probe_done:
                 char buf[900];
                 std::snprintf(buf, sizeof(buf),
                     "ST25R3916 not found (IC=0x%02X IO0=0x%02X IO1=0x%02X OP=0x%02X mode=%u speed=%u dummy=%u strict=%u expanded=%u lora=%u bss_wait=%u bss_to=%d power5v=%u level=%d pwr_line=%s pi4io=%s) "
-                    "GPIO[rst,bss,irq]=[%d,%d,%d]->[%d,%d,%d] firstSPI[%02X %02X %02X]->[%02X %02X %02X] first_ok=%u%s%s%s%s%s",
+                    "GPIO[rst,bss,irq]=[%d,%d,%d]->[%d,%d,%d] firstSPI[%02X %02X %02X]->[%02X %02X %02X] first_ok=%u probe7f00=[%02X %02X] probe_ok=%u%s%s%s%s%s",
                     best.ic, best.r0, best.r1, best.r2,
                     static_cast<unsigned>(spi_mode_),
                     static_cast<unsigned>(spi_speed_hz_),
@@ -309,6 +354,9 @@ probe_done:
                     first_tx[0], first_tx[1], first_tx[2],
                     first_rx[0], first_rx[1], first_rx[2],
                     first_ok ? 1u : 0u,
+                    static_cast<unsigned>(probe_7f00_rx0_),
+                    static_cast<unsigned>(probe_7f00_rx1_),
+                    probe_7f00_ok_ ? 1u : 0u,
                     (looks_stuck_hi || looks_stuck_lo || looks_uniform)
                         ? " [SPI readback is uniform/stuck; check CAP power, CS wiring, and MISO path]"
                         : "",
@@ -379,6 +427,10 @@ probe_done:
     DeviceKind device_kind() const { return device_kind_; }
     const std::string &path() const { return spidev_path_; }
     bool accepted_nonstandard_ic() const { return accepted_nonstandard_ic_; }
+    bool has_probe_7f00() const { return probe_7f00_valid_; }
+    bool probe_7f00_ok() const { return probe_7f00_ok_; }
+    uint8_t probe_7f00_rx0() const { return probe_7f00_rx0_; }
+    uint8_t probe_7f00_rx1() const { return probe_7f00_rx1_; }
 
     // Scan for one ISO14443A card. Returns false if no card present or error.
     bool readCard(I2cCardInfo *out)
@@ -464,10 +516,20 @@ private:
     bool lora_compat_profile_ = true;
     bool strict_probe_profile_ = true;
     bool bss_wait_before_transfer_ = true;
+    bool bss_manual_select_ = false;
+    bool spi_no_cs_enabled_ = false;
     bool power_gate_enabled_ = false;
     int power_enable_level_ = -1;
     std::string power_line_target_ = "unset";
     bool accepted_nonstandard_ic_ = false;
+    bool probe_7f00_valid_ = false;
+    bool probe_7f00_ok_ = false;
+    uint8_t probe_7f00_rx0_ = 0x00;
+    uint8_t probe_7f00_rx1_ = 0x00;
+    int bss_active_level_ = 0;
+    int bss_inactive_level_ = 1;
+    int bss_select_settle_us_ = 0;
+    int bss_release_settle_us_ = 0;
     int bss_ready_level_ = 0;
     int bss_xfer_ready_timeout_ms_ = 25;
     std::string pi4io_status_ = "not-checked";
@@ -783,6 +845,16 @@ private:
         const int bss_input = parse_env_int("NFC_SPI_BSS_INPUT", 0);
         const int rst_active_level = parse_env_int("NFC_SPI_RST_ACTIVE_LEVEL", 0);
         const int bss_level = parse_env_int("NFC_SPI_BSS_LEVEL", 0);
+        const int bss_active_level = bss_level ? 1 : 0;
+        const int bss_inactive_level = parse_env_int("NFC_SPI_BSS_INACTIVE_LEVEL", bss_active_level ? 0 : 1) ? 1 : 0;
+        const bool prefer_hw_cs = (spidev_path_.find("/dev/spidev0.2") != std::string::npos);
+
+        bss_active_level_ = bss_active_level;
+        bss_inactive_level_ = bss_inactive_level;
+        bss_select_settle_us_ = parse_env_int("NFC_SPI_BSS_SELECT_SETTLE_US", 0);
+        bss_release_settle_us_ = parse_env_int("NFC_SPI_BSS_RELEASE_SETTLE_US", 0);
+        bss_manual_select_ = (!bss_input) &&
+            (parse_env_int("NFC_SPI_BSS_MANUAL_SELECT", prefer_hw_cs ? 0 : 1) != 0);
 
         if (irq_input && irq_line_fd_ < 0) {
             if (!gpio_open_input_line(chip_path, irq_offset, &irq_line_fd_)) {
@@ -827,14 +899,19 @@ private:
             }
         } else {
             if (bss_line_fd_ < 0) {
-                if (!gpio_open_output_line(chip_path, bss_offset, bss_level, &bss_line_fd_)) {
+                if (!gpio_open_output_line(chip_path, bss_offset, bss_inactive_level_, &bss_line_fd_)) {
                     bss_line_unavailable_ = true;
                 }
             } else {
-                (void)gpio_set_output_line_value(bss_line_fd_, bss_level);
+                (void)gpio_set_output_line_value(bss_line_fd_, bss_inactive_level_);
                 bss_line_unavailable_ = false;
             }
             bss_sysfs_gpio_ = -1;
+        }
+
+        // If BSS line is unavailable, fall back to hardware CS instead of failing transfers.
+        if (bss_manual_select_ && bss_line_fd_ < 0 && bss_sysfs_gpio_ < 0) {
+            bss_manual_select_ = false;
         }
 
         if (rst_line_fd_ < 0) {
@@ -843,7 +920,7 @@ private:
                 const int rst_gpio = parse_env_int("NFC_SPI_RST_GPIO", -1);
                 const int bss_gpio = parse_env_int("NFC_SPI_BSS_GPIO", -1);
                 if (bss_gpio >= 0) {
-                    (void)gpio_set_output_value_sysfs(bss_gpio, bss_level);
+                    (void)gpio_set_output_value_sysfs(bss_gpio, bss_inactive_level_);
                     bss_sysfs_gpio_ = bss_gpio;
                 }
                 if (rst_gpio >= 0) {
@@ -898,7 +975,34 @@ private:
     bool spi_transfer(const uint8_t *tx, uint8_t *rx, size_t len)
     {
         if (fd_ < 0 || !tx || !rx || len == 0) return false;
-        if (!wait_bss_ready_before_transfer()) return false;
+        if (!wait_bss_ready_before_transfer()) {
+            NfcHexLog::get().log_event("SPI", "transfer skipped: BSS not ready");
+            return false;
+        }
+
+        bool bss_selected = false;
+        auto release_bss = [&]() {
+            if (!bss_selected) return;
+            if (!set_bss_line_level(bss_inactive_level_)) {
+                NfcHexLog::get().log_event("SPI", "BSS release failed");
+            }
+            bss_selected = false;
+            if (bss_release_settle_us_ > 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(bss_release_settle_us_));
+            }
+        };
+
+        if (bss_manual_select_) {
+            if (!set_bss_line_level(bss_active_level_)) {
+                NfcHexLog::get().log_event("SPI", "transfer skipped: BSS assert failed");
+                return false;
+            }
+            bss_selected = true;
+            if (bss_select_settle_us_ > 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(bss_select_settle_us_));
+            }
+        }
+
         struct spi_ioc_transfer tr{};
         tr.tx_buf = (unsigned long)tx;
         tr.rx_buf = (unsigned long)rx;
@@ -906,7 +1010,16 @@ private:
         tr.speed_hz = spi_speed_hz_;
         tr.bits_per_word = 8;
         tr.delay_usecs = 0;
-        return (::ioctl(fd_, SPI_IOC_MESSAGE(1), &tr) >= 0);
+        const bool ok = (::ioctl(fd_, SPI_IOC_MESSAGE(1), &tr) >= 0);
+        release_bss();
+        if (ok) {
+            NfcHexLog::get().log_tx("SPI", tx, len);
+            NfcHexLog::get().log_rx("SPI", rx, len);
+        } else {
+            NfcHexLog::get().log_tx("SPI", tx, len);
+            NfcHexLog::get().log_event("SPI", "transfer ioctl failed");
+        }
+        return ok;
     }
 
     int sample_rst_line_level() const
@@ -956,6 +1069,14 @@ private:
             if (!read_bss_level(&value)) return true;
             if (value == bss_ready_level_) return true;
         }
+        return false;
+    }
+
+    bool set_bss_line_level(int level)
+    {
+        const int value = level ? 1 : 0;
+        if (bss_line_fd_ >= 0) return gpio_set_output_line_value(bss_line_fd_, value);
+        if (bss_sysfs_gpio_ >= 0) return gpio_set_output_value_sysfs(bss_sysfs_gpio_, value);
         return false;
     }
 

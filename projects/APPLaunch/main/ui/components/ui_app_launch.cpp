@@ -204,8 +204,6 @@ public:
 
         app_list.emplace_back("GALLERY", img_path("camera.png"), page_v<UIGalleryPage>);
 
-        app_list.emplace_back("RFID", img_path("rfid.png"), page_v<UINfcPage>);
-
         app_list.emplace_back("HIKEPOD", img_path("hack.png"), page_v<UIHikePodPage>);
 
         app_list.emplace_back("AICli", img_path("hack.png"), page_v<UIAICliPage>);
@@ -430,9 +428,9 @@ public:
                 continue;
             }
             bool in_list = false;
-            for (auto it : app_list)
+            for (const auto &it : app_list)
             {
-                if (it.Exec == app_exec)
+                if ((!it.Exec.empty() && it.Exec == app_exec) || it.Name == app_name)
                 {
                     in_list = true;
                     break;
@@ -440,7 +438,7 @@ public:
             }
             if (in_list)
             {
-                fprintf(stderr, "applications_load: skip %s (duplicate Exec)\n", filepath.c_str());
+                fprintf(stderr, "applications_load: skip %s (duplicate Name/Exec)\n", filepath.c_str());
                 continue;
             }
 

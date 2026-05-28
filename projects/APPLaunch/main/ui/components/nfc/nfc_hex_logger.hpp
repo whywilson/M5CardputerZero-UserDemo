@@ -103,6 +103,7 @@ public:
     // Set the transport mode prefix used in log file names.
     // E.g. set_mode("uart") → "uart-2025-01-01.txt"
     //      set_mode("iic")  → "iic-2025-01-01.txt"
+    //      set_mode("spi")  → "spi-2025-01-01.txt"
     //      set_mode("")     → "2025-01-01.txt" (no prefix)
     void set_mode(const char *mode)
     {
