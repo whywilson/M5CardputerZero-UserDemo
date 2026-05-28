@@ -7,7 +7,7 @@ import subprocess
   custom `config_defaults.mk` file and passed via the `CONFIG_DEFAULT_FILE` 
   environment variable.
 
-export CONFIG_DEFAULT_FILE=custom_config_defaults.mk
+export CONFIG_DEFAULT_FILE=linux_x86_cross_cp0_config_defaults.mk
 scons -j8
 """
 
@@ -32,6 +32,7 @@ if "cross" in os.environ.get("CONFIG_DEFAULT_FILE", ''):
         os.makedirs("build/config")
         with open("build/config/config_tmp.mk", "w") as f:
             f.write(f'CONFIG_TOOLCHAIN_SYSROOT="{static_lib_path}"\n')
+            f.write(f'CONFIG_TOOLCHAIN_FLAGS="-I{static_lib_path}/usr/include/aarch64-linux-gnu"\n')
 
 os.environ["SDK_PATH"] = str(sdk_path)
 os.environ["EXT_COMPONENTS_PATH"] = str(sdk_path.parent / "ext_components")
@@ -84,7 +85,7 @@ if cross_package_enabled:
         except AttributeError:
             pass
         down_url = (
-            "https://github.com/dianjixz/M5CardputerZero-UserDemo/"
+            "https://github.com/CardputerZero/M5CardputerZero-UserDemo/"
             "releases/download/{}/sdk_bsp.tar.gz"
         ).format(version)
         check_wget_down(down_url, "static_lib_{}.tar.gz".format(version))

@@ -2,10 +2,38 @@ import os
 import sys
 import platform
 import subprocess
+import shutil
+import parse as _parse
 # iomport env and tools from the SDK's scons project.py
 Import('env')
 with open(env['PROJECT_TOOL_S']) as f:
     exec(f.read())
+
+rootfs_path=os.environ.get("CONFIG_TOOLCHAIN_SYSROOT", "")
+
+def wget_github(url):
+    repo = _parse.parse("{}://{}/{}/{}.git", url)
+    repo_name = repo[3]
+    local_path = os.path.join(os.environ['GIT_REPO_PATH'], repo_name)
+    if not os.path.exists(local_path):
+        github_url = url[:-4] if url.endswith('.git') else url
+        down_url = github_url + "/archive/refs/heads/master.zip"
+        zip_file_name = '{}-master.zip'.format(repo_name)
+        file_path = wget_zip(down_url, zip_file_name)
+        extracted_dir = os.path.join(file_path, '{}-master'.format(repo_name))
+        if os.path.exists(extracted_dir):
+            shutil.move(extracted_dir, local_path)
+            shutil.rmtree(file_path)
+        else:
+            shutil.rmtree(file_path, ignore_errors=True)
+            down_url = github_url + "/archive/refs/heads/main.zip"
+            zip_file_name = '{}-main.zip'.format(repo_name)
+            file_path = wget_zip(down_url, zip_file_name)
+            extracted_dir = os.path.join(file_path, '{}-main'.format(repo_name))
+            if os.path.exists(extracted_dir):
+                shutil.move(extracted_dir, local_path)
+                shutil.rmtree(file_path)
+    return local_path
 
 # define the project's environment
 SRCS = []
@@ -26,9 +54,24 @@ script_dir = os.path.dirname(script_path)
 subprocess.run(
     [sys.executable, script_path],
     cwd=script_dir,
-    capture_output=True,   
-    text=True              
+    capture_output=True,
+    text=True
 )
+
+# Get git commit short hash for version display
+try:
+    _repo_root = subprocess.check_output(
+        ['git', 'rev-parse', '--show-toplevel'],
+        stderr=subprocess.DEVNULL
+    ).decode().strip()
+    _git_commit = subprocess.check_output(
+        ['git', 'rev-parse', '--short', 'HEAD'],
+        cwd=_repo_root,
+        stderr=subprocess.DEVNULL
+    ).decode().strip()
+except Exception:
+    _git_commit = 'unknown'
+print('-- Launcher git commit: %s' % _git_commit)
 
 
 # add srcs
@@ -40,12 +83,15 @@ INCLUDE += [ADir('.'), ADir('include')]
 # add requirements
 REQUIREMENTS += ['lvgl_component', 'pthread']
 
+# Inject git commit hash as a compile-time macro
+DEFINITIONS += ['-DLAUNCHER_GIT_COMMIT_RAW=%s' % _git_commit]
+
+# Startup animation (GIF splash): opt-in via environment variable
+if os.environ.get('APPLAUNCH_STARTUP_ANIMATION', '0') == '1':
+    DEFINITIONS += ['-DAPPLAUNCH_STARTUP_ANIMATION']
+
 # add miniaudio
 REQUIREMENTS += ['Miniaudio']
-# Ensure miniaudio.h is findable on all platforms (ext_components/Miniaudio/include)
-_miniaudio_include = os.path.join(os.environ.get("EXT_COMPONENTS_PATH", ""), "Miniaudio", "include")
-if os.path.isdir(_miniaudio_include):
-    INCLUDE += [_miniaudio_include]
 
 # add 
 if 'CONFIG_BACKWARD_CPP_ENABLED' in os.environ:
@@ -72,24 +118,36 @@ if 'linux_x86_sdl2_config_defaults.mk' in os.environ.get("CONFIG_DEFAULT_FILE", 
 # x86 cross
 if 'linux_x86_cross_cp0_config_defaults.mk' in os.environ.get("CONFIG_DEFAULT_FILE", ''):
     lvgl_component['DEFINITIONS'] += ['-D_REENTRANT']
-    lvgl_component['INCLUDE'] += ['/usr/include/freetype2', '/usr/include/libpng16']
-
-    SRCS += Glob('hal/linux/*.c*')
-    REQUIREMENTS += ['input', 'xkbcommon', 'udev', 'freetype']    
-    # add libcamera
-    REQUIREMENTS += ['camera', 'camera-base', 'jpeg']
-    LDFLAGS += [f'{os.environ.get("CONFIG_TOOLCHAIN_SYSROOT", "")}/usr/lib/aarch64-linux-gnu/libstdc++.so.6']
-
-# native aarch64
-if 'native_aarch64_cp0_config_defaults.mk' in os.environ.get("CONFIG_DEFAULT_FILE", ''):
-    lvgl_component['DEFINITIONS'] += ['-D_REENTRANT']
-    lvgl_component['INCLUDE'] += ['/usr/include/freetype2', '/usr/include/libpng16', '/usr/include/libcamera']
+    lvgl_component['INCLUDE'] += [f'{rootfs_path}/usr/include/freetype2', 
+                                  f'{rootfs_path}/usr/include/libpng16',
+                                  f'{rootfs_path}/usr/include/libcamera',
+                                  ]
 
     SRCS += Glob('hal/linux/*.c*')
     REQUIREMENTS += ['input', 'xkbcommon', 'udev', 'freetype']
-    # add libcamera
     REQUIREMENTS += ['camera', 'camera-base', 'jpeg']
+    LDFLAGS += [f'{rootfs_path}/usr/lib/aarch64-linux-gnu/libstdc++.so.6']
+    DEFINITIONS += ['-Wno-format-truncation']
+if 'mac_cross_cp0_config_defaults.mk' in os.environ.get("CONFIG_DEFAULT_FILE", ''):
+    lvgl_component['DEFINITIONS'] += ['-D_REENTRANT']
+    lvgl_component['INCLUDE'] += [f'{os.environ.get("CONFIG_TOOLCHAIN_SYSROOT", "")}/usr/include/freetype2', f'{os.environ.get("CONFIG_TOOLCHAIN_SYSROOT", "")}/usr/include/libpng16']
 
+    SRCS += Glob('hal/linux/*.c*')
+    REQUIREMENTS += ['input', 'xkbcommon', 'udev', 'freetype']
+    # add libcamera — note: pkg-config name is 'libcamera', not 'camera'.
+    # Linker still wants -lcamera but we need explicit cflags for the headers.
+    REQUIREMENTS += ['camera', 'camera-base', 'jpeg']
+    try:
+        DEFINITIONS += subprocess.check_output(
+            ['pkg-config', '--cflags', 'libcamera'], text=True).split()
+    except Exception:
+        # Fallback: assume Debian's standard libcamera header layout under the
+        # configured sysroot. CONFIG_TOOLCHAIN_SYSROOT is empty for native builds.
+        _sr = os.environ.get('CONFIG_TOOLCHAIN_SYSROOT', '')
+        DEFINITIONS += [f'-I{_sr}/usr/include/libcamera']
+
+    LDFLAGS += [f'{os.environ.get("CONFIG_TOOLCHAIN_SYSROOT", "")}/usr/lib/aarch64-linux-gnu/libstdc++.so.6',f'-Wl,-rpath-link,{os.environ.get("CONFIG_TOOLCHAIN_SYSROOT", "")}/usr/lib/aarch64-linux-gnu',f'-B{os.environ.get("CONFIG_TOOLCHAIN_SYSROOT", "")}/usr/lib/aarch64-linux-gnu']
+    DEFINITIONS += ['-Wno-format-truncation']
 # macOS
 if 'darwin_config_defaults.mk' in os.environ.get("CONFIG_DEFAULT_FILE", ''):
     # macOS 使用 SDL 后端
@@ -117,8 +175,8 @@ SRCS += [
     os.path.join(RadioLib, 'src', 'Hal.cpp'),
     os.path.join(RadioLib, 'src', 'Module.cpp'),
     os.path.join(RadioLib, 'src', 'utils', 'CRC.cpp'),
+    os.path.join(RadioLib, 'src', 'utils', 'ConvCode.cpp'),
     os.path.join(RadioLib, 'src', 'utils', 'Utils.cpp'),
-    os.path.join(RadioLib, 'src', 'utils', 'FEC.cpp'),
     os.path.join(RadioLib, 'src', 'protocols', 'PhysicalLayer', 'PhysicalLayer.cpp'),
     os.path.join(RadioLib, 'src', 'modules', 'SX126x', 'SX126x.cpp'),
     os.path.join(RadioLib, 'src', 'modules', 'SX126x', 'SX126x_commands.cpp'),

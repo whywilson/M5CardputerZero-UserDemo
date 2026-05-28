@@ -1,4 +1,5 @@
 #include "../hal_process.h"
+#include "../hal_config.h"
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -9,6 +10,8 @@
 #include <chrono>
 #include <thread>
 #include <linux/input.h>
+#include <pwd.h>
+#include <grp.h>
 
 extern "C" {
     extern void keyboard_pause(void);
@@ -22,6 +25,50 @@ static const char *get_kbd_device()
 }
 
 static const int ESC_HOLD_SEC = 3;
+
+static bool is_nologin_shell(const char *shell)
+{
+    if (!shell || !shell[0]) return true;
+    return strstr(shell, "nologin") != NULL ||
+           strstr(shell, "/bin/false") != NULL;
+}
+
+static const char *get_run_user()
+{
+    const char *cfg = hal_config_get_str("run_as_user", NULL);
+    if (cfg && cfg[0]) return cfg;
+
+    struct passwd *pwd;
+    setpwent();
+    while ((pwd = getpwent()) != NULL) {
+        if (pwd->pw_uid >= 1000 && pwd->pw_uid < 65534 &&
+            !is_nologin_shell(pwd->pw_shell)) {
+            endpwent();
+            return pwd->pw_name;
+        }
+    }
+    endpwent();
+    return "pi";
+}
+
+static void exec_as_user(const char *exec_path)
+{
+    const char *user = get_run_user();
+    if (getuid() == 0 && strcmp(user, "root") != 0) {
+        struct passwd *pw = getpwnam(user);
+        if (pw) {
+            initgroups(pw->pw_name, pw->pw_gid);
+            setgid(pw->pw_gid);
+            setuid(pw->pw_uid);
+            setenv("HOME", pw->pw_dir, 1);
+            setenv("USER", pw->pw_name, 1);
+            setenv("LOGNAME", pw->pw_name, 1);
+            setenv("SHELL", pw->pw_shell[0] ? pw->pw_shell : "/bin/bash", 1);
+            chdir(pw->pw_dir);
+        }
+    }
+    execlp("/bin/sh", "sh", "-c", exec_path, (char *)NULL);
+}
 
 /* ------------------------------------------------------------------
  * Experiment:
@@ -57,13 +104,8 @@ int hal_process_exec_blocking(const char *exec_path, volatile int *home_key_flag
     }
     if (pid == 0) {
         close(evfd);
-        /* Put the child (and everything it fork/execs) in its own
-         * process group, so the launcher can kill the whole tree via
-         * killpg() on long-press ESC. Otherwise sh often fork+waits an
-         * inner sh that exec's the real binary, leaving the real
-         * process as a grandchild that SIGTERM to `pid` never reaches. */
         setpgid(0, 0);
-        execlp("/bin/sh", "sh", "-c", exec_path, (char *)NULL);
+        exec_as_user(exec_path);
         _exit(127);
     }
     /* Also set it in the parent in case setpgid races the child. */
@@ -188,7 +230,7 @@ hal_pid_t hal_process_spawn(const char *exec_path)
     if (pid < 0) return -1;
     if (pid == 0) {
         setpgid(0, 0);
-        execlp("/bin/sh", "sh", "-c", exec_path, (char *)NULL);
+        exec_as_user(exec_path);
         _exit(127);
     }
     setpgid(pid, pid);
@@ -214,3 +256,4 @@ void hal_system_reboot(void)
     printf("[HAL] reboot\n");
     system("sudo reboot");
 }
+// rebuild trigger

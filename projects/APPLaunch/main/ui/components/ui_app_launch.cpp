@@ -8,26 +8,41 @@
 #include "hal/hal_filesystem.h"
 #include "hal/hal_process.h"
 #include "hal/hal_settings.h"
+#include "hal/hal_config.h"
 #include "hal/hal_audio.h"
 #include <unordered_map>
 #include <list>
 #include <memory>
 #include <string>
-#include <cctype>
 #include <functional>
 #include <chrono>
-#include <atomic>
-#include <thread>
-#include <array>
 #include <fstream>
 #include <sstream>
 #include "ui_launch_page.hpp"
 #include "../ui_loading.h"
 #include "page_app.h"
-#include "nfc/nfc_device_service.hpp"
-#include "nfc/nfc_i2c_device.hpp"
 
 /* img_path() now defined in ui_app_page.hpp */
+
+#define PANEL_BORDER_CENTER  0x444444
+#define PANEL_BORDER_SIDE    0x222222
+#define PANEL_PAD_CENTER     0
+#define PANEL_PAD_SIDE       0
+
+
+static void panel_set_icon(lv_obj_t *panel, const char *src)
+{
+    lv_obj_set_style_pad_all(panel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    lv_obj_t *img = lv_obj_get_child(panel, 0);
+    if (!img || !lv_obj_check_type(img, &lv_image_class)) {
+        img = lv_image_create(panel);
+        lv_obj_set_size(img, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_align(img, LV_ALIGN_CENTER);
+        lv_image_set_inner_align(img, LV_IMAGE_ALIGN_STRETCH);
+    }
+    lv_image_set_src(img, src);
+}
 
 // ============================================================
 // 启动快捷方式示例
@@ -39,7 +54,7 @@ Name=Vim
 TryExec=vim
 Exec=vim
 Terminal=true
-Icon=share/images/email.png
+Icon=share/images/e-Mail_80.png
 */
 
 // 前向声明
@@ -53,6 +68,7 @@ struct page_t
 {
     using type = PageT;
 };
+
 template <class PageT>
 inline constexpr page_t<PageT> page_v{};
 
@@ -64,6 +80,7 @@ struct app
     std::string Name;
     std::string Icon;
     std::string Exec;
+
     std::function<void(app_launch_S *)> launch;
 
     // ① 外部命令
@@ -76,7 +93,8 @@ struct app
     app(std::string name,
         std::string icon,
         std::string exec,
-        bool terminal, bool sysplause);
+        bool terminal,
+        bool sysplause);
 
     // ② 内置 UI 页面
     template <class PageT>
@@ -95,11 +113,7 @@ private:
     hal_watcher_t dir_watcher = NULL;
     lv_timer_t *watch_timer = nullptr;  // LVGL 3s 定时器
     lv_timer_t *status_timer = nullptr; // 状态栏刷新定时器
-    lv_timer_t *nfc_automation_timer = nullptr;
     int fixed_count;
-    nfc_app::NfcDeviceService nfc_automation_service_;
-    static constexpr const char *kNfcAutomationCmdPath = "/tmp/applaunch_nfc_automation.cmd";
-    static constexpr const char *kNfcAutomationStatusPath = "/tmp/applaunch_nfc_automation.status";
 
 public:
     std::list<app> app_list;
@@ -109,111 +123,125 @@ public:
     app_launch_S()
     {
         // 固定图标，不允许用户修改
-        app_list.emplace_back("RFID",
-                              img_path("rfid.png"), page_v<UINfcPage>);
-        app_list.emplace_back("STORE",
-                              img_path("Store_logo.png"), page_v<UIStorePage>);
         app_list.emplace_back("Python",
-                              img_path("PYTHON_logo.png"), "python3", true, false);
+                              img_path("python_100.png"), "python3", true, false);
+        app_list.emplace_back("STORE",
+                              img_path("store_100.png"),
+                              "/usr/share/APPLaunch/bin/M5CardputerZero-AppStore", false);
         app_list.emplace_back("CLI",
-                              img_path("CLI_logo.png"), "bash", true, false);
+                              img_path("cli_100.png"), "bash", true, false);
         app_list.emplace_back("CLAW",
-                              img_path("CLAW_logo.png"), "/home/pi/zeroclaw agent", true);
+                              img_path("claw_100.png"), "/home/pi/zeroclaw agent", true);
         app_list.emplace_back("SETTING",
-                              img_path("SETTING_logo.png"), page_v<UISetupPage>);
+                              img_path("setting_100.png"), page_v<UISetupPage>);
 
         {
             auto it = std::next(app_list.begin(), 0);
             lv_label_set_text(ui_zuoLabelout, it->Name.c_str());
-            lv_obj_set_style_bg_img_src(ui_outPanelzuo, it->Icon.c_str(),
-                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+            panel_set_icon(ui_outPanelzuo, it->Icon.c_str());
         }
+
         {
             auto it = std::next(app_list.begin(), 1);
             lv_label_set_text(ui_zuoLabel, it->Name.c_str());
-            lv_obj_set_style_bg_img_src(ui_zuoPanel, it->Icon.c_str(),
-                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+            panel_set_icon(ui_zuoPanel, it->Icon.c_str());
         }
+
         {
             auto it = std::next(app_list.begin(), 2);
             lv_label_set_text(ui_switchLabel, it->Name.c_str());
-            lv_obj_set_style_bg_img_src(ui_switchPanel, it->Icon.c_str(),
-                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+            panel_set_icon(ui_switchPanel, it->Icon.c_str());
         }
+
         {
             auto it = std::next(app_list.begin(), 3);
             lv_label_set_text(ui_youLabel, it->Name.c_str());
-            lv_obj_set_style_bg_img_src(ui_youPanel, it->Icon.c_str(),
-                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+            panel_set_icon(ui_youPanel, it->Icon.c_str());
         }
+
         {
             auto it = std::next(app_list.begin(), 4);
             lv_label_set_text(ui_youLabelout, it->Name.c_str());
-            lv_obj_set_style_bg_img_src(ui_outPanelyou, it->Icon.c_str(),
-                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+            panel_set_icon(ui_outPanelyou, it->Icon.c_str());
         }
 
-        // 动态图标，允许用户自定义
+        // 动态图标，根据 Settings 配置过滤
+        #define APP_ENABLED(key) (hal_config_get_int("app_" key, 1) != 0)
+
+        if (APP_ENABLED("Music"))
         app_list.emplace_back("MUSIC",
-                              img_path("MUSIC_logo.png"), page_v<UIMusicPage>);
-        app_list.emplace_back("AUDIO_PLAYER",
-                              img_path("MUSIC_logo.png"),
+                              img_path("music_100.png"), page_v<UIMusicPage>);
+        if (APP_ENABLED("Audio"))
+        app_list.emplace_back("AUDIO",
+                              img_path("audio_player_100.png"),
                               "tinyplay -D1 -d0 /home/pi/zhou.wav",
                               true);
-        app_list.emplace_back("IP_PANEL",
-                              img_path("ssh.png"), page_v<UIIpPanelPage>);
-
-        app_list.emplace_back("MATH",
-                              img_path("math.png"),
-                              "/home/pi/M5CardputerZero-Calculator-linux-aarch64", false);
-
-        app_list.emplace_back("STOCKS",
-                              img_path("stocks_macos_bigsur_icon_189691.png"), page_v<UIStockPage>);
-
-        app_list.emplace_back("CHAT",
-                              img_path("chat.png"), page_v<UIchatPage>);
-        app_list.emplace_back("e-Mail",
-                              img_path("email.png"), page_v<UIEmailPage>);
-        app_list.emplace_back("FILE",
-                              img_path("CLI_logo.png"), page_v<UIFilePage>);
-        app_list.emplace_back("SSH",
-                              img_path("ssh.png"), page_v<UISSHPage>);
+        if (APP_ENABLED("Hack"))
         app_list.emplace_back("HACK",
-                              img_path("hack.png"), page_v<UIHackPage>);
-        app_list.emplace_back("MESH",
-                              img_path("mesh.png"), page_v<UIMeshPage>);
-        app_list.emplace_back("REC",
-                              img_path("rec.png"), page_v<UIRecPage>);
-#ifndef HAL_PLATFORM_SDL
-        app_list.emplace_back("CAMERA",
-                              img_path("camera.png"), page_v<UICameraPage>);
-#endif
+                              img_path("hack_100.png"), page_v<UIHackPage>);
+        if (APP_ENABLED("Game"))
         app_list.emplace_back("GAME",
-                              img_path("gmae.png"), page_v<UIGamePage>);
+                              img_path("game_100.png"), page_v<UIGamePage>);
+
+        if (APP_ENABLED("Math"))
+        app_list.emplace_back("MATH",
+                              img_path("math_100.png"),
+                              "/usr/share/APPLaunch/bin/M5CardputerZero-Calculator", false);
+
+#if defined(__linux__) && !defined(HAL_PLATFORM_SDL)
+        if (APP_ENABLED("IP_Panel"))
+        app_list.emplace_back("IP_PANEL",
+                              img_path("ip_panel_100.png"), page_v<UIIpPanelPage>);
+        if (APP_ENABLED("Stocks"))
+        app_list.emplace_back("STOCKS",
+                              img_path("stocks_100.png"), page_v<UIStockPage>);
+        if (APP_ENABLED("Chat"))
+        app_list.emplace_back("CHAT",
+                              img_path("chat_100.png"), page_v<UIchatPage>);
+        if (APP_ENABLED("e-Mail"))
+        app_list.emplace_back("e-Mail",
+                              img_path("e_mail_100.png"), page_v<UIEmailPage>);
+        if (APP_ENABLED("File"))
+        app_list.emplace_back("FILE",
+                              img_path("file_100.png"), page_v<UIFilePage>);
+        if (APP_ENABLED("AICli"))
+        app_list.emplace_back("AICli", img_path("aicli_100.png"), page_v<UIAICliPage>);
+        if (APP_ENABLED("SSH"))
+        app_list.emplace_back("SSH",
+                              img_path("ssh_100.png"), page_v<UISSHPage>);
+        if (APP_ENABLED("Mesh"))
+        app_list.emplace_back("MESH",
+                              img_path("mesh_100.png"), page_v<UIMeshPage>);
+        if (APP_ENABLED("Rec"))
+        app_list.emplace_back("REC",
+                              img_path("rec_100.png"), page_v<UIRecPage>);
+        if (APP_ENABLED("Camera"))
+        app_list.emplace_back("CAMERA",
+                              img_path("camera_100.png"), page_v<UICameraPage>);
+        if (APP_ENABLED("UnitEnv"))
         app_list.emplace_back("UnitEnv",
-                              img_path("unitENV.png"), page_v<UIUnitEnvPage>);
+                              img_path("unitenv_100.png"), page_v<UIUnitEnvPage>);
+        if (APP_ENABLED("Midi"))
         app_list.emplace_back("Midi",
-                              img_path("Midi.png"), page_v<UIMidiPage>);
-
+                              img_path("midi_100.png"), page_v<UIMidiPage>);
+        if (APP_ENABLED("Gpio"))
         app_list.emplace_back("Gpio",
-                              img_path("Gpio.png"), page_v<UIGpioPage>);
-        
-#ifndef HAL_PLATFORM_SDL
-        app_list.emplace_back("LORA", img_path("mesh.png"), page_v<UILoraPage>);
-#endif
-
-        app_list.emplace_back("GALLERY", img_path("camera.png"), page_v<UIGalleryPage>);
-
-        app_list.emplace_back("HIKEPOD", img_path("hack.png"), page_v<UIHikePodPage>);
-
-        app_list.emplace_back("AICli", img_path("hack.png"), page_v<UIAICliPage>);
-
-        app_list.emplace_back("TANK", img_path("tank.png"), page_v<UITankBattlePage>);
-
+                              img_path("gpio_100.png"), page_v<UIGpioPage>);
+        if (APP_ENABLED("LoRa"))
+        app_list.emplace_back("LORA", img_path("lora_100.png"), page_v<UILoraPage>);
+        if (APP_ENABLED("Gallery"))
+        app_list.emplace_back("GALLERY", img_path("gallery_100.png"), page_v<UIGalleryPage>);
+        if (APP_ENABLED("HikePod"))
+        app_list.emplace_back("HIKEPOD", img_path("hikepod_100.png"), page_v<UIHikePodPage>);
+        if (APP_ENABLED("Tank"))
+        app_list.emplace_back("TANK", img_path("tank_100.png"), page_v<UITankBattlePage>);
         app_list.emplace_back("Love",
-                                    img_path("gmae.png"), page_v<UILovyanPage>);
+                                    img_path("game_100.png"), page_v<UILovyanPage>);
+#endif
+        #undef APP_ENABLED
 
         fixed_count = app_list.size();
+
         applications_load();
 
         // 初始化 inotify，监听 applications 目录
@@ -225,8 +253,6 @@ public:
         // 状态栏定时刷新（时间 + 电量），每5秒更新一次
         update_home_status_bar();
         status_timer = lv_timer_create(home_status_timer_cb, 5000, this);
-        nfc_automation_timer = lv_timer_create(nfc_automation_timer_cb, 200, this);
-
     }
 
     void launch_app()
@@ -313,8 +339,7 @@ public:
         next_app = next_app == (int)app_list.size() - 1 ? 0 : next_app + 1;
         auto it = std::next(app_list.begin(), next_app);
         lv_label_set_text(label, it->Name.c_str());
-        lv_obj_set_style_bg_img_src(panel, it->Icon.c_str(),
-                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        panel_set_icon(panel, it->Icon.c_str());
     }
 
     void you(lv_obj_t *panel, lv_obj_t *label)
@@ -325,8 +350,7 @@ public:
         next_app = next_app == 0 ? (int)app_list.size() - 1 : next_app - 1;
         auto it = std::next(app_list.begin(), next_app);
         lv_label_set_text(label, it->Name.c_str());
-        lv_obj_set_style_bg_img_src(panel, it->Icon.c_str(),
-                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        panel_set_icon(panel, it->Icon.c_str());
     }
 
     void applications_load()
@@ -428,9 +452,9 @@ public:
                 continue;
             }
             bool in_list = false;
-            for (const auto &it : app_list)
+            for (auto it : app_list)
             {
-                if ((!it.Exec.empty() && it.Exec == app_exec) || it.Name == app_name)
+                if (it.Exec == app_exec)
                 {
                     in_list = true;
                     break;
@@ -438,7 +462,7 @@ public:
             }
             if (in_list)
             {
-                fprintf(stderr, "applications_load: skip %s (duplicate Name/Exec)\n", filepath.c_str());
+                fprintf(stderr, "applications_load: skip %s (duplicate Exec)\n", filepath.c_str());
                 continue;
             }
 
@@ -479,37 +503,33 @@ public:
         {
             auto &a = app_at(current_app - 2);
             lv_label_set_text(ui_zuoLabelout, a.Name.c_str());
-            lv_obj_set_style_bg_img_src(ui_outPanelzuo, a.Icon.c_str(),
-                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+            panel_set_icon(ui_outPanelzuo, a.Icon.c_str());
         }
         // 左
         {
             auto &a = app_at(current_app - 1);
             lv_label_set_text(ui_zuoLabel, a.Name.c_str());
-            lv_obj_set_style_bg_img_src(ui_zuoPanel, a.Icon.c_str(),
-                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+            panel_set_icon(ui_zuoPanel, a.Icon.c_str());
         }
         // 中心
         {
             auto &a = app_at(current_app);
             lv_label_set_text(ui_switchLabel, a.Name.c_str());
-            lv_obj_set_style_bg_img_src(ui_switchPanel, a.Icon.c_str(),
-                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+            panel_set_icon(ui_switchPanel, a.Icon.c_str());
         }
         // 右
         {
             auto &a = app_at(current_app + 1);
             lv_label_set_text(ui_youLabel, a.Name.c_str());
-            lv_obj_set_style_bg_img_src(ui_youPanel, a.Icon.c_str(),
-                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+            panel_set_icon(ui_youPanel, a.Icon.c_str());
         }
         // 最右外（隐藏）
         {
             auto &a = app_at(current_app + 2);
             lv_label_set_text(ui_youLabelout, a.Name.c_str());
-            lv_obj_set_style_bg_img_src(ui_outPanelyou, a.Icon.c_str(),
-                                        LV_PART_MAIN | LV_STATE_DEFAULT);
+            panel_set_icon(ui_outPanelyou, a.Icon.c_str());
         }
+
     }
 
     // ============================================================
@@ -539,10 +559,27 @@ public:
 
     void update_home_status_bar()
     {
+        // WiFi signal bars: show/hide + color by strength
+        hal_wifi_status_t wifi = hal_wifi_get_status();
+        if (wifi.connected) {
+            lv_obj_clear_flag(ui_wifiPanel, LV_OBJ_FLAG_HIDDEN);
+            int sig = wifi.signal;
+            uint32_t on_color  = 0x33CC33;
+            uint32_t off_color = 0x4D4D4D;
+            lv_obj_set_style_bg_color(ui_wifiBar1, lv_color_hex(sig > 0 ? on_color : off_color), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ui_wifiBar2, lv_color_hex(sig >= 30 ? on_color : off_color), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ui_wifiBar3, lv_color_hex(sig >= 60 ? on_color : off_color), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ui_wifiBar4, lv_color_hex(sig >= 80 ? on_color : off_color), LV_PART_MAIN | LV_STATE_DEFAULT);
+        } else {
+            lv_obj_add_flag(ui_wifiPanel, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        // Time
         char time_buf[16];
         hal_time_str(time_buf, sizeof(time_buf));
         lv_label_set_text(ui_timeLabel, time_buf);
 
+        // Battery
         hal_battery_info_t bat = hal_battery_read();
         if (bat.valid)
         {
@@ -556,14 +593,19 @@ public:
             char pwr_buf[16];
             snprintf(pwr_buf, sizeof(pwr_buf), "%d%%", soc);
             lv_label_set_text(ui_powerLabel, pwr_buf);
+            if (soc == 100)
+                lv_obj_set_style_text_font(ui_powerLabel, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
+            else
+                lv_obj_set_style_text_font(ui_powerLabel, LV_FONT_DEFAULT, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-            uint32_t color = 0x66CC33;
-            if (soc <= 20)
-                color = 0xE74C3C;
-            else if (soc <= 50)
-                color = 0xF39C12;
-            lv_obj_set_style_bg_color(ui_Bar1, lv_color_hex(color),
-                                      LV_PART_INDICATOR | LV_STATE_DEFAULT);
+        //     uint32_t color = 0x66CC33;
+        //     if (soc <= 20)
+        //         color = 0xE74C3C;
+        //     else if (soc <= 50)
+        //         color = 0xF39C12;
+        //     lv_obj_set_style_bg_color(ui_Bar1, lv_color_hex(color),
+        //                               LV_PART_INDICATOR | LV_STATE_DEFAULT);
+        // }
         }
     }
 
@@ -583,183 +625,6 @@ public:
         }
     }
 
-    static std::string trim_ascii(const std::string &in)
-    {
-        size_t begin = 0;
-        while (begin < in.size() && std::isspace(static_cast<unsigned char>(in[begin]))) ++begin;
-        size_t end = in.size();
-        while (end > begin && std::isspace(static_cast<unsigned char>(in[end - 1]))) --end;
-        return in.substr(begin, end - begin);
-    }
-
-    static std::string upper_ascii(std::string text)
-    {
-        for (char &ch : text) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-        return text;
-    }
-
-    static int nfc_profile_index_from_token(const std::string &token)
-    {
-        std::string out;
-        out.reserve(token.size());
-        for (unsigned char ch : token) {
-            if (std::isalnum(ch)) out.push_back(static_cast<char>(std::toupper(ch)));
-        }
-        if (out == "NTAG" || out == "NTAG213" || out == "ISO14443A" || out == "NFCA") return 0;
-        if (out == "MIFARE" || out == "MIFARE1K" || out == "MIFARECLASSIC" || out == "MIFARECLASSIC1K" || out == "MFC") return 1;
-        if (out == "ISO15693" || out == "NFCV") return 2;
-        return -1;
-    }
-
-    void write_nfc_automation_status(const std::string &line) const
-    {
-        std::ofstream out(kNfcAutomationStatusPath, std::ios::trunc);
-        if (!out.good()) return;
-        out << line << '\n';
-    }
-
-    bool pop_nfc_automation_command(std::string *command)
-    {
-        if (!command) return false;
-        std::ifstream in(kNfcAutomationCmdPath);
-        if (!in.good()) return false;
-        std::string line;
-        std::getline(in, line);
-        in.close();
-        std::remove(kNfcAutomationCmdPath);
-        line = trim_ascii(line);
-        if (line.empty()) return false;
-        *command = line;
-        return true;
-    }
-
-    bool ensure_nfcunit_connected_for_automation(std::string *error)
-    {
-        auto conn = nfc_automation_service_.connection_state();
-        if (conn.connected && conn.device_kind == nfc_app::DeviceKind::NFCUnit) return true;
-
-        auto i2c_endpoints = nfc_automation_service_.scan_i2c_devices();
-        if (i2c_endpoints.empty()) {
-            if (error) *error = "No NFC Unit I2C endpoint";
-            return false;
-        }
-
-        size_t pick = 0;
-        for (size_t i = 0; i < i2c_endpoints.size(); ++i) {
-            if (i2c_endpoints[i].path.find(":0x50") != std::string::npos) {
-                pick = i;
-                break;
-            }
-        }
-
-        nfc_automation_service_.select_i2c_endpoint(i2c_endpoints[pick]);
-        if (!nfc_automation_service_.connect_current()) {
-            conn = nfc_automation_service_.connection_state();
-            if (error) *error = conn.detail.empty() ? "NFC Unit connect failed" : conn.detail;
-            return false;
-        }
-
-        conn = nfc_automation_service_.connection_state();
-        if (!conn.connected || conn.device_kind != nfc_app::DeviceKind::NFCUnit) {
-            if (error) *error = "Connected device is not NFC Unit";
-            return false;
-        }
-        return true;
-    }
-
-    void process_nfc_automation_command()
-    {
-        std::string command;
-        if (!pop_nfc_automation_command(&command)) return;
-
-        std::istringstream iss(command);
-        std::string verb;
-        iss >> verb;
-        const std::string verb_upper = upper_ascii(verb);
-
-        auto emit_ok = [this](const std::string &line) {
-            write_nfc_automation_status("OK " + line);
-        };
-        auto emit_err = [this](const std::string &line) {
-            write_nfc_automation_status("ERR " + line);
-        };
-
-        if (verb_upper == "STATUS") {
-            const auto conn = nfc_automation_service_.connection_state();
-            std::ostringstream oss;
-            oss << "status connected=" << (conn.connected ? 1 : 0)
-                << " device=" << nfc_app::to_string(conn.device_kind)
-                << " profile=" << nfc_automation_service_.nfcunit_profile_label()
-                << " running=" << (nfc_automation_service_.nfcunit_emulation_running() ? 1 : 0);
-            emit_ok(oss.str());
-            return;
-        }
-
-        if (verb_upper == "STOP") {
-            const bool ok = nfc_automation_service_.grovenfc_deactivate();
-            if (ok) emit_ok("stop emulation");
-            else emit_err("stop failed");
-            return;
-        }
-
-        std::string arg;
-        std::getline(iss, arg);
-        arg = trim_ascii(arg);
-
-        if (verb_upper == "PROFILE") {
-            const int profile = nfc_profile_index_from_token(arg);
-            if (profile < 0) {
-                emit_err("unknown profile: " + arg);
-                return;
-            }
-            nfc_automation_service_.set_nfcunit_profile_index(profile);
-            emit_ok("profile=" + nfc_automation_service_.nfcunit_profile_label());
-            return;
-        }
-
-        if (verb_upper == "START" || verb_upper == "RUN") {
-            int run_profile = -1;
-            if (verb_upper == "RUN") {
-                run_profile = nfc_profile_index_from_token(arg);
-                if (run_profile < 0) {
-                    emit_err("unknown profile: " + arg);
-                    return;
-                }
-            }
-
-            std::string err;
-            if (run_profile >= 0 && run_profile != nfc_automation_service_.nfcunit_profile_index()) {
-                (void)nfc_automation_service_.grovenfc_deactivate();
-                nfc_automation_service_.disconnect();
-            }
-            if (!ensure_nfcunit_connected_for_automation(&err)) {
-                emit_err(err.empty() ? "connect failed" : err);
-                return;
-            }
-            if (run_profile >= 0) {
-                nfc_automation_service_.set_nfcunit_profile_index(run_profile);
-            }
-            if (nfc_automation_service_.start_nfcunit_current_profile_emulation(&err)) {
-                std::ostringstream oss;
-                oss << "run profile=" << nfc_automation_service_.nfcunit_profile_label()
-                    << " running=" << (nfc_automation_service_.nfcunit_emulation_running() ? 1 : 0);
-                emit_ok(oss.str());
-            } else {
-                emit_err(err.empty() ? "start failed" : err);
-            }
-            return;
-        }
-
-        emit_err("unknown command: " + command);
-    }
-
-    static void nfc_automation_timer_cb(lv_timer_t *timer)
-    {
-        auto *self = static_cast<app_launch_S *>(lv_timer_get_user_data(timer));
-        if (!self) return;
-        self->process_nfc_automation_command();
-    }
-
     ~app_launch_S();
 };
 
@@ -770,8 +635,7 @@ inline app::app(std::string name,
                 std::string icon,
                 std::string exec,
                 bool terminal)
-    : Name(std::move(name)), Icon(std::move(icon))
-{
+    : Name(std::move(name)), Icon(std::move(icon)){
     launch = [exec = std::move(exec), terminal](app_launch_S *ctx)
     {
         if (terminal)
@@ -786,8 +650,7 @@ inline app::app(std::string name,
                 std::string exec,
                 bool terminal,
                 bool sysplause)
-    : Name(std::move(name)), Icon(std::move(icon))
-{
+    : Name(std::move(name)), Icon(std::move(icon)){
     launch = [exec = std::move(exec), terminal, sysplause](app_launch_S *ctx)
     {
         if (terminal)
@@ -801,8 +664,7 @@ template <class PageT>
 app::app(std::string name,
          std::string icon,
          page_t<PageT> /*tag*/)
-    : Name(std::move(name)), Icon(std::move(icon))
-{
+    : Name(std::move(name)), Icon(std::move(icon)){
     launch = [](app_launch_S *self)
     {
         /* Instant feedback: show the overlay, then force an immediate
@@ -830,11 +692,6 @@ app::app(std::string name,
 // ============================================================
 app_launch_S::~app_launch_S()
 {
-    if (nfc_automation_timer)
-    {
-        lv_timer_delete(nfc_automation_timer);
-        nfc_automation_timer = nullptr;
-    }
     if (status_timer)
     {
         lv_timer_delete(status_timer);

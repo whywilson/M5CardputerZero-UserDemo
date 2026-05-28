@@ -15,6 +15,7 @@
 #include "compat/input_keys.h"
 #include "hal/hal_process.h"
 #include "hal/hal_settings.h"
+#include "hal/hal_config.h"
 // #include "ui/inter_process_comms.h"
 #include "global_config.h"
 #if CONFIG_BACKWARD_CPP_ENABLED
@@ -305,7 +306,10 @@ void APPLaunch_lock()
 
 int main(void)
 {
-
+    setenv("XDG_RUNTIME_DIR", "/run/user/1000", 1);
+    setenv("PIPEWIRE_RUNTIME_DIR", "/run/user/1000", 1);
+    setenv("PULSE_SERVER", "unix:/run/user/1000/pulse/native", 1);
+    
     lock_file = hal_path_lock_file();
     g_launch_thread_pool = thpool_init(3);
     lv_init();
@@ -318,6 +322,20 @@ int main(void)
     LV_EVENT_KEYBOARD = lv_event_register_id();
     LV_EVENT_BATTERY = lv_event_register_id();
     lv_timer_create(battery_timer_cb, 3000, NULL);
+
+    // Restore saved brightness
+    {
+        int saved_bright = hal_config_get_int("brightness", -1);
+        if (saved_bright > 0)
+            hal_backlight_write(saved_bright);
+    }
+
+    // Restore saved volume
+    {
+        int saved_vol = hal_config_get_int("volume", -1);
+        if (saved_vol >= 0)
+            hal_volume_write(saved_vol);
+    }
 
     ui_init();
     // lv_demo_widgets(); // 用LVGL自带demo测试

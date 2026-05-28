@@ -11,6 +11,21 @@ set(REPO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 set(APPLAUNCH  ${REPO_ROOT}/projects/APPLaunch/main)
 set(USERDEMO   ${REPO_ROOT}/projects/UserDemo/main)
 
+file(GLOB PAGE_APP_HEADERS
+    RELATIVE ${APPLAUNCH}/ui/components
+    CONFIGURE_DEPENDS
+    ${APPLAUNCH}/ui/components/page_app/*.hpp
+)
+list(SORT PAGE_APP_HEADERS)
+if(PAGE_APP_HEADERS)
+    file(WRITE ${APPLAUNCH}/ui/components/page_app.h "#pragma once\n\n")
+    foreach(PAGE_APP_HEADER ${PAGE_APP_HEADERS})
+        file(APPEND ${APPLAUNCH}/ui/components/page_app.h "#include \"${PAGE_APP_HEADER}\"\n")
+    endforeach()
+else()
+    message(FATAL_ERROR "No APPLaunch page_app headers found")
+endif()
+
 # ---------------------------------------------------------------------------
 # SDL2 + Freetype (skip for Emscripten — uses its own ports)
 # ---------------------------------------------------------------------------
@@ -25,10 +40,8 @@ if(NOT EMSCRIPTEN)
 
     find_package(SDL2 QUIET)
     if(NOT SDL2_FOUND)
-        find_package(PkgConfig QUIET)
-        if(PkgConfig_FOUND)
-            pkg_check_modules(SDL2 sdl2)
-        endif()
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(SDL2 REQUIRED sdl2)
     endif()
 
     find_package(PkgConfig QUIET)
@@ -136,12 +149,17 @@ target_include_directories(APPLaunch PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor
     ${CMAKE_CURRENT_SOURCE_DIR}/lib
+    ${REPO_ROOT}/ext_components/Miniaudio/include
     ${APPLAUNCH}/ui
     ${APPLAUNCH}/include
     ${APPLAUNCH}
     ${APPLAUNCH}/hal
-    ${REPO_ROOT}/ext_components/Miniaudio/include
 )
+if(NOT WIN32)
+    target_include_directories(APPLaunch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/compat_stubs)
+else()
+    target_include_directories(APPLaunch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/compat)
+endif()
 target_compile_definitions(APPLaunch PRIVATE HAL_PLATFORM_SDL=1)
 if(SDL2_MIXER_FOUND)
     target_compile_definitions(APPLaunch PRIVATE EMU_HAS_AUDIO=1)
@@ -157,8 +175,7 @@ if(WIN32)
 else()
     target_compile_options(APPLaunch PRIVATE
         "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/emu_compat.h"
-        -Wno-c++11-narrowing
-        -Wno-incompatible-function-pointer-types)
+        -Wno-c++11-narrowing)
 endif()
 if(APPLE)
     target_link_options(APPLaunch PRIVATE -undefined dynamic_lookup)
@@ -199,6 +216,7 @@ if(WIN32 AND NOT EMU_SKIP_APPLAUNCH)
     target_include_directories(cardputer-zero-emu PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/compat
         ${CMAKE_CURRENT_SOURCE_DIR}/vendor
+        ${REPO_ROOT}/ext_components/Miniaudio/include
         ${APPLAUNCH}/ui ${APPLAUNCH}/include ${APPLAUNCH} ${APPLAUNCH}/hal)
     target_compile_options(cardputer-zero-emu PRIVATE
         "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/emu_compat_win.h"
@@ -310,46 +328,19 @@ endif()
 add_custom_command(TARGET cardputer-zero-emu POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/apps
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:UserDemo> $<TARGET_FILE_DIR:cardputer-zero-emu>/apps/
-    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/APPLaunch
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${REPO_ROOT}/projects/APPLaunch/APPLaunch/share $<TARGET_FILE_DIR:cardputer-zero-emu>/APPLaunch/share
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/applications
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/images
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${REPO_ROOT}/projects/APPLaunch/dist/images $<TARGET_FILE_DIR:cardputer-zero-emu>/images
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${REPO_ROOT}/projects/APPLaunch/APPLaunch/share/images $<TARGET_FILE_DIR:cardputer-zero-emu>/images
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/assets
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/assets/device_skin.png $<TARGET_FILE_DIR:cardputer-zero-emu>/assets/device_skin.png
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/assets/startup.mp3 $<TARGET_FILE_DIR:cardputer-zero-emu>/assets/startup.mp3
     COMMENT "Copying apps and resources"
 )
 if(TARGET APPLaunch)
-    add_custom_command(TARGET APPLaunch POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardputer-zero-emu>/apps
+    add_custom_command(TARGET cardputer-zero-emu POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:APPLaunch> $<TARGET_FILE_DIR:cardputer-zero-emu>/apps/
-        COMMENT "Syncing libAPPLaunch.dylib -> apps/"
+        COMMENT "Copying APPLaunch"
     )
-endif()
-
-# ---------------------------------------------------------------------------
-# NFC USB automated test  (no LVGL / SDL dependencies)
-# Usage: ./nfc-usb-test [/dev/cu.wchusbserial000000011]
-# ---------------------------------------------------------------------------
-if(NOT WIN32 AND NOT EMSCRIPTEN)
-add_executable(nfc-usb-test src/nfc_usb_test.cpp)
-target_compile_features(nfc-usb-test PRIVATE cxx_std_17)
-target_include_directories(nfc-usb-test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/vendor          # nlohmann/json.hpp
-    ${APPLAUNCH}                                # ui/components/nfc/...
-    ${APPLAUNCH}/ui
-    ${APPLAUNCH}/include
-)
-# nfc_models.hpp needs nlohmann but no LVGL; define a minimal stub for map
-target_compile_definitions(nfc-usb-test PRIVATE
-    NFC_TEST_STANDALONE=1
-)
-find_package(Threads REQUIRED)
-target_link_libraries(nfc-usb-test PRIVATE Threads::Threads)
-if(APPLE)
-    target_compile_options(nfc-usb-test PRIVATE -Wno-c++11-narrowing)
-endif()
 endif()
 
 endif() # NOT EMSCRIPTEN
@@ -379,8 +370,10 @@ if(EMSCRIPTEN)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/compat_queue
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/compat_stubs
         ${CMAKE_CURRENT_SOURCE_DIR}/vendor
         ${CMAKE_CURRENT_SOURCE_DIR}/lib
+        ${REPO_ROOT}/ext_components/Miniaudio/include
         ${APPLAUNCH}/ui
         ${APPLAUNCH}/include
         ${APPLAUNCH}
@@ -405,7 +398,7 @@ if(EMSCRIPTEN)
         -sALLOW_MEMORY_GROWTH=1
         -sINITIAL_MEMORY=67108864
         "--preload-file=${CMAKE_CURRENT_SOURCE_DIR}/assets/device_skin.png@/assets/device_skin.png"
-        "--preload-file=${APPLAUNCH}/ui/images@/images"
+        "--preload-file=${REPO_ROOT}/projects/APPLaunch/APPLaunch/share/images@/images"
         --shell-file ${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html
     )
 
