@@ -14,13 +14,19 @@
 #include <list>
 #include <memory>
 #include <string>
+#include <cctype>
 #include <functional>
 #include <chrono>
+#include <atomic>
+#include <thread>
+#include <array>
 #include <fstream>
 #include <sstream>
 #include "ui_launch_page.hpp"
 #include "../ui_loading.h"
 #include "page_app.h"
+#include "nfc/nfc_device_service.hpp"
+#include "nfc/nfc_i2c_device.hpp"
 
 /* img_path() now defined in ui_app_page.hpp */
 
@@ -68,7 +74,6 @@ struct page_t
 {
     using type = PageT;
 };
-
 template <class PageT>
 inline constexpr page_t<PageT> page_v{};
 
@@ -80,7 +85,6 @@ struct app
     std::string Name;
     std::string Icon;
     std::string Exec;
-
     std::function<void(app_launch_S *)> launch;
 
     // ① 外部命令
@@ -113,7 +117,11 @@ private:
     hal_watcher_t dir_watcher = NULL;
     lv_timer_t *watch_timer = nullptr;  // LVGL 3s 定时器
     lv_timer_t *status_timer = nullptr; // 状态栏刷新定时器
+    lv_timer_t *nfc_automation_timer = nullptr;
     int fixed_count;
+    nfc_app::NfcDeviceService nfc_automation_service_;
+    static constexpr const char *kNfcAutomationCmdPath = "/tmp/applaunch_nfc_automation.cmd";
+    static constexpr const char *kNfcAutomationStatusPath = "/tmp/applaunch_nfc_automation.status";
 
 public:
     std::list<app> app_list;
@@ -123,6 +131,8 @@ public:
     app_launch_S()
     {
         // 固定图标，不允许用户修改
+        app_list.emplace_back("RFID",
+                              img_path("rfid.png"), page_v<UINfcPage>);
         app_list.emplace_back("Python",
                               img_path("python_100.png"), "python3", true, false);
         app_list.emplace_back("STORE",
@@ -140,25 +150,21 @@ public:
             lv_label_set_text(ui_zuoLabelout, it->Name.c_str());
             panel_set_icon(ui_outPanelzuo, it->Icon.c_str());
         }
-
         {
             auto it = std::next(app_list.begin(), 1);
             lv_label_set_text(ui_zuoLabel, it->Name.c_str());
             panel_set_icon(ui_zuoPanel, it->Icon.c_str());
         }
-
         {
             auto it = std::next(app_list.begin(), 2);
             lv_label_set_text(ui_switchLabel, it->Name.c_str());
             panel_set_icon(ui_switchPanel, it->Icon.c_str());
         }
-
         {
             auto it = std::next(app_list.begin(), 3);
             lv_label_set_text(ui_youLabel, it->Name.c_str());
             panel_set_icon(ui_youPanel, it->Icon.c_str());
         }
-
         {
             auto it = std::next(app_list.begin(), 4);
             lv_label_set_text(ui_youLabelout, it->Name.c_str());
@@ -241,7 +247,6 @@ public:
         #undef APP_ENABLED
 
         fixed_count = app_list.size();
-
         applications_load();
 
         // 初始化 inotify，监听 applications 目录
@@ -253,6 +258,8 @@ public:
         // 状态栏定时刷新（时间 + 电量），每5秒更新一次
         update_home_status_bar();
         status_timer = lv_timer_create(home_status_timer_cb, 5000, this);
+        nfc_automation_timer = lv_timer_create(nfc_automation_timer_cb, 200, this);
+
     }
 
     void launch_app()
@@ -452,9 +459,9 @@ public:
                 continue;
             }
             bool in_list = false;
-            for (auto it : app_list)
+            for (const auto &it : app_list)
             {
-                if (it.Exec == app_exec)
+                if ((!it.Exec.empty() && it.Exec == app_exec) || it.Name == app_name)
                 {
                     in_list = true;
                     break;
@@ -462,7 +469,7 @@ public:
             }
             if (in_list)
             {
-                fprintf(stderr, "applications_load: skip %s (duplicate Exec)\n", filepath.c_str());
+                fprintf(stderr, "applications_load: skip %s (duplicate Name/Exec)\n", filepath.c_str());
                 continue;
             }
 
@@ -529,7 +536,6 @@ public:
             lv_label_set_text(ui_youLabelout, a.Name.c_str());
             panel_set_icon(ui_outPanelyou, a.Icon.c_str());
         }
-
     }
 
     // ============================================================
@@ -597,15 +603,6 @@ public:
                 lv_obj_set_style_text_font(ui_powerLabel, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
             else
                 lv_obj_set_style_text_font(ui_powerLabel, LV_FONT_DEFAULT, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-        //     uint32_t color = 0x66CC33;
-        //     if (soc <= 20)
-        //         color = 0xE74C3C;
-        //     else if (soc <= 50)
-        //         color = 0xF39C12;
-        //     lv_obj_set_style_bg_color(ui_Bar1, lv_color_hex(color),
-        //                               LV_PART_INDICATOR | LV_STATE_DEFAULT);
-        // }
         }
     }
 
@@ -625,6 +622,183 @@ public:
         }
     }
 
+    static std::string trim_ascii(const std::string &in)
+    {
+        size_t begin = 0;
+        while (begin < in.size() && std::isspace(static_cast<unsigned char>(in[begin]))) ++begin;
+        size_t end = in.size();
+        while (end > begin && std::isspace(static_cast<unsigned char>(in[end - 1]))) --end;
+        return in.substr(begin, end - begin);
+    }
+
+    static std::string upper_ascii(std::string text)
+    {
+        for (char &ch : text) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        return text;
+    }
+
+    static int nfc_profile_index_from_token(const std::string &token)
+    {
+        std::string out;
+        out.reserve(token.size());
+        for (unsigned char ch : token) {
+            if (std::isalnum(ch)) out.push_back(static_cast<char>(std::toupper(ch)));
+        }
+        if (out == "NTAG" || out == "NTAG213" || out == "ISO14443A" || out == "NFCA") return 0;
+        if (out == "MIFARE" || out == "MIFARE1K" || out == "MIFARECLASSIC" || out == "MIFARECLASSIC1K" || out == "MFC") return 1;
+        if (out == "ISO15693" || out == "NFCV") return 2;
+        return -1;
+    }
+
+    void write_nfc_automation_status(const std::string &line) const
+    {
+        std::ofstream out(kNfcAutomationStatusPath, std::ios::trunc);
+        if (!out.good()) return;
+        out << line << '\n';
+    }
+
+    bool pop_nfc_automation_command(std::string *command)
+    {
+        if (!command) return false;
+        std::ifstream in(kNfcAutomationCmdPath);
+        if (!in.good()) return false;
+        std::string line;
+        std::getline(in, line);
+        in.close();
+        std::remove(kNfcAutomationCmdPath);
+        line = trim_ascii(line);
+        if (line.empty()) return false;
+        *command = line;
+        return true;
+    }
+
+    bool ensure_nfcunit_connected_for_automation(std::string *error)
+    {
+        auto conn = nfc_automation_service_.connection_state();
+        if (conn.connected && conn.device_kind == nfc_app::DeviceKind::NFCUnit) return true;
+
+        auto i2c_endpoints = nfc_automation_service_.scan_i2c_devices();
+        if (i2c_endpoints.empty()) {
+            if (error) *error = "No NFC Unit I2C endpoint";
+            return false;
+        }
+
+        size_t pick = 0;
+        for (size_t i = 0; i < i2c_endpoints.size(); ++i) {
+            if (i2c_endpoints[i].path.find(":0x50") != std::string::npos) {
+                pick = i;
+                break;
+            }
+        }
+
+        nfc_automation_service_.select_i2c_endpoint(i2c_endpoints[pick]);
+        if (!nfc_automation_service_.connect_current()) {
+            conn = nfc_automation_service_.connection_state();
+            if (error) *error = conn.detail.empty() ? "NFC Unit connect failed" : conn.detail;
+            return false;
+        }
+
+        conn = nfc_automation_service_.connection_state();
+        if (!conn.connected || conn.device_kind != nfc_app::DeviceKind::NFCUnit) {
+            if (error) *error = "Connected device is not NFC Unit";
+            return false;
+        }
+        return true;
+    }
+
+    void process_nfc_automation_command()
+    {
+        std::string command;
+        if (!pop_nfc_automation_command(&command)) return;
+
+        std::istringstream iss(command);
+        std::string verb;
+        iss >> verb;
+        const std::string verb_upper = upper_ascii(verb);
+
+        auto emit_ok = [this](const std::string &line) {
+            write_nfc_automation_status("OK " + line);
+        };
+        auto emit_err = [this](const std::string &line) {
+            write_nfc_automation_status("ERR " + line);
+        };
+
+        if (verb_upper == "STATUS") {
+            const auto conn = nfc_automation_service_.connection_state();
+            std::ostringstream oss;
+            oss << "status connected=" << (conn.connected ? 1 : 0)
+                << " device=" << nfc_app::to_string(conn.device_kind)
+                << " profile=" << nfc_automation_service_.nfcunit_profile_label()
+                << " running=" << (nfc_automation_service_.nfcunit_emulation_running() ? 1 : 0);
+            emit_ok(oss.str());
+            return;
+        }
+
+        if (verb_upper == "STOP") {
+            const bool ok = nfc_automation_service_.grovenfc_deactivate();
+            if (ok) emit_ok("stop emulation");
+            else emit_err("stop failed");
+            return;
+        }
+
+        std::string arg;
+        std::getline(iss, arg);
+        arg = trim_ascii(arg);
+
+        if (verb_upper == "PROFILE") {
+            const int profile = nfc_profile_index_from_token(arg);
+            if (profile < 0) {
+                emit_err("unknown profile: " + arg);
+                return;
+            }
+            nfc_automation_service_.set_nfcunit_profile_index(profile);
+            emit_ok("profile=" + nfc_automation_service_.nfcunit_profile_label());
+            return;
+        }
+
+        if (verb_upper == "START" || verb_upper == "RUN") {
+            int run_profile = -1;
+            if (verb_upper == "RUN") {
+                run_profile = nfc_profile_index_from_token(arg);
+                if (run_profile < 0) {
+                    emit_err("unknown profile: " + arg);
+                    return;
+                }
+            }
+
+            std::string err;
+            if (run_profile >= 0 && run_profile != nfc_automation_service_.nfcunit_profile_index()) {
+                (void)nfc_automation_service_.grovenfc_deactivate();
+                nfc_automation_service_.disconnect();
+            }
+            if (!ensure_nfcunit_connected_for_automation(&err)) {
+                emit_err(err.empty() ? "connect failed" : err);
+                return;
+            }
+            if (run_profile >= 0) {
+                nfc_automation_service_.set_nfcunit_profile_index(run_profile);
+            }
+            if (nfc_automation_service_.start_nfcunit_current_profile_emulation(&err)) {
+                std::ostringstream oss;
+                oss << "run profile=" << nfc_automation_service_.nfcunit_profile_label()
+                    << " running=" << (nfc_automation_service_.nfcunit_emulation_running() ? 1 : 0);
+                emit_ok(oss.str());
+            } else {
+                emit_err(err.empty() ? "start failed" : err);
+            }
+            return;
+        }
+
+        emit_err("unknown command: " + command);
+    }
+
+    static void nfc_automation_timer_cb(lv_timer_t *timer)
+    {
+        auto *self = static_cast<app_launch_S *>(lv_timer_get_user_data(timer));
+        if (!self) return;
+        self->process_nfc_automation_command();
+    }
+
     ~app_launch_S();
 };
 
@@ -635,7 +809,8 @@ inline app::app(std::string name,
                 std::string icon,
                 std::string exec,
                 bool terminal)
-    : Name(std::move(name)), Icon(std::move(icon)){
+    : Name(std::move(name)), Icon(std::move(icon))
+{
     launch = [exec = std::move(exec), terminal](app_launch_S *ctx)
     {
         if (terminal)
@@ -650,7 +825,8 @@ inline app::app(std::string name,
                 std::string exec,
                 bool terminal,
                 bool sysplause)
-    : Name(std::move(name)), Icon(std::move(icon)){
+    : Name(std::move(name)), Icon(std::move(icon))
+{
     launch = [exec = std::move(exec), terminal, sysplause](app_launch_S *ctx)
     {
         if (terminal)
@@ -664,7 +840,8 @@ template <class PageT>
 app::app(std::string name,
          std::string icon,
          page_t<PageT> /*tag*/)
-    : Name(std::move(name)), Icon(std::move(icon)){
+    : Name(std::move(name)), Icon(std::move(icon))
+{
     launch = [](app_launch_S *self)
     {
         /* Instant feedback: show the overlay, then force an immediate
@@ -692,6 +869,11 @@ app::app(std::string name,
 // ============================================================
 app_launch_S::~app_launch_S()
 {
+    if (nfc_automation_timer)
+    {
+        lv_timer_delete(nfc_automation_timer);
+        nfc_automation_timer = nullptr;
+    }
     if (status_timer)
     {
         lv_timer_delete(status_timer);

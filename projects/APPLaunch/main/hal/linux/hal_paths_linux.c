@@ -19,6 +19,10 @@ static char s_font_regular[512]     = APP_PREFIX "/share/font/AlibabaPuHuiTi-3-5
 static char s_font_mono[512]        = APP_PREFIX "/share/font/LiberationMono-Regular.ttf";
 static char s_images_dir[512]       = "share/images";
 static char s_audio_dir[512]        = "/usr/share/APPLaunch/share/audio";
+static char s_nfc_dumps_dir[512]    = APP_PREFIX "/share/nfc/records";
+static char s_nfc_keys_dir[512]     = APP_PREFIX "/share/nfc/keys";
+static char s_mfkey_bin_dir[512]    = APP_PREFIX "/bin";
+static char s_nfc_log_dir[512]      = "/tmp/nfc_log";
 static const char *KBD_DEVICE       = "/dev/input/by-path/platform-3f804000.i2c-event";
 static const char *KBD_MAP          = "/usr/share/keymaps/tca8418_keypad_m5stack_keymap.map";
 static char s_store_sync_cmd[512]   = "python " APP_PREFIX "/bin/store_cache_sync.py";
@@ -40,3 +44,7 @@ const char *hal_path_keyboard_map(void)     { return KBD_MAP; }
 const char *hal_path_store_sync_cmd(void)   { return s_store_sync_cmd; }
 const char *hal_path_images_dir(void)       { return s_images_dir; }
 const char *hal_path_audio_dir(void)       { return s_audio_dir; }
+const char *hal_path_nfc_dumps_dir(void)   { return s_nfc_dumps_dir; }
+const char *hal_path_nfc_keys_dir(void)    { return s_nfc_keys_dir; }
+const char *hal_path_mfkey_bin_dir(void)   { return s_mfkey_bin_dir; }
+const char *hal_path_nfc_log_dir(void)     { return s_nfc_log_dir; }
