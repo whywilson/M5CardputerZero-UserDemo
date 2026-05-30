@@ -19,6 +19,7 @@
 #include <chrono>
 #include <atomic>
 #include <thread>
+#include <sstream>
 #include <array>
 #include <fstream>
 #include <sstream>
@@ -840,6 +841,119 @@ public:
                 const std::string msg = scan.error.empty() ? scan.status : scan.error;
                 emit_err(msg.empty() ? "SPI no card" : msg);
             }
+            return;
+        }
+
+        // GEN1A [spi_path]
+        // Scan card on SPI HAT, detect Gen1A magic, dump all 64 blocks.
+        if (verb_upper == "GEN1A") {
+            const std::string spi_path = arg.empty() ? "/dev/spidev0.2" : arg;
+
+            nfc_app::TransportEndpoint ep;
+            ep.kind  = nfc_app::TransportKind::SpiBus;
+            ep.path  = spi_path;
+            ep.label = "SPI " + spi_path;
+            nfc_automation_service_.select_spi_endpoint(ep);
+
+            if (!nfc_automation_service_.connect_current()) {
+                const auto conn = nfc_automation_service_.connection_state();
+                emit_err(conn.detail.empty() ? "SPI connect failed" : conn.detail);
+                return;
+            }
+
+            nfc_app::I2cCardInfo card_info;
+            std::vector<std::vector<uint8_t>> blocks;
+            std::string gen1a_err;
+
+            const bool ok = nfc_automation_service_.spi_scan_gen1a(&blocks, &card_info, &gen1a_err);
+            if (!ok) {
+                emit_err(gen1a_err.empty() ? "gen1a failed" : gen1a_err);
+                return;
+            }
+
+            std::ostringstream oss;
+            oss << "gen1a uid=" << card_info.uid;
+            for (int blk = 0; blk < static_cast<int>(blocks.size()); ++blk) {
+                oss << "\n" << blk << ":";
+                for (uint8_t b : blocks[blk]) {
+                    char hex[3];
+                    std::snprintf(hex, sizeof(hex), "%02X", b);
+                    oss << " " << hex;
+                }
+            }
+            if (!gen1a_err.empty()) oss << "\n# " << gen1a_err;
+            emit_ok(oss.str());
+            return;
+        }
+
+        // SPI_EMU_START [uid_hex] [atqa_hex] [sak_hex] [spi_path]
+        //   uid_hex : 8 or 14 hex digits (4 or 7 bytes)
+        //   atqa_hex: 4 hex digits (2 bytes, little-endian)
+        //   sak_hex : 2 hex digits
+        //   spi_path: optional, default /dev/spidev0.2
+        // Example: SPI_EMU_START 01020304 0004 08
+        if (verb_upper == "SPI_EMU_START") {
+            // Parse arguments: uid atqa sak [path]
+            std::istringstream args_ss(arg);
+            std::string uid_hex, atqa_hex, sak_hex, emu_path;
+            args_ss >> uid_hex >> atqa_hex >> sak_hex >> emu_path;
+            if (emu_path.empty()) emu_path = "/dev/spidev0.2";
+
+            auto hex_to_bytes = [](const std::string &hex) -> std::vector<uint8_t> {
+                std::vector<uint8_t> out;
+                for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                    char buf[3] = {hex[i], hex[i+1], '\0'};
+                    out.push_back(static_cast<uint8_t>(std::strtoul(buf, nullptr, 16)));
+                }
+                return out;
+            };
+
+            const auto uid_bytes = hex_to_bytes(uid_hex);
+            if (uid_bytes.size() != 4 && uid_bytes.size() != 7) {
+                emit_err("SPI_EMU_START: uid must be 4 or 7 bytes (8 or 14 hex digits)");
+                return;
+            }
+            if (atqa_hex.size() < 4) {
+                emit_err("SPI_EMU_START: atqa must be 4 hex digits");
+                return;
+            }
+            if (sak_hex.size() < 2) {
+                emit_err("SPI_EMU_START: sak must be 2 hex digits");
+                return;
+            }
+
+            const auto atqa_bytes = hex_to_bytes(atqa_hex);
+            const uint16_t atqa = static_cast<uint16_t>(atqa_bytes[0]) |
+                                  (static_cast<uint16_t>(atqa_bytes.size() > 1 ? atqa_bytes[1] : 0) << 8);
+            const uint8_t sak = hex_to_bytes(sak_hex)[0];
+
+            nfc_app::TransportEndpoint ep;
+            ep.kind  = nfc_app::TransportKind::SpiBus;
+            ep.path  = emu_path;
+            ep.label = "SPI " + emu_path;
+            nfc_automation_service_.select_spi_endpoint(ep);
+
+            if (!nfc_automation_service_.connect_current()) {
+                const auto conn = nfc_automation_service_.connection_state();
+                emit_err(conn.detail.empty() ? "SPI connect failed" : conn.detail);
+                return;
+            }
+
+            std::string emu_err;
+            if (!nfc_automation_service_.spi_start_listener_a(uid_bytes, atqa, sak, &emu_err)) {
+                emit_err(emu_err.empty() ? "spi emu start failed" : emu_err);
+                return;
+            }
+
+            std::ostringstream oss;
+            oss << "spi emu started uid=" << uid_hex << " atqa=" << atqa_hex << " sak=" << sak_hex;
+            emit_ok(oss.str());
+            return;
+        }
+
+        if (verb_upper == "SPI_EMU_STOP") {
+            nfc_automation_service_.spi_stop_listener();
+            emit_ok("spi emu stopped");
             return;
         }
 

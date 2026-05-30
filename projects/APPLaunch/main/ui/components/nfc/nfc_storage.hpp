@@ -49,15 +49,22 @@ public:
         return root_dir() + "/last_transport.json";
     }
 
-    bool save_last_transport_kind(TransportKind kind) const
+    // Save both kind and endpoint path so SPI/I2C paths survive restarts.
+    bool save_last_endpoint(TransportKind kind, const std::string &path) const
     {
         if (!ensure_layout()) return false;
         std::ofstream out(last_transport_kind_path().c_str(), std::ios::out | std::ios::trunc);
         if (!out.is_open()) return false;
         nlohmann::json j;
         j["kind"] = to_string(kind);
+        j["path"] = path;
         out << j.dump(2);
         return out.good();
+    }
+
+    bool save_last_transport_kind(TransportKind kind) const
+    {
+        return save_last_endpoint(kind, "");
     }
 
     TransportKind load_last_transport_kind() const
@@ -71,6 +78,19 @@ public:
                 return transport_from_string(j["kind"].get<std::string>());
         } catch (...) {}
         return TransportKind::UsbSerial;
+    }
+
+    std::string load_last_endpoint_path() const
+    {
+        std::ifstream in(last_transport_kind_path().c_str());
+        if (!in.is_open()) return "";
+        try {
+            nlohmann::json j;
+            in >> j;
+            if (j.contains("path") && j["path"].is_string())
+                return j["path"].get<std::string>();
+        } catch (...) {}
+        return "";
     }
 
     bool save_uart_config(const UartConfig &cfg) const

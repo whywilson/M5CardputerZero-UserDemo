@@ -551,6 +551,10 @@ private:
     int bss_xfer_ready_timeout_ms_ = 25;
     std::string pi4io_status_ = "not-checked";
 
+    // Listener / passive-target state
+    bool listener_active_ = false;
+    enum class ListenerState { Off, Idle, Active } listener_state_ = ListenerState::Off;
+
     static void sleep_ms(int ms)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(ms));
@@ -1419,6 +1423,350 @@ private:
         if ((sak & 0x20) != 0) return "ISO14443A"; // ISO-DEP
         return "ISO14443A";
     }
+
+    // ── Gen1A magic card detection + dump ─────────────────────────────────────
+
+    // Send a 7-bit short frame and check for positive ACK nibble (0x0A).
+    bool gen1a_7bit_cmd_ack(uint8_t cmd)
+    {
+        direct_cmd(st25r_cmd::CLEAR_FIFO);
+        direct_cmd(st25r_cmd::CLEAR);
+        write_reg(st25r_reg::ISO14443A_NFC, 0x00);
+        // 7-bit frame: NUM_TX_BYTES2 = 0x07 (0 full bytes + 7 bits last byte)
+        write_reg(st25r_reg::NUM_TX_BYTES1, 0x00);
+        write_reg(st25r_reg::NUM_TX_BYTES2, 0x07);
+        write_fifo(&cmd, 1);
+        direct_cmd(st25r_cmd::TRANSMIT_WITHOUT_CRC);
+        uint8_t last_irq = 0, last_fifo = 0, last_irq_t = 0;
+        if (!wait_fifo_bytes(1, 30, &last_irq, &last_fifo, &last_irq_t)) return false;
+        uint8_t ack = 0;
+        size_t got = 0;
+        if (!read_fifo(&ack, 1, &got) || got < 1) return false;
+        // Positive ACK nibble = 0x0A (low nibble of first byte)
+        return (ack & 0x0F) == 0x0A;
+    }
+
+    // Send a full-byte command (no CRC) and check for positive ACK nibble.
+    bool gen1a_fullbyte_cmd_ack(uint8_t cmd)
+    {
+        direct_cmd(st25r_cmd::CLEAR_FIFO);
+        direct_cmd(st25r_cmd::CLEAR);
+        write_reg(st25r_reg::ISO14443A_NFC, 0x00);
+        write_fifo(&cmd, 1);
+        direct_cmd(st25r_cmd::TRANSMIT_WITHOUT_CRC);
+        uint8_t last_irq = 0, last_fifo = 0, last_irq_t = 0;
+        if (!wait_fifo_bytes(1, 30, &last_irq, &last_fifo, &last_irq_t)) return false;
+        uint8_t ack = 0;
+        size_t got = 0;
+        if (!read_fifo(&ack, 1, &got) || got < 1) return false;
+        return (ack & 0x0F) == 0x0A;
+    }
+
+public:
+    // Check if the currently-selected card is a Gen1A magic card.
+    // Requires the card to have been previously selected (readCard completed).
+    // Gen1A backdoor: 7-bit 0x40 → ACK, then full-byte 0x43 → ACK.
+    bool is_gen1a()
+    {
+#if defined(__linux__)
+        if (fd_ < 0) return false;
+        if (!gen1a_7bit_cmd_ack(0x40)) return false;
+        return gen1a_fullbyte_cmd_ack(0x43);
+#else
+        return false;
+#endif
+    }
+
+    // Read one 16-byte MFC block using plain READ command (0x30).
+    // Card must be in Gen1A unlocked state (call is_gen1a() first).
+    bool gen1a_read_block(uint8_t block, uint8_t data[16])
+    {
+#if defined(__linux__)
+        if (fd_ < 0) return false;
+        direct_cmd(st25r_cmd::CLEAR_FIFO);
+        direct_cmd(st25r_cmd::CLEAR);
+        write_reg(st25r_reg::ISO14443A_NFC, 0x00);
+        uint8_t read_cmd[2] = {0x30, block};
+        write_fifo(read_cmd, 2);
+        direct_cmd(st25r_cmd::TRANSMIT_WITH_CRC);
+        // Expect 16 data bytes + 2 CRC bytes
+        if (!wait_fifo_bytes(16, 80)) return false;
+        size_t got = 0;
+        uint8_t buf[18] = {0};
+        if (!read_fifo(buf, 18, &got) || got < 16) return false;
+        std::memcpy(data, buf, 16);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // Scan a card, verify it is Gen1A, and dump all 64 blocks.
+    // out_info receives the card UID/ATQA/SAK (may be nullptr).
+    // out_blocks receives 64 × 16-byte blocks (may be nullptr for detect-only).
+    bool scan_and_dump_gen1a(I2cCardInfo *out_info,
+                             std::vector<std::vector<uint8_t>> *out_blocks,
+                             std::string *error)
+    {
+#if defined(__linux__)
+        if (fd_ < 0) {
+            if (error) *error = "SPI device not open";
+            return false;
+        }
+
+        I2cCardInfo local_info;
+        if (!readCard(out_info ? out_info : &local_info)) {
+            if (error) *error = "No card detected";
+            return false;
+        }
+
+        if (!is_gen1a()) {
+            set_rf_field(false);
+            if (error) *error = "Not a Gen1A magic card";
+            return false;
+        }
+
+        if (!out_blocks) {
+            set_rf_field(false);
+            return true; // detect only
+        }
+
+        out_blocks->clear();
+        int failures = 0;
+        for (int blk = 0; blk < 64; ++blk) {
+            std::vector<uint8_t> block(16, 0xFF);
+            if (!gen1a_read_block(static_cast<uint8_t>(blk), block.data())) {
+                ++failures;
+            }
+            out_blocks->push_back(std::move(block));
+        }
+
+        set_rf_field(false);
+        if (failures > 0 && error) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "dump completed with %d block read errors", failures);
+            *error = buf;
+        }
+        return true;
+#else
+        if (error) *error = "SPI not supported";
+        return false;
+#endif
+    }
+
+    // ── ST25R3916 SPI passive-target (listener / EMU) ─────────────────────────
+    // Reference: ST25R3916 datasheet §11 (Passive target mode)
+    // Note: no slot concept – the chip emulates exactly one card identity.
+
+    // Write PT Memory A via the SPI direct opcode 0xA0 (15 bytes for NFC-A).
+    // Layout: uid[0..6], padding[0..4], atqa[lo,hi], sak_cl1, sak_cl2, sak.
+    bool write_pt_memory_a(const uint8_t *data, uint8_t len)
+    {
+#if defined(__linux__)
+        if (len > 15) len = 15;
+        std::vector<uint8_t> tx(static_cast<size_t>(len) + 1);
+        std::vector<uint8_t> rx(static_cast<size_t>(len) + 1);
+        tx[0] = 0xA0; // ST25R3916 SPI: Load PT Memory A config
+        std::memcpy(tx.data() + 1, data, len);
+        return spi_transfer(tx.data(), rx.data(), len + 1);
+#else
+        return false;
+#endif
+    }
+
+    // Read all four IRQ registers and return as a 32-bit value:
+    //   bits [7:0]   = IRQ_MAIN (0x1A)
+    //   bits [15:8]  = IRQ_TIMER_NFC (0x1B)
+    //   bits [23:16] = IRQ_ERR_WUP (0x1C)
+    //   bits [31:24] = IRQ_PTA (0x1D)
+    bool read_irq32(uint32_t *out)
+    {
+#if defined(__linux__)
+        uint8_t main_irq = 0, timer_irq = 0, err_irq = 0, pta_irq = 0;
+        if (!read_reg(st25r_reg::IRQ_MAIN,      &main_irq))  return false;
+        if (!read_reg(st25r_reg::IRQ_TIMER_NFC, &timer_irq)) return false;
+        if (!read_reg(st25r_reg::IRQ_ERR_WUP,   &err_irq))   return false;
+        if (!read_reg(0x1D,                      &pta_irq))   return false;
+        if (out) *out = (static_cast<uint32_t>(pta_irq)   << 24) |
+                        (static_cast<uint32_t>(err_irq)   << 16) |
+                        (static_cast<uint32_t>(timer_irq) <<  8) |
+                         static_cast<uint32_t>(main_irq);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // Start passive-target (listener) mode for NFC-A.
+    // uid:  4 or 7 bytes. atqa: 2 bytes (little-endian). sak: SELECT response.
+    // After this call, poll_listener_frame() will block until a frame arrives.
+    bool start_listener_a(const std::vector<uint8_t> &uid, uint16_t atqa, uint8_t sak,
+                          std::string *error = nullptr)
+    {
+#if defined(__linux__)
+        if (fd_ < 0) { if (error) *error = "SPI not open"; return false; }
+        const uint8_t uid_len = static_cast<uint8_t>(uid.size());
+        if (uid_len != 4 && uid_len != 7) {
+            if (error) *error = "UID must be 4 or 7 bytes";
+            return false;
+        }
+
+        stop_listener();
+
+        // ── 1. Build PT Memory A (15 bytes) ───────────────────────────────
+        // Format: uid[0..6], zeros[0..4], atqa_lo, atqa_hi, sak_cl1, sak_cl2, sak
+        uint8_t pt[15] = {0};
+        for (uint8_t i = 0; i < uid_len; ++i) pt[i] = uid[i];
+        // Byte 7 is padding; bytes 8-9 are ATQA
+        pt[8]  = static_cast<uint8_t>(atqa & 0xFF);
+        pt[9]  = static_cast<uint8_t>((atqa >> 8) & 0xFF);
+        // SAK values: sak_cl1, sak_cl2 (cascade bits), sak (final)
+        pt[10] = (uid_len == 7) ? 0x04 : sak; // cascade SAK or final SAK if 4-byte
+        pt[11] = (uid_len == 7) ? 0x04 : sak;
+        pt[12] = sak;
+        if (!write_pt_memory_a(pt, 15)) {
+            if (error) *error = "PT memory A write failed";
+            return false;
+        }
+
+        // ── 2. AUX: uid_7 bit = 0x10 for 7-byte UID, 0x00 for 4-byte ─────
+        uint8_t aux_val = 0;
+        read_reg(st25r_reg::AUX, &aux_val);
+        aux_val = static_cast<uint8_t>((aux_val & 0xCF) | (uid_len == 7 ? 0x10 : 0x00));
+        write_reg(st25r_reg::AUX, aux_val);
+
+        // ── 3. PASSIVE_TARGET: bit0=1 for auto-collision response ─────────
+        write_reg(st25r_reg::PASSIVE_TARGET, 0x01);
+
+        // ── 4. External-field detection thresholds ────────────────────────
+        write_reg(st25r_reg::FIELD_THRES_ACTV,   0x13);
+        write_reg(st25r_reg::FIELD_THRES_DEACTV, 0x02);
+
+        // ── 5. OP_CONTROL: oscillator on + field-detect auto ──────────────
+        write_reg(st25r_reg::OP_CONTROL, 0x83); // osc_en=1, en_fd=01 (auto)
+
+        // ── 6. MODE: ISO14443A passive target + bitrate detection ─────────
+        write_reg(st25r_reg::MODE, 0xC8); // targ=1 | iso14443a=0x08 | bitrate_detect=0xC0
+
+        // ── 7. Enable listener IRQs; mask everything else ─────────────────
+        // IRQ_MASK_MAIN: unmask RXE (bit4) and RXS (bit5)
+        write_reg(st25r_reg::IRQ_MASK_MAIN,      0xCF); // keep ERR bits masked
+        // IRQ_MASK_TIMER_NFC: unmask NFCT (bit0), EOF (bit4), EON (bit5)
+        write_reg(st25r_reg::IRQ_MASK_TIMER_NFC, 0xCE);
+        // IRQ_MASK_ERR_WUP: keep all masked
+        write_reg(st25r_reg::IRQ_MASK_ERR_WUP,   0xFF);
+
+        // Clear any latched IRQs
+        uint32_t dummy = 0;
+        read_irq32(&dummy);
+
+        // ── 8. GOTO_SENSE: start listening for external field ─────────────
+        direct_cmd(st25r_cmd::GOTO_SENSE);
+
+        listener_active_ = true;
+        listener_state_  = ListenerState::Idle;
+        return true;
+#else
+        if (error) *error = "SPI not supported";
+        return false;
+#endif
+    }
+
+    // Stop passive-target mode and return to initiator configuration.
+    void stop_listener()
+    {
+#if defined(__linux__)
+        if (!listener_active_ && fd_ < 0) return;
+        direct_cmd(st25r_cmd::STOP);
+        // Restore initiator registers
+        init_chip();
+        listener_active_ = false;
+        listener_state_  = ListenerState::Off;
+#endif
+    }
+
+    bool listener_active() const
+    {
+#if defined(__linux__)
+        return listener_active_;
+#else
+        return false;
+#endif
+    }
+
+    // Wait for an incoming NFC frame in passive-target mode.
+    // On success, returns the raw frame bytes in 'frame'.
+    // Returns false on timeout or error.
+    bool poll_listener_frame(std::vector<uint8_t> &frame, int timeout_ms = 100)
+    {
+#if defined(__linux__)
+        if (fd_ < 0 || !listener_active_) return false;
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            uint32_t irq = 0;
+            if (!read_irq32(&irq)) { sleep_ms(2); continue; }
+
+            // IRQ_PTA bits (in high byte) ─────────────────────────────────
+            const uint8_t pta = static_cast<uint8_t>(irq >> 24);
+            // IRQ_TIMER_NFC bits ──────────────────────────────────────────
+            const uint8_t timer = static_cast<uint8_t>((irq >> 8) & 0xFF);
+            // IRQ_MAIN bits ───────────────────────────────────────────────
+            const uint8_t main_irq = static_cast<uint8_t>(irq & 0xFF);
+
+            // EON (external field on) → enter Idle
+            if ((timer & 0x20) && listener_state_ == ListenerState::Off) {
+                listener_state_ = ListenerState::Idle;
+            }
+            // NFCT (NFC-A target selected) → enter Active
+            if ((timer & 0x01) && listener_state_ == ListenerState::Idle) {
+                listener_state_ = ListenerState::Active;
+                direct_cmd(st25r_cmd::UNMASK_RECEIVE_DATA);
+            }
+            // RXE or RXE_PTA: frame received
+            const bool rxe_main = (main_irq & 0x10) != 0; // RXE bit4
+            const bool rxe_pta  = (pta  & 0x10) != 0;     // RXE_PTA bit4
+            if ((rxe_main || rxe_pta) && listener_state_ == ListenerState::Active) {
+                uint8_t fifo_data[64] = {0};
+                size_t  fifo_len = 0;
+                if (read_fifo(fifo_data, sizeof(fifo_data), &fifo_len) && fifo_len > 0) {
+                    frame.assign(fifo_data, fifo_data + fifo_len);
+                    return true;
+                }
+            }
+            // EOF (end of field) → return to Off
+            if ((timer & 0x10) && listener_state_ != ListenerState::Off) {
+                listener_state_ = ListenerState::Off;
+                direct_cmd(st25r_cmd::GOTO_SENSE);
+            }
+
+            sleep_ms(2);
+        }
+        return false;
+#else
+        return false;
+#endif
+    }
+
+    // Send a response frame from the passive target.
+    bool send_listener_frame(const uint8_t *tx, uint8_t tx_len)
+    {
+#if defined(__linux__)
+        if (fd_ < 0 || !listener_active_ || tx_len == 0) return false;
+        direct_cmd(st25r_cmd::CLEAR_FIFO);
+        direct_cmd(st25r_cmd::CLEAR);
+        write_fifo(tx, tx_len);
+        const uint16_t nbits = static_cast<uint16_t>(tx_len) * 8;
+        write_reg(st25r_reg::NUM_TX_BYTES1, static_cast<uint8_t>((nbits >> 8) & 0x01));
+        write_reg(st25r_reg::NUM_TX_BYTES2, static_cast<uint8_t>(nbits & 0xFF));
+        direct_cmd(st25r_cmd::TRANSMIT_WITH_CRC);
+        return true;
+#else
+        return false;
+#endif
+    }
+
 #endif
 };
 

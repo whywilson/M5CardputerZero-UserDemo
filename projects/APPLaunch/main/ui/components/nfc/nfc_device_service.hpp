@@ -94,19 +94,41 @@ public:
                 ep.baud_rate = uart_config_.baud_rate;
             }
         }
-        // Restore last-used transport kind so the UI starts on the right mode
+        // Restore last-used transport kind + path so the UI starts on the right mode
         const TransportKind saved_kind = storage_.load_last_transport_kind();
+        const std::string saved_path   = storage_.load_last_endpoint_path();
         if (saved_kind != TransportKind::Mock) {
             intended_kind_ = saved_kind;
-            // Select the first endpoint matching the saved kind
-            for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
-                if (endpoints_[i].kind == saved_kind) {
-                    // Prefer the configured UART path if UART
-                    if (saved_kind == TransportKind::UartSerial &&
-                        !uart_config_.device_path.empty() &&
-                        endpoints_[i].path != uart_config_.device_path) continue;
-                    selected_endpoint_ = i;
-                    break;
+            if ((saved_kind == TransportKind::SpiBus ||
+                 saved_kind == TransportKind::I2cBus) && !saved_path.empty()) {
+                // SPI/I2C endpoints are not in the system enumeration; restore them
+                // as a synthetic endpoint so the UI stays on the right mode.
+                bool found = false;
+                for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
+                    if (endpoints_[i].kind == saved_kind && endpoints_[i].path == saved_path) {
+                        selected_endpoint_ = i;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    TransportEndpoint ep;
+                    ep.kind  = saved_kind;
+                    ep.path  = saved_path;
+                    ep.label = (saved_kind == TransportKind::SpiBus ? "SPI " : "I2C ") + saved_path;
+                    endpoints_.push_back(ep);
+                    selected_endpoint_ = static_cast<int>(endpoints_.size()) - 1;
+                }
+            } else {
+                // For USB/UART: select the first matching endpoint
+                for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
+                    if (endpoints_[i].kind == saved_kind) {
+                        if (saved_kind == TransportKind::UartSerial &&
+                            !uart_config_.device_path.empty() &&
+                            endpoints_[i].path != uart_config_.device_path) continue;
+                        selected_endpoint_ = i;
+                        break;
+                    }
                 }
             }
         }
@@ -559,7 +581,7 @@ public:
         if (transport_) { transport_->close(); transport_.reset(); }
         connection_ = ConnectionState{};
         intended_kind_ = TransportKind::SpiBus;
-        storage_.save_last_transport_kind(intended_kind_);
+        storage_.save_last_endpoint(intended_kind_, ep.path);
         for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
             if (endpoints_[i].kind == TransportKind::SpiBus &&
                 endpoints_[i].path == ep.path) {
@@ -580,7 +602,7 @@ public:
         if (transport_) { transport_->close(); transport_.reset(); }
         connection_ = ConnectionState{};
         intended_kind_ = TransportKind::I2cBus;
-        storage_.save_last_transport_kind(intended_kind_);
+        storage_.save_last_endpoint(intended_kind_, ep.path);
         // Reuse existing slot if the path is already known
         for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
             if (endpoints_[i].kind == TransportKind::I2cBus &&
@@ -1828,6 +1850,48 @@ public:
 
         if (status) *status = "Scanning card...";
         return true;
+    }
+
+    // ── SPI Gen1A detection + dump (blocking, call on automation thread) ──────
+    // Requires SPI to already be connected via select_spi_endpoint + connect_current.
+    // Scans card, checks Gen1A backdoor, optionally dumps all 64 blocks.
+    // Returns false on any failure; out_blocks may be nullptr for detect-only.
+    bool spi_scan_gen1a(std::vector<std::vector<uint8_t>> *out_blocks,
+                        I2cCardInfo *out_info,
+                        std::string *error)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!spi_device_ || !spi_device_->is_open()) {
+            if (error) *error = "SPI not connected";
+            return false;
+        }
+        return spi_device_->scan_and_dump_gen1a(out_info, out_blocks, error);
+    }
+
+    // ── SPI passive-target (EMU) control ─────────────────────────────────────
+    // All methods require SPI to be connected.
+
+    bool spi_start_listener_a(const std::vector<uint8_t> &uid, uint16_t atqa, uint8_t sak,
+                              std::string *error = nullptr)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!spi_device_ || !spi_device_->is_open()) {
+            if (error) *error = "SPI not connected";
+            return false;
+        }
+        return spi_device_->start_listener_a(uid, atqa, sak, error);
+    }
+
+    void spi_stop_listener()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (spi_device_) spi_device_->stop_listener();
+    }
+
+    bool spi_listener_active() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return spi_device_ && spi_device_->listener_active();
     }
 
     bool can_dump_last_scan(std::string *error = nullptr) const
