@@ -32,39 +32,6 @@
 #else
 #define NFC_SPI_HAS_I2CDEV 0
 #endif
-#else
-// Non-Linux stub: enough to compile, SPI/GPIO ops always fail at runtime
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/ioctl.h>
-#define NFC_SPI_HAS_I2CDEV 0
-#ifndef SPI_MODE_0
-#define SPI_MODE_0 0
-#define SPI_MODE_1 1
-#define SPI_MODE_2 2
-#define SPI_MODE_3 3
-#define SPI_NO_CS  4
-#endif
-#ifndef SPI_IOC_WR_MODE
-#define SPI_IOC_WR_MODE         _IOW('k', 1, uint8_t)
-#define SPI_IOC_WR_BITS_PER_WORD _IOW('k', 3, uint8_t)
-#define SPI_IOC_WR_MAX_SPEED_HZ  _IOW('k', 4, uint32_t)
-#define SPI_IOC_MESSAGE(n)       _IOW('k', 0, char[32])
-#endif
-struct spi_ioc_transfer { uint64_t tx_buf, rx_buf; uint32_t len; uint32_t speed_hz; uint16_t delay_usecs; uint8_t bits_per_word; uint8_t cs_change; uint32_t pad; };
-#ifndef GPIO_GET_CHIPINFO_IOCTL
-#define GPIO_GET_CHIPINFO_IOCTL       _IOR('B', 1, char[68])
-#define GPIO_GET_LINEINFO_IOCTL       _IOWR('B', 2, char[72])
-#define GPIO_GET_LINEHANDLE_IOCTL     _IOWR('B', 3, char[364])
-#define GPIOHANDLE_GET_LINE_VALUES_IOCTL _IOWR(0xB4, 8, char[8])
-#define GPIOHANDLE_SET_LINE_VALUES_IOCTL _IOWR(0xB4, 9, char[8])
-#define GPIOHANDLE_REQUEST_INPUT      1
-#define GPIOHANDLE_REQUEST_OUTPUT     2
-struct gpiochip_info { char name[32]; char label[32]; uint32_t lines; };
-struct gpioline_info { uint32_t line_offset; uint32_t flags; char name[32]; char consumer[32]; };
-struct gpiohandle_request { uint32_t lineoffsets[64]; uint32_t flags; uint8_t default_values[64]; char consumer_label[32]; uint32_t lines; int fd; };
-struct gpiohandle_data { uint8_t values[64]; };
-#endif
 #endif
 
 #include <chrono>
@@ -171,8 +138,14 @@ public:
         power_line_target_ = "unset";
         accepted_nonstandard_ic_ = false;
         pi4io_status_ = "not-checked";
-        lora_compat_profile_ = (parse_env_int("NFC_SPI_LORA_COMPAT_PROFILE", 1) != 0);
-        strict_probe_profile_ = (parse_env_int("NFC_SPI_STRICT_PROFILE", lora_compat_profile_ ? 1 : 0) != 0);
+        // /dev/spidev0.2 = ST25R3916 on CardputerZero HAT (verified by reference nfc_linux demo).
+        // ST25R3916 SPI spec: CPOL=0/CPHA=1 = SPI_MODE_1, 5 MHz max, CS kernel-managed.
+        // Read format: [CMD_BYTE | ADDR, 0x00] → rx[1] is the register value (no extra dummy).
+        const bool is_st25r_spidev = (spidev_path.find("spidev0.2") != std::string::npos);
+        lora_compat_profile_ = is_st25r_spidev ? false
+            : (parse_env_int("NFC_SPI_LORA_COMPAT_PROFILE", 1) != 0);
+        strict_probe_profile_ = is_st25r_spidev ? true
+            : (parse_env_int("NFC_SPI_STRICT_PROFILE", lora_compat_profile_ ? 1 : 0) != 0);
         bss_wait_before_transfer_ = (parse_env_int("NFC_SPI_BSS_WAIT_BEFORE_XFER", 0) != 0);
         bss_ready_level_ = parse_env_int("NFC_SPI_BSS_READY_LEVEL", 0);
         bss_xfer_ready_timeout_ms_ = parse_env_int("NFC_SPI_BSS_XFER_READY_TIMEOUT_MS", 0);
@@ -189,8 +162,10 @@ public:
         rst_sysfs_gpio_ = -1;
         bss_sysfs_gpio_ = -1;
         irq_sysfs_gpio_ = -1;
-        prepare_spi_hat_power_gate();
+        // Assign path before prepare_spi_hat_power_gate so that
+        // configure_st25r_control_lines() can detect spidev0.2 via spidev_path_.
         spidev_path_ = spidev_path;
+        prepare_spi_hat_power_gate();
         fd_ = ::open(spidev_path.c_str(), O_RDWR);
         if (fd_ < 0) {
             if (error) *error = std::string("open(") + spidev_path + "): " + std::strerror(errno);
@@ -218,18 +193,22 @@ public:
         } best;
 
         const uint8_t mode_candidates_all[] = {
-            static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE0", SPI_MODE_2)),
+            // spidev0.2 (ST25R3916): MODE_1 is correct per datasheet and reference demo.
+            // Other paths retain legacy MODE_2 first for compatibility.
+            static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE0", is_st25r_spidev ? SPI_MODE_1 : SPI_MODE_2)),
             static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE1", SPI_MODE_1)),
             static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE2", SPI_MODE_0)),
             static_cast<uint8_t>(parse_env_int("NFC_SPI_MODE3", SPI_MODE_3)),
         };
-        // Keep ST25R CAP access conservative and stable: probe at 1 MHz only.
+        // spidev0.2: 5 MHz (reference-verified). Other paths: 1 MHz conservative probe.
         const uint32_t speed_candidates_all[] = {
-            static_cast<uint32_t>(parse_env_int("NFC_SPI_SPEED", 1000000)),
+            static_cast<uint32_t>(parse_env_int("NFC_SPI_SPEED", is_st25r_spidev ? 5000000u : 1000000u)),
         };
+        // spidev0.2: ST25R3916 read = CMD + DUMMY → data in rx[1], no extra dummy byte needed.
+        // read_dummy=true means 3-byte transfer; read_dummy=false means 2-byte (correct for ST25R).
         const bool read_dummy_candidates_all[] = {
-            parse_env_int("NFC_SPI_READ_DUMMY_FIRST", 1) != 0,
-            parse_env_int("NFC_SPI_READ_DUMMY_SECOND", 0) != 0,
+            parse_env_int("NFC_SPI_READ_DUMMY_FIRST",  is_st25r_spidev ? 0 : 1) != 0,
+            parse_env_int("NFC_SPI_READ_DUMMY_SECOND", is_st25r_spidev ? 1 : 0) != 0,
         };
 
         std::vector<uint8_t> mode_candidates;
