@@ -454,9 +454,14 @@ probe_done:
         // Clear IRQ flags
         direct_cmd(st25r_cmd::CLEAR);
 
-        // Set up for ISO14443A 106 kbps
-        write_reg(st25r_reg::MODE, 0x00);       // ISO14443A / NFC
+        // Set up for ISO14443A initiator at 106 kbps.
+        write_reg(st25r_reg::MODE, 0x08);       // om_iso14443a (matches proven I2C flow)
         write_reg(st25r_reg::BIT_RATE, 0x00);   // 106 kbps TX/RX
+        write_reg(st25r_reg::ISO14443A_NFC, 0x00); // antcl off for short-frame wakeup
+        write_reg(st25r_reg::RX_CONF1, 0x08);
+        write_reg(st25r_reg::RX_CONF2, 0x2D);
+        write_reg(st25r_reg::RX_CONF3, 0xD8);
+        write_reg(st25r_reg::RX_CONF4, 0x22);
         // Enable RF field
         set_rf_field(true);
         sleep_ms(6);
@@ -1181,15 +1186,33 @@ private:
         return true;
     }
 
-    bool wait_irq(uint8_t irq_mask, int timeout_ms)
+    bool wait_fifo_bytes(size_t min_bytes, int timeout_ms,
+                         uint8_t *last_irq_main = nullptr,
+                         uint8_t *last_fifo_bytes = nullptr,
+                         uint8_t *last_irq_timer = nullptr)
     {
+        uint8_t irq = 0;
+        uint8_t fifo_b = 0;
+        uint8_t irq_t = 0;
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds(timeout_ms);
         while (std::chrono::steady_clock::now() < deadline) {
-            uint8_t irq = 0;
             if (!read_reg(st25r_reg::IRQ_MAIN, &irq)) return false;
-            if (irq & irq_mask) return true;
-            sleep_ms(1);
+            if (!read_reg(st25r_reg::IRQ_TIMER_NFC, &irq_t)) return false;
+            if (!read_reg(st25r_reg::FIFO_STATUS1, &fifo_b)) return false;
+
+            // Different ST25R3916 setups may expose slightly different IRQ bit
+            // behavior. FIFO byte count is the most reliable RX readiness signal.
+            if (fifo_b >= static_cast<uint8_t>(min_bytes)) {
+                if (last_irq_main) *last_irq_main = irq;
+                if (last_fifo_bytes) *last_fifo_bytes = fifo_b;
+                if (last_irq_timer) *last_irq_timer = irq_t;
+                return true;
+            }
+
+            if (last_irq_main) *last_irq_main = irq;
+            if (last_fifo_bytes) *last_fifo_bytes = fifo_b;
+            if (last_irq_timer) *last_irq_timer = irq_t;
         }
         return false;
     }
@@ -1200,18 +1223,38 @@ private:
         direct_cmd(st25r_cmd::SET_DEFAULT);
         sleep_ms(2);
 
+        // Calibrate regulators before enabling RF blocks.
+        direct_cmd(st25r_cmd::ADJUST_REGULATORS);
+        sleep_ms(5);
+
+        // Oscillator only first; RX/TX are enabled for each scan cycle.
+        write_reg(st25r_reg::OP_CONTROL, 0x80);
+        sleep_ms(5);
+
         // Disable all IRQ masks (we poll IRQ_MAIN register directly)
         write_reg(st25r_reg::IRQ_MASK_MAIN, 0xFF);
         write_reg(st25r_reg::IRQ_MASK_TIMER_NFC, 0xFF);
         write_reg(st25r_reg::IRQ_MASK_ERR_WUP, 0xFF);
 
-        // No-response timer: ~86ms at 106kbps
+        // No-response timer for short-frame polling path.
         write_reg(st25r_reg::NO_RESPONSE_TIMER1, 0x00);
         write_reg(st25r_reg::NO_RESPONSE_TIMER2, 0x64);
 
-        // Enable regulator
-        write_reg(st25r_reg::REGULATOR_CONTROL, 0x10);
-        sleep_ms(2);
+        // Base NFCA initiator configuration.
+        write_reg(st25r_reg::MODE, 0x08);
+        write_reg(st25r_reg::BIT_RATE, 0x00);
+        write_reg(st25r_reg::ISO14443A_NFC, 0x00);
+        write_reg(st25r_reg::STREAM_MODE, 0x03);
+        write_reg(st25r_reg::RX_CONF1, 0x08);
+        write_reg(st25r_reg::RX_CONF2, 0x2D);
+        write_reg(st25r_reg::RX_CONF3, 0xD8);
+        write_reg(st25r_reg::RX_CONF4, 0x22);
+
+        // Clear latched IRQs.
+        uint8_t dummy = 0;
+        read_reg(st25r_reg::IRQ_MAIN, &dummy);
+        read_reg(st25r_reg::IRQ_TIMER_NFC, &dummy);
+        read_reg(st25r_reg::IRQ_ERR_WUP, &dummy);
     }
 
     // Send REQA (7-bit) and read ATQA (2 bytes)
@@ -1222,25 +1265,53 @@ private:
         direct_cmd(st25r_cmd::CLEAR_FIFO);
         direct_cmd(st25r_cmd::CLEAR);
 
-        // Set 7-bit transmission for REQA
-        write_reg(st25r_reg::ISO14443A_NFC, 0x01); // antcl=0, rx_nfc=1 (no CRC on ATQA)
-        write_reg(st25r_reg::NUM_TX_BYTES1, 0x00);
-        write_reg(st25r_reg::NUM_TX_BYTES2, 0x07); // 7 bits
+        // Short-frame wakeup first (wakes both IDLE and HALT cards).
+        write_reg(st25r_reg::ISO14443A_NFC, 0x00);
+        direct_cmd(st25r_cmd::TRANSMIT_WUPA);
 
-        // Load REQA (0x26) into FIFO
-        uint8_t reqa = 0x26;
-        write_fifo(&reqa, 1);
+        uint8_t last_irq = 0;
+        uint8_t last_irq_t = 0;
+        uint8_t last_fifo = 0;
+        if (!wait_fifo_bytes(2, 30, &last_irq, &last_fifo, &last_irq_t)) {
+            // Fallback path 1: dedicated REQA short-frame command.
+            direct_cmd(st25r_cmd::CLEAR_FIFO);
+            direct_cmd(st25r_cmd::CLEAR);
+            write_reg(st25r_reg::ISO14443A_NFC, 0x00);
+            direct_cmd(st25r_cmd::TRANSMIT_REQA);
 
-        // Transmit without CRC
-        direct_cmd(st25r_cmd::TRANSMIT_WITHOUT_CRC);
+            if (!wait_fifo_bytes(2, 30, &last_irq, &last_fifo, &last_irq_t)) {
+                // Fallback path 2: explicit 7-bit REQA from FIFO.
+                direct_cmd(st25r_cmd::CLEAR_FIFO);
+                direct_cmd(st25r_cmd::CLEAR);
+                write_reg(st25r_reg::ISO14443A_NFC, 0x00);
+                write_reg(st25r_reg::NUM_TX_BYTES1, 0x00);
+                write_reg(st25r_reg::NUM_TX_BYTES2, 0x07);
+                uint8_t reqa = 0x26;
+                write_fifo(&reqa, 1);
+                direct_cmd(st25r_cmd::TRANSMIT_WITHOUT_CRC);
 
-        // Wait for rx done or error
-        if (!wait_irq(0x40 | 0x01, 30)) return false; // IRQ_MAIN bit 6=rx_done, 0=err
+                if (!wait_fifo_bytes(2, 30, &last_irq, &last_fifo, &last_irq_t)) {
+                    char buf[96];
+                    std::snprintf(buf, sizeof(buf),
+                        "REQA timeout irq=0x%02X timer=0x%02X fifo=0x%02X",
+                        last_irq, last_irq_t, last_fifo);
+                    NfcHexLog::get().log_event("scan", buf);
+                    return false;
+                }
+            }
+        }
 
         // Read ATQA from FIFO
         size_t got = 0;
         if (!read_fifo(atqa_out, 2, &got)) return false;
-        return (got >= 2);
+        if (got < 2) {
+            char buf[80];
+                std::snprintf(buf, sizeof(buf),
+                "REQA short ATQA len=%zu", got);
+            NfcHexLog::get().log_event("scan", buf);
+            return false;
+        }
+        return true;
     }
 
     // ISO14443A anti-collision loop: returns UID (up to 10 bytes) and length
@@ -1265,7 +1336,7 @@ private:
             write_fifo(sdd, 2);
             direct_cmd(st25r_cmd::TRANSMIT_WITHOUT_CRC);
 
-            if (!wait_irq(0x40 | 0x01, 30)) return false;
+            if (!wait_fifo_bytes(5, 40)) return false;
 
             // Read 5 bytes: CT/UID0, UID1, UID2, UID3, BCC
             uint8_t sdd_resp[5] = {0};
@@ -1290,30 +1361,26 @@ private:
             direct_cmd(st25r_cmd::CLEAR);
 
             write_reg(st25r_reg::ISO14443A_NFC, 0x00); // CRC on for SELECT
-            uint8_t sel_frame[6];
+            uint8_t sel_frame[7];
             sel_frame[0] = sel_code;
             sel_frame[1] = 0x70;
             sel_frame[2] = sdd_resp[0];
             sel_frame[3] = sdd_resp[1];
             sel_frame[4] = sdd_resp[2];
             sel_frame[5] = sdd_resp[3];
-            // BCC not sent in SELECT frame (it's only for SDD)
-            write_fifo(sel_frame, 6);
-            write_reg(st25r_reg::NUM_TX_BYTES1, 0x00);
-            write_reg(st25r_reg::NUM_TX_BYTES2, 0x30); // 3 bytes = 24 bits (frame without BCC)
-            // Actually: SEL(1) + NVB(1) + 4 UID bytes = 6 bytes
-            write_reg(st25r_reg::NUM_TX_BYTES1, 0x00);
-            write_reg(st25r_reg::NUM_TX_BYTES2, 0x40); // 4*8=0x30? or just 6 bytes
+            // SELECT frame must include BCC byte (ISO14443A: SEL NVB UID[4] BCC).
+            sel_frame[6] = sdd_resp[4];
+            write_fifo(sel_frame, 7);
             // Use TRANSMIT_WITH_CRC so the chip appends CRC
-            // Number of bytes: 6 bytes excluding CRC
+            // Number of bytes: 7 bytes excluding CRC
             {
-                const uint16_t nbytes6 = 6 * 8; // bits
-                write_reg(st25r_reg::NUM_TX_BYTES1, static_cast<uint8_t>((nbytes6 >> 8) & 0x01));
-                write_reg(st25r_reg::NUM_TX_BYTES2, static_cast<uint8_t>(nbytes6 & 0xFF));
+                const uint16_t nbits = 7 * 8;
+                write_reg(st25r_reg::NUM_TX_BYTES1, static_cast<uint8_t>((nbits >> 8) & 0x01));
+                write_reg(st25r_reg::NUM_TX_BYTES2, static_cast<uint8_t>(nbits & 0xFF));
             }
             direct_cmd(st25r_cmd::TRANSMIT_WITH_CRC);
 
-            if (!wait_irq(0x40 | 0x01, 30)) return false;
+            if (!wait_fifo_bytes(1, 40)) return false;
 
             // Read SAK (1 byte + 2 CRC bytes, but we just need SAK)
             uint8_t sak_resp[3] = {0};

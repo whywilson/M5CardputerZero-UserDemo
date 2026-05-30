@@ -1122,6 +1122,18 @@ private:
             return;
         }
 
+        if (verb_upper == "SCAN") {
+            std::string status;
+            if (service_.connect_and_scan(&status)) {
+                emit_ok(status.empty() ? "scan started" : status);
+                ui_message_ = "Automation: scan started";
+            } else {
+                emit_err(status.empty() ? "scan failed" : status);
+                ui_message_ = "Automation: scan failed";
+            }
+            return;
+        }
+
         emit_err("unknown command: " + command);
         ui_message_ = "Automation: unknown command";
     }

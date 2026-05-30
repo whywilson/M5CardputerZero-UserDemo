@@ -789,6 +789,60 @@ public:
             return;
         }
 
+        if (verb_upper == "SCAN") {
+            std::string status;
+            if (nfc_automation_service_.connect_and_scan(&status)) {
+                emit_ok(status.empty() ? "scan started" : status);
+            } else {
+                emit_err(status.empty() ? "scan failed" : status);
+            }
+            return;
+        }
+
+        if (verb_upper == "SCAN_SPI") {
+            const std::string spi_path = arg.empty() ? "/dev/spidev0.2" : arg;
+
+            nfc_app::TransportEndpoint ep;
+            ep.kind = nfc_app::TransportKind::SpiBus;
+            ep.path = spi_path;
+            ep.label = "SPI " + spi_path;
+            nfc_automation_service_.select_spi_endpoint(ep);
+
+            if (!nfc_automation_service_.connect_current()) {
+                const auto conn = nfc_automation_service_.connection_state();
+                emit_err(conn.detail.empty() ? "SPI connect failed" : conn.detail);
+                return;
+            }
+
+            if (!nfc_automation_service_.start_scan()) {
+                const auto scan = nfc_automation_service_.scan_state();
+                const std::string msg = scan.error.empty() ? scan.status : scan.error;
+                emit_err(msg.empty() ? "SPI scan start failed" : msg);
+                return;
+            }
+
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(2500);
+            while (std::chrono::steady_clock::now() < deadline) {
+                const auto scan = nfc_automation_service_.scan_state();
+                if (!scan.running) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            }
+
+            const auto scan = nfc_automation_service_.scan_state();
+            if (scan.running) {
+                emit_err("SPI scan timeout");
+            } else if (scan.has_result) {
+                std::ostringstream oss;
+                oss << "SPI card found uid=" << scan.last_record.tag.uid;
+                emit_ok(oss.str());
+            } else {
+                const std::string msg = scan.error.empty() ? scan.status : scan.error;
+                emit_err(msg.empty() ? "SPI no card" : msg);
+            }
+            return;
+        }
+
         emit_err("unknown command: " + command);
     }
 
