@@ -1941,10 +1941,6 @@ public:
             if (error) *error = "Scan card first";
             return false;
         }
-        if (!transport_ || !transport_->is_open()) {
-            if (error) *error = "Connect device first";
-            return false;
-        }
         if (connection_.endpoint.kind == TransportKind::I2cBus) {
             if (!i2c_device_ || !i2c_device_->is_open()) {
                 if (error) *error = "I2C device not open";
@@ -1958,6 +1954,22 @@ public:
                 return false;
             }
             return true;
+        }
+        if (connection_.endpoint.kind == TransportKind::SpiBus) {
+            if (!spi_device_ || !spi_device_->is_open()) {
+                if (error) *error = "SPI device not open";
+                return false;
+            }
+            const auto p = scan_.last_record.tag.protocol;
+            if (p != ProtocolKind::MifareClassic && p != ProtocolKind::Iso14443A) {
+                if (error) *error = "SPI dump supports MFC/MFU only";
+                return false;
+            }
+            return true;
+        }
+        if (!transport_ || !transport_->is_open()) {
+            if (error) *error = "Connect device first";
+            return false;
         }
         if (connection_.device_kind == DeviceKind::PN532 &&
             scan_.last_record.tag.protocol == ProtocolKind::Iso15693) {
@@ -4643,6 +4655,20 @@ private:
                 tag.tag_type = i2c_protocol_to_tag_type(card.protocol);
                 tag.magic_type = card.magic_type;
                 tag.raw_data.clear();
+
+                // SPI ST25R does not expose magic type in readCard(); probe it here
+                // so READ page can show Gen1A/Normal like PN532/I2C paths.
+                const bool mfc_like = (tag.protocol == ProtocolKind::MifareClassic) ||
+                                      (to_upper(tag.tag_type).find("MIFARE CLASSIC") != std::string::npos);
+                if (mfc_like) {
+                    std::string magic_err;
+                    if (spi_dev->scan_and_dump_gen1a(nullptr, nullptr, &magic_err)) {
+                        tag.magic_type = "Gen1A";
+                    } else if (tag.magic_type.empty()) {
+                        tag.magic_type = "Normal";
+                    }
+                }
+
                 if (!card.atqa_hex.empty()) tag.identity_fields["ATQA"] = card.atqa_hex;
                 if (!card.sak_hex.empty()) tag.identity_fields["SAK"] = card.sak_hex;
                 emit_scan_summary(to_string(tag.protocol),
@@ -4806,6 +4832,7 @@ private:
         DeviceKind device_kind = DeviceKind::Unknown;
         INfcTransport *transport_raw = nullptr;
         I2cGroveNfcDevice *i2c_dev = nullptr;
+        NfcSpiDevice *spi_dev = nullptr;
         SavedRecord base_record;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -4813,6 +4840,7 @@ private:
             device_kind = connection_.device_kind;
             transport_raw = transport_.get();
             i2c_dev = i2c_device_.get();
+            spi_dev = spi_device_.get();
             base_record = scan_.last_record;
         }
 
@@ -4826,6 +4854,17 @@ private:
 
         auto emit_dump_lines = [this](const std::vector<std::string> &lines) {
             for (const auto &line : lines) push_log(line);
+        };
+
+        auto bytes_to_hex = [](const std::vector<uint8_t> &bytes) {
+            std::string out;
+            out.reserve(bytes.size() * 2);
+            char hb[3];
+            for (uint8_t byte : bytes) {
+                std::snprintf(hb, sizeof(hb), "%02X", byte);
+                out += hb;
+            }
+            return out;
         };
 
         auto to_upper_copy = [](std::string s) {
@@ -4988,6 +5027,53 @@ private:
                     push_log(std::string("ERR ") + error);
                 }
             }
+        } else if (endpoint.kind == TransportKind::SpiBus) {
+            if (!spi_dev || !spi_dev->is_open()) {
+                error = "SPI device not open";
+                push_log(std::string("ERR ") + error);
+            } else {
+                // Current SPI ST25R dump path is Gen1A-focused.
+                push_log("> Dumping SPI ST25R (Gen1A)...");
+                I2cCardInfo card_info;
+                std::vector<std::vector<uint8_t>> blocks;
+                std::string dump_err;
+                if (spi_dev->scan_and_dump_gen1a(&card_info, &blocks, &dump_err)) {
+                    record.tag.uid = card_info.uid;
+                    const auto proto = i2c_protocol_to_kind(card_info.protocol);
+                    if (proto != ProtocolKind::Unknown) record.tag.protocol = proto;
+                    const std::string type = i2c_protocol_to_tag_type(card_info.protocol);
+                    if (!type.empty()) record.tag.tag_type = type;
+                    record.tag.magic_type = "Gen1A";
+                    if (!card_info.atqa_hex.empty()) record.tag.identity_fields["ATQA"] = card_info.atqa_hex;
+                    if (!card_info.sak_hex.empty()) record.tag.identity_fields["SAK"] = card_info.sak_hex;
+
+                    std::vector<std::string> dump_lines;
+                    dump_lines.reserve(blocks.size());
+                    for (size_t i = 0; i < blocks.size(); ++i) {
+                        char prefix[8];
+                        std::snprintf(prefix, sizeof(prefix), "%02d:", static_cast<int>(i));
+                        const std::string line = std::string(prefix) + bytes_to_hex(blocks[i]);
+                        dump_lines.push_back(line);
+                        record.tag.raw_data.push_back(line);
+                    }
+
+                    record.mifare_dump = MifareClassicDump{};
+                    record.mifare_dump->sector_count = 16;
+                    record.mifare_dump->block_count = static_cast<int>(dump_lines.size());
+                    record.mifare_dump->blocks_hex = dump_lines;
+                    record.mifare_dump->attack.method = AttackMethod::None;
+                    record.mifare_dump->attack.status = AttackStatus::Success;
+                    record.mifare_dump->attack.dump_obtained = !dump_lines.empty();
+
+                    emit_dump_lines(dump_lines);
+                    if (!dump_err.empty()) push_log(std::string("WARN ") + dump_err);
+                    push_log("Tip: Press Ctrl+S to save dump.");
+                    success = !record.tag.raw_data.empty();
+                } else {
+                    error = dump_err.empty() ? "SPI dump failed (not Gen1A?)" : dump_err;
+                    push_log(std::string("ERR ") + error);
+                }
+            }
         } else if (endpoint.kind == TransportKind::Mock) {
             record = build_mock_record(endpoint);
             success = true;
@@ -5006,17 +5092,6 @@ private:
                 } else {
                     card_ok = client.in_list_passive_target_iso14443a(&live_tag, &error);
                 }
-
-                auto bytes_to_hex = [](const std::vector<uint8_t> &bytes) {
-                    std::string out;
-                    out.reserve(bytes.size() * 2);
-                    char hb[3];
-                    for (uint8_t byte : bytes) {
-                        std::snprintf(hb, sizeof(hb), "%02X", byte);
-                        out += hb;
-                    }
-                    return out;
-                };
 
                 if (!card_ok) {
                     push_log(std::string("ERR ") + (error.empty() ? "no card" : error));
