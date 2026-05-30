@@ -2695,11 +2695,12 @@ public:
         if (connection_.connected && (connection_.device_kind == DeviceKind::PN532Killer ||
                                       connection_.device_kind == DeviceKind::PN532 ||
                                       connection_.device_kind == DeviceKind::GroveNFC ||
-                                      connection_.device_kind == DeviceKind::NFCUnit)) {
+                                      connection_.device_kind == DeviceKind::NFCUnit ||
+                                      connection_.device_kind == DeviceKind::ST25RNFC)) {
             return true;
         }
         if (reason) {
-            *reason = "PN532/PN532Killer/GroveNFC/NFCUnit\nrequired for EMU";
+            *reason = "PN532/PN532Killer/GroveNFC/NFCUnit/ST25R\nrequired for EMU";
         }
         return false;
     }
@@ -2908,8 +2909,16 @@ public:
     bool cache_i2c_slot_dump(ProtocolKind protocol, int slot, std::string *err = nullptr)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!connection_.connected || connection_.endpoint.kind != TransportKind::I2cBus) {
-            if (err) *err = "I2C device not connected";
+        if (!connection_.connected) {
+            if (err) *err = "EMU device not connected";
+            return false;
+        }
+
+        const bool i2c_mode = (connection_.endpoint.kind == TransportKind::I2cBus);
+        const bool spi_st25r_mode = (connection_.endpoint.kind == TransportKind::SpiBus &&
+                                     connection_.device_kind == DeviceKind::ST25RNFC);
+        if (!i2c_mode && !spi_st25r_mode) {
+            if (err) *err = "I2C/SPI EMU device not connected";
             return false;
         }
         const auto slots = protocol_slots_padded_locked(protocol);

@@ -304,6 +304,10 @@ private:
             conn.device_kind != nfc_app::DeviceKind::NotConnected) {
             return conn.device_kind;
         }
+        if (conn.connected && conn.endpoint.kind == nfc_app::TransportKind::SpiBus) {
+            // SPI NFC path in this app is ST25R-based EMU.
+            return nfc_app::DeviceKind::ST25RNFC;
+        }
         if (conn.connected &&
             (conn.endpoint.kind == nfc_app::TransportKind::UsbSerial ||
              conn.endpoint.kind == nfc_app::TransportKind::UartSerial) &&
@@ -544,11 +548,14 @@ private:
             cache_serial_device_kind(conn2);
             const auto dev_kind2 = effective_emu_device_kind(conn2);
             const auto ep2 = active_endpoint_for_ui(conn2);
-            const bool nfc_unit2 = (dev_kind2 == nfc_app::DeviceKind::NFCUnit ||
-                                    ep2.kind == nfc_app::TransportKind::I2cBus);
+            const bool profile_emu2 =
+                (dev_kind2 == nfc_app::DeviceKind::NFCUnit ||
+                 dev_kind2 == nfc_app::DeviceKind::ST25RNFC ||
+                 ep2.kind == nfc_app::TransportKind::I2cBus ||
+                 (ep2.kind == nfc_app::TransportKind::SpiBus && conn2.connected));
             const bool pn532_ndef2 = (dev_kind2 == nfc_app::DeviceKind::PN532);
-            const int slot2 = nfc_unit2 ? 0 : hw_emu_slot_;
-            if (!nfc_unit2 && !pn532_ndef2 &&
+            const int slot2 = profile_emu2 ? 0 : hw_emu_slot_;
+            if (!pn532_ndef2 &&
                 service_.emu_dump_loaded(service_.current_emulator_protocol(), slot2)) {
                 std::string save_err;
                 if (service_.save_emu_dump_cached(
@@ -654,13 +661,20 @@ private:
                     emu_dump_scroll_ = 0;
                     const auto proto = service_.current_emulator_protocol();
                     service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
-                } else if (emu_device_kind == nfc_app::DeviceKind::NFCUnit) {
+                } else if (emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
+                           emu_device_kind == nfc_app::DeviceKind::ST25RNFC) {
                     service_.toggle_nfcunit_profile_protocol();
+                    if (emu_device_kind == nfc_app::DeviceKind::ST25RNFC &&
+                        service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso15693) {
+                        // SPI ST25R listener path currently supports NFC-A profiles only.
+                        service_.toggle_nfcunit_profile_protocol();
+                    }
                     ui_message_ = std::string("Profile -> ") + service_.nfcunit_profile_label();
                 } else {
                     service_.toggle_slot_protocol();
                 }
-                if (emu_device_kind != nfc_app::DeviceKind::NFCUnit) {
+                if (emu_device_kind != nfc_app::DeviceKind::NFCUnit &&
+                    emu_device_kind != nfc_app::DeviceKind::ST25RNFC) {
                     ui_message_ = std::string("Protocol -> ") + nfc_app::to_string(service_.current_emulator_protocol());
                 }
                 render_all();
@@ -686,6 +700,9 @@ private:
                 const auto conn = service_.connection_state();
                 cache_serial_device_kind(conn);
                 const auto endpoint = active_endpoint_for_ui(conn);
+                const bool st25r_mode =
+                    (effective_emu_device_kind(conn) == nfc_app::DeviceKind::ST25RNFC) ||
+                    (endpoint.kind == nfc_app::TransportKind::SpiBus && conn.connected);
                 if (endpoint.kind == nfc_app::TransportKind::I2cBus || effective_emu_device_kind(conn) == nfc_app::DeviceKind::NFCUnit) {
                     if (service_.nfcunit_emulation_running()) {
                         ui_message_ = "NFC Unit already running";
@@ -694,6 +711,32 @@ private:
                     } else {
                         start_nfcunit_emu_autostart_async();
                         ui_message_ = "NFC Unit starting...";
+                    }
+                    render_all();
+                } else if (st25r_mode) {
+                    if (service_.spi_listener_active()) {
+                        ui_message_ = "SPI ST25R already running";
+                    } else {
+                        std::vector<uint8_t> uid;
+                        uint16_t atqa = 0x0000;
+                        uint8_t sak = 0x00;
+                        const auto proto = service_.current_emulator_protocol();
+                        std::string emu_err;
+                        bool ok = false;
+                        if (proto == nfc_app::ProtocolKind::MifareClassic) {
+                            uid = {0x11, 0x22, 0x33, 0x44};
+                            atqa = 0x0004;
+                            sak = 0x08;
+                            ok = service_.spi_start_listener_a(uid, atqa, sak, &emu_err);
+                        } else if (proto == nfc_app::ProtocolKind::Iso14443A) {
+                            uid = {0x28, 0x44, 0x10, 0x0A, 0xE3, 0x6C, 0x1C};
+                            atqa = 0x0042;
+                            sak = 0x18;
+                            ok = service_.spi_start_listener_a(uid, atqa, sak, &emu_err);
+                        } else {
+                            emu_err = "SPI ST25R supports NFC-A profile only";
+                        }
+                        ui_message_ = ok ? "SPI ST25R emulating..." : ("SPI start failed: " + emu_err);
                     }
                     render_all();
                 }
@@ -714,9 +757,16 @@ private:
                 const auto conn = service_.connection_state();
                 cache_serial_device_kind(conn);
                 const auto endpoint = active_endpoint_for_ui(conn);
+                const bool st25r_mode =
+                    (effective_emu_device_kind(conn) == nfc_app::DeviceKind::ST25RNFC) ||
+                    (endpoint.kind == nfc_app::TransportKind::SpiBus && conn.connected);
                 if (endpoint.kind == nfc_app::TransportKind::I2cBus || effective_emu_device_kind(conn) == nfc_app::DeviceKind::NFCUnit) {
                     service_.grovenfc_deactivate();
                     ui_message_ = "NFC Unit emulation stopped";
+                    render_all();
+                } else if (st25r_mode) {
+                    service_.spi_stop_listener();
+                    ui_message_ = "SPI ST25R emulation stopped";
                     render_all();
                 }
             } else if (current_tab_ == Tab::Read) {
@@ -856,6 +906,10 @@ private:
             if (service_.nfcunit_emulation_running()) {
                 service_.grovenfc_deactivate();
                 ui_message_ = "NFC Unit emulation stopped";
+            }
+            if (service_.spi_listener_active()) {
+                service_.spi_stop_listener();
+                ui_message_ = "SPI ST25R emulation stopped";
             }
         }
         if (current_tab_ == Tab::Emulator) {
@@ -1174,9 +1228,13 @@ private:
                     ui_message_ = "HW Slot " + std::to_string(hw_emu_slot_ + 1);
                 }
             } else {
-                if (conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+                const auto emu_kind = effective_emu_device_kind(conn);
+                if (emu_kind == nfc_app::DeviceKind::NFCUnit ||
+                    emu_kind == nfc_app::DeviceKind::ST25RNFC) {
                     hw_emu_slot_ = 0;
-                    ui_message_ = "NFC Unit: Tab selects profile";
+                    ui_message_ = (emu_kind == nfc_app::DeviceKind::ST25RNFC)
+                                  ? "ST25R: Tab selects profile"
+                                  : "NFC Unit: Tab selects profile";
                 } else {
                     service_.cycle_slot(delta);
                     ui_message_ = "Slot changed";
@@ -1262,7 +1320,8 @@ private:
                 const auto conn0 = service_.connection_state();
                 cache_serial_device_kind(conn0);
                 const auto endpoint = active_endpoint_for_ui(conn0);
-                if (endpoint.kind == nfc_app::TransportKind::I2cBus) {
+                if (endpoint.kind == nfc_app::TransportKind::I2cBus ||
+                    (endpoint.kind == nfc_app::TransportKind::SpiBus && conn0.connected)) {
                     modal_ = Modal::EmulatorAction;
                     modal_idx_ = 0;
                     break;
@@ -2229,34 +2288,41 @@ private:
             create_text(right, 6, 76, "OK: Start / Edit URI / Stop", 0x555555, 10);
         } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC ||
                emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
-                   endpoint.kind == nfc_app::TransportKind::I2cBus) {
+               emu_device_kind == nfc_app::DeviceKind::ST25RNFC ||
+                   endpoint.kind == nfc_app::TransportKind::I2cBus ||
+                   (endpoint.kind == nfc_app::TransportKind::SpiBus && connection.connected)) {
             // ── I2C EMU mode (GroveNFC / NFC Unit), 8 slots ───────────────────
             const std::string proto_name =
                 (protocol == nfc_app::ProtocolKind::MifareClassic) ? "MFC-1K" :
                 (protocol == nfc_app::ProtocolKind::Iso14443B)     ? "ISO14B"  :
                 (protocol == nfc_app::ProtocolKind::Iso15693)      ? "ISO15693" :
                                                                                  "NFC-A";
+            const bool is_st25r =
+                (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) ||
+                (endpoint.kind == nfc_app::TransportKind::SpiBus && connection.connected);
             const bool is_nfc_unit =
-                (emu_device_kind == nfc_app::DeviceKind::NFCUnit) ||
+                !is_st25r && ((emu_device_kind == nfc_app::DeviceKind::NFCUnit) ||
                 (endpoint.kind == nfc_app::TransportKind::I2cBus &&
                  (emu_device_kind == nfc_app::DeviceKind::Unknown ||
-                  emu_device_kind == nfc_app::DeviceKind::NotConnected));
+                  emu_device_kind == nfc_app::DeviceKind::NotConnected)));
             const std::string nfc_unit_profile = is_nfc_unit ? service_.nfcunit_profile_label() : std::string();
-            create_text(left, 6, 4,  "SW EMU", 0x00FF88, 12);
+            create_text(left, 6, 4,  is_st25r ? "SPI EMU" : "SW EMU", is_st25r ? 0x00B4FF : 0x00FF88, 12);
             if (is_nfc_unit) {
                 create_text(left, 6, 18,
                             (emu_device_kind == nfc_app::DeviceKind::NFCUnit) ? "Profile mode" : "I2C pending",
                             0xFFFFFF, 12);
+            } else if (is_st25r) {
+                create_text(left, 6, 18, "Profile mode", 0xFFFFFF, 12);
             } else {
                 const std::string slot_str = "Slot " + std::to_string(hw_emu_slot_ + 1) + "/8";
                 create_text(left, 6, 18, slot_str.c_str(), 0xFFFFFF, 12);
             }
-            create_text(left, 6, 38, is_nfc_unit ? "Tab:profile" : "Tab:proto", 0xD8D8D8, 10);
-            create_text(left, 6, 50, is_nfc_unit ? "OK:start" : "F/X:slot", is_nfc_unit ? 0xF7A600 : 0xD8D8D8, 10);
-            if (!is_nfc_unit) create_text(left, 6, 62, "OK:menu", 0xF7A600, 10);
-            create_text(left, 6, 80, is_nfc_unit ? "NFC Unit I2C" : "GroveNFC I2C", 0x00FF88, 10);
+            create_text(left, 6, 38, (is_nfc_unit || is_st25r) ? "Tab:profile" : "Tab:proto", 0xD8D8D8, 10);
+            create_text(left, 6, 50, (is_nfc_unit || is_st25r) ? "OK:start" : "F/X:slot", (is_nfc_unit || is_st25r) ? 0xF7A600 : 0xD8D8D8, 10);
+            if (!is_nfc_unit && !is_st25r) create_text(left, 6, 62, "OK:menu", 0xF7A600, 10);
+            create_text(left, 6, 80, is_st25r ? "ST25R SPI" : (is_nfc_unit ? "NFC Unit I2C" : "GroveNFC I2C"), is_st25r ? 0x00B4FF : 0x00FF88, 10);
 
-            create_text(right, 6, 4,  is_nfc_unit ? nfc_unit_profile.c_str() : proto_name.c_str(), 0x00D2FF, 12);
+            create_text(right, 6, 4,  is_nfc_unit ? nfc_unit_profile.c_str() : (is_st25r ? service_.nfcunit_profile_label().c_str() : proto_name.c_str()), 0x00D2FF, 12);
             const auto start_state = service_.nfcunit_emu_start_state();
             if (is_nfc_unit) {
                 const auto emu_protocol = service_.current_emulator_protocol();
@@ -2274,6 +2340,21 @@ private:
                     create_text(right, 6, 52, emu_text, 0x9E9E9E, 10);
                     create_text(right, 6, 66, start_state.running ? "starting in background" : "background worker", 0x666666, 10);
                 }
+            } else if (is_st25r) {
+                const auto emu_protocol = service_.current_emulator_protocol();
+                const bool running = service_.spi_listener_active();
+                create_text(right, 6, 20, "S:start P:stop OK:menu", 0xD8D8D8, 10);
+                create_text(right, 6, 34, running ? "Status: RUNNING" : "Status: READY", running ? 0x00FF88 : 0x9E9E9E, 10);
+                if (emu_protocol == nfc_app::ProtocolKind::Iso15693) {
+                    create_text(right, 6, 52, "ISO15693 unsupported on SPI", 0xFF8888, 10);
+                    create_text(right, 6, 66, "Tab to switch profile", 0x666666, 10);
+                } else if (emu_protocol == nfc_app::ProtocolKind::MifareClassic) {
+                    create_text(right, 6, 52, "UID:11223344 ATQA:0004", 0x9E9E9E, 10);
+                    create_text(right, 6, 66, "SAK:08 (MFC profile)", 0x9E9E9E, 10);
+                } else {
+                    create_text(right, 6, 52, "UID:2844100AE36C1C", 0x9E9E9E, 10);
+                    create_text(right, 6, 66, "ATQA:0042 SAK:18", 0x9E9E9E, 10);
+                }
             } else {
                 create_text(right, 6, 20, "OK menu: Dn/Up/Save", 0xD8D8D8, 10);
                 create_text(right, 6, 34, "activate selected slot", 0xD8D8D8, 10);
@@ -2281,7 +2362,7 @@ private:
                 create_text(right, 6, 64, "MFC/NTAG/ISO14B", 0x9E9E9E, 10);
                 create_text(right, 6, 76, "ISO15693", 0x9E9E9E, 10);
             }
-            create_text(right, 6, 92, is_nfc_unit ? "I2C profile cache enabled" : "I2C slot cache enabled", 0x444444, 10);
+            create_text(right, 6, 92, is_nfc_unit ? "I2C profile cache enabled" : (is_st25r ? "SPI profile cache enabled" : "I2C slot cache enabled"), 0x444444, 10);
         } else {
             // ── No device / unknown ───────────────────────────────────────────
             create_text(left, 6, 4,  "EMU", 0x888888, 12);
@@ -2316,14 +2397,19 @@ private:
         const auto endpoint = active_endpoint_for_ui(conn);
         const auto emu_device_kind = effective_emu_device_kind(conn);
         const bool pn532_ndef_menu = (emu_device_kind == nfc_app::DeviceKind::PN532);
-        const bool nfc_unit_mode = (emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
+        const bool st25r_mode =
+            (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) ||
+            (endpoint.kind == nfc_app::TransportKind::SpiBus && conn.connected);
+        const bool nfc_unit_mode = !st25r_mode &&
+                                   (emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
                                     endpoint.kind == nfc_app::TransportKind::I2cBus);
         const bool nfc_unit_url_mode = nfc_unit_mode &&
             service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso14443A;
-        const int emu_slot = nfc_unit_mode ? 0 : hw_emu_slot_;
+        const int emu_slot = (nfc_unit_mode || st25r_mode) ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
         const int n_opts = pn532_ndef_menu ? 3 :
-                          (nfc_unit_mode ? (nfc_unit_url_mode ? 5 : 4) : 3);
+                          (nfc_unit_mode ? (nfc_unit_url_mode ? 5 : 4)
+                                         : (st25r_mode ? 4 : 3));
         const int visible_opts = std::min(n_opts, 4);
         int first_opt = 0;
         if (n_opts > visible_opts) {
@@ -2336,6 +2422,8 @@ private:
         } else {
             if (nfc_unit_mode) {
                 create_text(card, 8, 5, (service_.nfcunit_profile_label() + " Profile").c_str(), 0xFFFFFF, 12);
+            } else if (st25r_mode) {
+                create_text(card, 8, 5, (service_.nfcunit_profile_label() + " SPI").c_str(), 0xFFFFFF, 12);
             } else {
                 const auto slot = service_.selected_slot_index();
                 create_text(card, 8, 5, (std::string(nfc_app::to_string(service_.current_emulator_protocol())) + " Slot " + std::to_string(slot)).c_str(), 0xFFFFFF, 12);
@@ -2355,6 +2443,12 @@ private:
             "Upload Data",
             "Cancel"
         };
+        const char *st25r_opts[] = {
+            service_.spi_listener_active() ? "Stop Emulation" : "Start Emulating",
+            "Download Data",
+            "Upload Data",
+            "Cancel"
+        };
         const char *pn532_opts[] = {"Start NDEF Emu", "Edit URI", "Stop NDEF Emu"};
         for (int row_idx = 0; row_idx < visible_opts; ++row_idx) {
             const int i = first_opt + row_idx;
@@ -2369,6 +2463,7 @@ private:
             const char *label = nullptr;
             if (pn532_ndef_menu) label = pn532_opts[i];
             else if (nfc_unit_mode) label = nfc_unit_url_mode ? nfc_unit_opts[i] : nfc_unit_no_url_opts[i];
+            else if (st25r_mode) label = st25r_opts[i];
             else label = options[i];
             create_text(row, 6, 4, label, sel ? 0x000000 : 0xD0D0D0, 11);
         }
@@ -4613,21 +4708,26 @@ private:
         const auto dev_kind = effective_emu_device_kind(conn);
         const auto endpoint = active_endpoint_for_ui(conn);
         const bool pn532_ndef_menu = (dev_kind == nfc_app::DeviceKind::PN532);
-        const bool nfc_unit_mode = (dev_kind == nfc_app::DeviceKind::NFCUnit ||
+        const bool st25r_mode =
+            (dev_kind == nfc_app::DeviceKind::ST25RNFC) ||
+            (endpoint.kind == nfc_app::TransportKind::SpiBus && conn.connected);
+        const bool nfc_unit_mode = !st25r_mode &&
+                                   (dev_kind == nfc_app::DeviceKind::NFCUnit ||
                                     endpoint.kind == nfc_app::TransportKind::I2cBus);
         const bool nfc_unit_url_mode = nfc_unit_mode &&
             service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso14443A;
-        const int emu_slot = nfc_unit_mode ? 0 : hw_emu_slot_;
+        const int emu_slot = (nfc_unit_mode || st25r_mode) ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
         const int n_opts = pn532_ndef_menu ? 3 :
-                          (nfc_unit_mode ? (nfc_unit_url_mode ? 5 : 4) : 3);
+                          (nfc_unit_mode ? (nfc_unit_url_mode ? 5 : 4)
+                                         : (st25r_mode ? 4 : 3));
         switch (key) {
         case KEY_UP:
         case KEY_F:    modal_idx_ = (modal_idx_ + n_opts - 1) % n_opts; break;
         case KEY_DOWN:
         case KEY_X:    modal_idx_ = (modal_idx_ + 1) % n_opts; break;
         case KEY_ENTER:
-            if (!nfc_unit_mode && !service_.emulation_allowed(&ui_message_)) {
+            if (!nfc_unit_mode && !st25r_mode && !service_.emulation_allowed(&ui_message_)) {
                 modal_ = Modal::None;
                 modal_idx_ = 0;
                 break;
@@ -4718,6 +4818,67 @@ private:
                     modal_ = Modal::Pn532NdefInput;
                     modal_idx_ = 0;
                     return;
+                } else {
+                    ui_message_ = "Canceled";
+                }
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+                break;
+            }
+            if (st25r_mode) {
+                auto start_spi_listener_for_profile = [this](std::string *error) {
+                    const auto proto = service_.current_emulator_protocol();
+                    std::vector<uint8_t> uid;
+                    uint16_t atqa = 0x0000;
+                    uint8_t sak = 0x00;
+
+                    if (proto == nfc_app::ProtocolKind::MifareClassic) {
+                        uid = {0x11, 0x22, 0x33, 0x44};
+                        atqa = 0x0004;
+                        sak = 0x08;
+                    } else if (proto == nfc_app::ProtocolKind::Iso14443A) {
+                        uid = {0x28, 0x44, 0x10, 0x0A, 0xE3, 0x6C, 0x1C};
+                        atqa = 0x0042;
+                        sak = 0x18;
+                    } else {
+                        if (error) *error = "SPI ST25R supports NFC-A profile only";
+                        return false;
+                    }
+                    return service_.spi_start_listener_a(uid, atqa, sak, error);
+                };
+
+                if (modal_idx_ == 0) {
+                    if (service_.spi_listener_active()) {
+                        service_.spi_stop_listener();
+                        ui_message_ = "SPI ST25R emulation stopped";
+                    } else {
+                        std::string emu_err;
+                        if (start_spi_listener_for_profile(&emu_err)) {
+                            ui_message_ = "SPI ST25R emulating...";
+                        } else {
+                            ui_message_ = "SPI start failed" +
+                                         (emu_err.empty() ? std::string() : (": " + emu_err));
+                        }
+                    }
+                } else if (modal_idx_ == 1) {
+                    std::string dump_err;
+                    if (service_.cache_i2c_slot_dump(service_.current_emulator_protocol(), emu_slot, &dump_err)) {
+                        ui_message_ = "SPI profile dump cached";
+                    } else {
+                        ui_message_ = "Download failed" +
+                                     (dump_err.empty() ? std::string() : (": " + dump_err));
+                    }
+                } else if (modal_idx_ == 2) {
+                    if (!saved_records_.empty()) {
+                        if (service_.upload_record_to_profile(service_.current_emulator_protocol(),
+                                                              saved_records_[saved_idx_])) {
+                            ui_message_ = "Uploaded to SPI profile (100%)";
+                        } else {
+                            ui_message_ = "Upload failed";
+                        }
+                    } else {
+                        ui_message_ = "Upload failed: no saved data";
+                    }
                 } else {
                     ui_message_ = "Canceled";
                 }
