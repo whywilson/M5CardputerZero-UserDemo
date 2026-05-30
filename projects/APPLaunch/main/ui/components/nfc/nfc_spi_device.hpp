@@ -447,70 +447,7 @@ probe_done:
     // Scan for one ISO14443A card. Returns false if no card present or error.
     bool readCard(I2cCardInfo *out)
     {
-        if (!out || fd_ < 0) return false;
-        out->valid = false;
-
-#if defined(__linux__)
-        // Clear IRQ flags
-        direct_cmd(st25r_cmd::CLEAR);
-
-        // Set up for ISO14443A initiator at 106 kbps.
-        write_reg(st25r_reg::MODE, 0x08);       // om_iso14443a (matches proven I2C flow)
-        write_reg(st25r_reg::BIT_RATE, 0x00);   // 106 kbps TX/RX
-        write_reg(st25r_reg::ISO14443A_NFC, 0x00); // antcl off for short-frame wakeup
-        write_reg(st25r_reg::RX_CONF1, 0x08);
-        write_reg(st25r_reg::RX_CONF2, 0x2D);
-        write_reg(st25r_reg::RX_CONF3, 0xD8);
-        write_reg(st25r_reg::RX_CONF4, 0x22);
-        // Enable RF field
-        set_rf_field(true);
-        sleep_ms(6);
-
-        // Send REQA
-        uint8_t atqa[2] = {0, 0};
-        if (!send_reqa(atqa)) {
-            set_rf_field(false);
-            return false;
-        }
-
-        // Anti-collision / UID read
-        uint8_t uid[10] = {0};
-        uint8_t uid_len = 0;
-        if (!anti_collision_loop(uid, &uid_len)) {
-            set_rf_field(false);
-            return false;
-        }
-
-        // Determine SAK (single/double/triple size)
-        uint8_t sak = last_sak_;
-
-        // Build result
-        std::string uid_str;
-        for (uint8_t i = 0; i < uid_len; ++i) {
-            if (i > 0) uid_str += ':';
-            char hex[3];
-            std::snprintf(hex, sizeof(hex), "%02X", uid[i]);
-            uid_str += hex;
-        }
-
-        char atqa_str[5];
-        std::snprintf(atqa_str, sizeof(atqa_str), "%02X%02X", atqa[0], atqa[1]);
-        char sak_str[3];
-        std::snprintf(sak_str, sizeof(sak_str), "%02X", sak);
-
-        out->uid      = uid_str;
-        out->atqa_hex = std::string(atqa_str);
-        out->sak_hex  = std::string(sak_str);
-        out->protocol = identify_protocol(atqa, sak);
-        out->detail   = std::string("ST25R3916 ") + spidev_path_ +
-                        " ATQA:" + atqa_str + " SAK:" + sak_str;
-        out->valid    = true;
-
-        set_rf_field(false);
-        return true;
-#else
-        return false;
-#endif
+        return select_card_iso14443a(out, false);
     }
 
 private:
@@ -558,6 +495,89 @@ private:
     static void sleep_ms(int ms)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    }
+
+    // ISO14443A CRC (CRC_A) used by MIFARE commands.
+    static uint16_t crc_a(const uint8_t *data, size_t len)
+    {
+        uint16_t crc = 0x6363;
+        for (size_t i = 0; i < len; ++i) {
+            uint8_t c = static_cast<uint8_t>(data[i] ^ (crc & 0x00FF));
+            c ^= static_cast<uint8_t>(c << 4);
+            crc = static_cast<uint16_t>((crc >> 8) ^
+                                        (static_cast<uint16_t>(c) << 8) ^
+                                        (static_cast<uint16_t>(c) << 3) ^
+                                        (static_cast<uint16_t>(c) >> 4));
+        }
+        return crc;
+    }
+
+    // Select one ISO14443A card and optionally keep RF field on for follow-up
+    // operations (e.g. Gen1A backdoor + dump).
+    bool select_card_iso14443a(I2cCardInfo *out, bool keep_rf_on)
+    {
+#if defined(__linux__)
+        if (!out || fd_ < 0) return false;
+        out->valid = false;
+
+        // Clear IRQ flags
+        direct_cmd(st25r_cmd::CLEAR);
+
+        // Set up for ISO14443A initiator at 106 kbps.
+        write_reg(st25r_reg::MODE, 0x08);       // om_iso14443a (matches proven I2C flow)
+        write_reg(st25r_reg::BIT_RATE, 0x00);   // 106 kbps TX/RX
+        write_reg(st25r_reg::ISO14443A_NFC, 0x00); // antcl off for short-frame wakeup
+        write_reg(st25r_reg::RX_CONF1, 0x08);
+        write_reg(st25r_reg::RX_CONF2, 0x2D);
+        write_reg(st25r_reg::RX_CONF3, 0xD8);
+        write_reg(st25r_reg::RX_CONF4, 0x22);
+
+        set_rf_field(true);
+        sleep_ms(6);
+
+        uint8_t atqa[2] = {0, 0};
+        if (!send_reqa(atqa)) {
+            set_rf_field(false);
+            return false;
+        }
+
+        uint8_t uid[10] = {0};
+        uint8_t uid_len = 0;
+        if (!anti_collision_loop(uid, &uid_len)) {
+            set_rf_field(false);
+            return false;
+        }
+
+        const uint8_t sak = last_sak_;
+
+        std::string uid_str;
+        for (uint8_t i = 0; i < uid_len; ++i) {
+            if (i > 0) uid_str += ':';
+            char hex[3];
+            std::snprintf(hex, sizeof(hex), "%02X", uid[i]);
+            uid_str += hex;
+        }
+
+        char atqa_str[5];
+        std::snprintf(atqa_str, sizeof(atqa_str), "%02X%02X", atqa[0], atqa[1]);
+        char sak_str[3];
+        std::snprintf(sak_str, sizeof(sak_str), "%02X", sak);
+
+        out->uid      = uid_str;
+        out->atqa_hex = std::string(atqa_str);
+        out->sak_hex  = std::string(sak_str);
+        out->protocol = identify_protocol(atqa, sak);
+        out->detail   = std::string("ST25R3916 ") + spidev_path_ +
+                        " ATQA:" + atqa_str + " SAK:" + sak_str;
+        out->valid    = true;
+
+        if (!keep_rf_on) set_rf_field(false);
+        return true;
+#else
+        (void)out;
+        (void)keep_rf_on;
+        return false;
+#endif
     }
 
 #if defined(__linux__)
@@ -1429,37 +1449,64 @@ private:
     // Send a 7-bit short frame and check for positive ACK nibble (0x0A).
     bool gen1a_7bit_cmd_ack(uint8_t cmd)
     {
-        direct_cmd(st25r_cmd::CLEAR_FIFO);
-        direct_cmd(st25r_cmd::CLEAR);
-        write_reg(st25r_reg::ISO14443A_NFC, 0x00);
-        // 7-bit frame: NUM_TX_BYTES2 = 0x07 (0 full bytes + 7 bits last byte)
-        write_reg(st25r_reg::NUM_TX_BYTES1, 0x00);
-        write_reg(st25r_reg::NUM_TX_BYTES2, 0x07);
-        write_fifo(&cmd, 1);
-        direct_cmd(st25r_cmd::TRANSMIT_WITHOUT_CRC);
-        uint8_t last_irq = 0, last_fifo = 0, last_irq_t = 0;
-        if (!wait_fifo_bytes(1, 30, &last_irq, &last_fifo, &last_irq_t)) return false;
-        uint8_t ack = 0;
-        size_t got = 0;
-        if (!read_fifo(&ack, 1, &got) || got < 1) return false;
-        // Positive ACK nibble = 0x0A (low nibble of first byte)
-        return (ack & 0x0F) == 0x0A;
+        const uint8_t iso_profiles[2] = {0x00, 0x40};
+        for (uint8_t iso : iso_profiles) {
+            direct_cmd(st25r_cmd::CLEAR_FIFO);
+            direct_cmd(st25r_cmd::CLEAR);
+            write_reg(st25r_reg::ISO14443A_NFC, iso);
+            // 7-bit frame: NUM_TX_BYTES2 = 0x07 (0 full bytes + 7 bits last byte)
+            write_reg(st25r_reg::NUM_TX_BYTES1, 0x00);
+            write_reg(st25r_reg::NUM_TX_BYTES2, 0x07);
+            write_fifo(&cmd, 1);
+            direct_cmd(st25r_cmd::TRANSMIT_WITHOUT_CRC);
+            uint8_t last_irq = 0, last_fifo = 0, last_irq_t = 0;
+            if (!wait_fifo_bytes(1, 30, &last_irq, &last_fifo, &last_irq_t)) continue;
+            uint8_t ack = 0;
+            size_t got = 0;
+            if (!read_fifo(&ack, 1, &got) || got < 1) continue;
+            // Positive ACK nibble = 0x0A (some cards expose it in high nibble).
+            const uint8_t lo = static_cast<uint8_t>(ack & 0x0F);
+            const uint8_t hi = static_cast<uint8_t>((ack >> 4) & 0x0F);
+            if (lo == 0x0A || hi == 0x0A) return true;
+        }
+        return false;
     }
 
     // Send a full-byte command (no CRC) and check for positive ACK nibble.
     bool gen1a_fullbyte_cmd_ack(uint8_t cmd)
     {
+        const uint8_t iso_profiles[2] = {0x00, 0x40};
+        for (uint8_t iso : iso_profiles) {
+            direct_cmd(st25r_cmd::CLEAR_FIFO);
+            direct_cmd(st25r_cmd::CLEAR);
+            write_reg(st25r_reg::ISO14443A_NFC, iso);
+            // Force full-byte frame length (8 bits) so 0x43 is not sent as 7-bit.
+            write_reg(st25r_reg::NUM_TX_BYTES1, 0x00);
+            write_reg(st25r_reg::NUM_TX_BYTES2, 0x08);
+            write_fifo(&cmd, 1);
+            direct_cmd(st25r_cmd::TRANSMIT_WITHOUT_CRC);
+            uint8_t last_irq = 0, last_fifo = 0, last_irq_t = 0;
+            if (!wait_fifo_bytes(1, 30, &last_irq, &last_fifo, &last_irq_t)) continue;
+            uint8_t ack = 0;
+            size_t got = 0;
+            if (!read_fifo(&ack, 1, &got) || got < 1) continue;
+            const uint8_t lo = static_cast<uint8_t>(ack & 0x0F);
+            const uint8_t hi = static_cast<uint8_t>((ack >> 4) & 0x0F);
+            if (lo == 0x0A || hi == 0x0A) return true;
+        }
+        return false;
+    }
+
+    // HALT current tag before re-selecting. Response is not required.
+    void gen1a_send_halt()
+    {
+        uint8_t halt[2] = {0x50, 0x00};
         direct_cmd(st25r_cmd::CLEAR_FIFO);
         direct_cmd(st25r_cmd::CLEAR);
         write_reg(st25r_reg::ISO14443A_NFC, 0x00);
-        write_fifo(&cmd, 1);
-        direct_cmd(st25r_cmd::TRANSMIT_WITHOUT_CRC);
-        uint8_t last_irq = 0, last_fifo = 0, last_irq_t = 0;
-        if (!wait_fifo_bytes(1, 30, &last_irq, &last_fifo, &last_irq_t)) return false;
-        uint8_t ack = 0;
-        size_t got = 0;
-        if (!read_fifo(&ack, 1, &got) || got < 1) return false;
-        return (ack & 0x0F) == 0x0A;
+        write_fifo(halt, 2);
+        direct_cmd(st25r_cmd::TRANSMIT_WITH_CRC);
+        sleep_ms(2);
     }
 
 public:
@@ -1483,19 +1530,43 @@ public:
     {
 #if defined(__linux__)
         if (fd_ < 0) return false;
-        direct_cmd(st25r_cmd::CLEAR_FIFO);
-        direct_cmd(st25r_cmd::CLEAR);
-        write_reg(st25r_reg::ISO14443A_NFC, 0x00);
-        uint8_t read_cmd[2] = {0x30, block};
-        write_fifo(read_cmd, 2);
-        direct_cmd(st25r_cmd::TRANSMIT_WITH_CRC);
-        // Expect 16 data bytes + 2 CRC bytes
-        if (!wait_fifo_bytes(16, 80)) return false;
-        size_t got = 0;
-        uint8_t buf[18] = {0};
-        if (!read_fifo(buf, 18, &got) || got < 16) return false;
-        std::memcpy(data, buf, 16);
-        return true;
+
+        auto try_read = [&](uint8_t iso_mode, bool with_crc_cmd, bool append_crc) -> bool {
+            direct_cmd(st25r_cmd::CLEAR_FIFO);
+            direct_cmd(st25r_cmd::CLEAR);
+            write_reg(st25r_reg::ISO14443A_NFC, iso_mode);
+
+            uint8_t tx[4] = {0x30, block, 0x00, 0x00};
+            size_t tx_len = 2;
+            if (append_crc) {
+                const uint16_t crc = crc_a(tx, 2);
+                tx[2] = static_cast<uint8_t>(crc & 0xFF);
+                tx[3] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+                tx_len = 4;
+            }
+
+            write_reg(st25r_reg::NUM_TX_BYTES1, 0x00);
+            write_reg(st25r_reg::NUM_TX_BYTES2, static_cast<uint8_t>(tx_len * 8));
+            write_fifo(tx, tx_len);
+            direct_cmd(with_crc_cmd ? st25r_cmd::TRANSMIT_WITH_CRC
+                                    : st25r_cmd::TRANSMIT_WITHOUT_CRC);
+
+            if (!wait_fifo_bytes(16, 90)) return false;
+
+            size_t got = 0;
+            uint8_t buf[20] = {0};
+            if (!read_fifo(buf, sizeof(buf), &got) || got < 16) return false;
+            std::memcpy(data, buf, 16);
+            return true;
+        };
+
+        // Order mirrors proven I2C strategy: native first, then raw+CRC,
+        // each with normal and no-rx-par receive profiles.
+        if (try_read(0x00, true,  false)) return true;
+        if (try_read(0x40, true,  false)) return true;
+        if (try_read(0x00, false, true )) return true;
+        if (try_read(0x40, false, true )) return true;
+        return false;
 #else
         return false;
 #endif
@@ -1515,12 +1586,31 @@ public:
         }
 
         I2cCardInfo local_info;
-        if (!readCard(out_info ? out_info : &local_info)) {
+        if (!select_card_iso14443a(out_info ? out_info : &local_info, true)) {
             if (error) *error = "No card detected";
             return false;
         }
 
-        if (!is_gen1a()) {
+        bool unlocked = is_gen1a();
+        if (!unlocked) {
+            // Some cards require a HALT + reselection before backdoor unlock.
+            gen1a_send_halt();
+            I2cCardInfo retry_info;
+            if (select_card_iso14443a(&retry_info, true)) {
+                if (out_info) *out_info = retry_info;
+                unlocked = is_gen1a();
+            }
+        }
+        if (!unlocked) {
+            // Final retry without HALT to recover from timing-sensitive cards.
+            I2cCardInfo retry_info;
+            if (select_card_iso14443a(&retry_info, true)) {
+                if (out_info) *out_info = retry_info;
+                unlocked = is_gen1a();
+            }
+        }
+
+        if (!unlocked) {
             set_rf_field(false);
             if (error) *error = "Not a Gen1A magic card";
             return false;

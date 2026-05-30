@@ -162,6 +162,7 @@ inline TransportKind transport_from_string(const std::string &value)
     if (value == "USB")  return TransportKind::UsbSerial;
     if (value == "UART") return TransportKind::UartSerial;
     if (value == "I2C")  return TransportKind::I2cBus;
+    if (value == "SPI")  return TransportKind::SpiBus;
     return TransportKind::Mock;
 }
 

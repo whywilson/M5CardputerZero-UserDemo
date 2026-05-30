@@ -99,36 +99,45 @@ public:
         const std::string saved_path   = storage_.load_last_endpoint_path();
         if (saved_kind != TransportKind::Mock) {
             intended_kind_ = saved_kind;
-            if ((saved_kind == TransportKind::SpiBus ||
-                 saved_kind == TransportKind::I2cBus) && !saved_path.empty()) {
-                // SPI/I2C endpoints are not in the system enumeration; restore them
-                // as a synthetic endpoint so the UI stays on the right mode.
-                bool found = false;
+            bool restored = false;
+
+            // First priority: restore exact endpoint path for all transport kinds.
+            if (!saved_path.empty()) {
                 for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
                     if (endpoints_[i].kind == saved_kind && endpoints_[i].path == saved_path) {
                         selected_endpoint_ = i;
-                        found = true;
+                        restored = true;
                         break;
                     }
                 }
-                if (!found) {
-                    TransportEndpoint ep;
-                    ep.kind  = saved_kind;
-                    ep.path  = saved_path;
-                    ep.label = (saved_kind == TransportKind::SpiBus ? "SPI " : "I2C ") + saved_path;
-                    endpoints_.push_back(ep);
-                    selected_endpoint_ = static_cast<int>(endpoints_.size()) - 1;
-                }
-            } else {
-                // For USB/UART: select the first matching endpoint
+            }
+
+            // SPI/I2C endpoints are often on-demand; synthesize when not enumerated.
+            if (!restored &&
+                (saved_kind == TransportKind::SpiBus || saved_kind == TransportKind::I2cBus) &&
+                !saved_path.empty()) {
+                TransportEndpoint ep;
+                ep.kind  = saved_kind;
+                ep.path  = saved_path;
+                ep.label = (saved_kind == TransportKind::SpiBus ? "SPI " : "I2C ") + saved_path;
+                endpoints_.push_back(ep);
+                selected_endpoint_ = static_cast<int>(endpoints_.size()) - 1;
+                restored = true;
+            }
+
+            // Fallback: first endpoint by kind (UART prefers configured path).
+            if (!restored) {
+                const std::string uart_prefer_path = !saved_path.empty() ? saved_path : uart_config_.device_path;
                 for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
-                    if (endpoints_[i].kind == saved_kind) {
-                        if (saved_kind == TransportKind::UartSerial &&
-                            !uart_config_.device_path.empty() &&
-                            endpoints_[i].path != uart_config_.device_path) continue;
-                        selected_endpoint_ = i;
-                        break;
+                    if (endpoints_[i].kind != saved_kind) continue;
+                    if (saved_kind == TransportKind::UartSerial &&
+                        !uart_prefer_path.empty() &&
+                        endpoints_[i].path != uart_prefer_path) {
+                        continue;
                     }
+                    selected_endpoint_ = i;
+                    restored = true;
+                    break;
                 }
             }
         }
@@ -296,9 +305,27 @@ public:
     void refresh_endpoints()
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        std::string previous_path;
+        TransportKind previous_kind = intended_kind_;
+        if (!endpoints_.empty() && selected_endpoint_ < static_cast<int>(endpoints_.size())) {
+            previous_path = endpoints_[selected_endpoint_].path;
+            previous_kind = endpoints_[selected_endpoint_].kind;
+        }
+
         endpoints_ = NfcTransportFactory::enumerate_endpoints();
         if (selected_endpoint_ >= static_cast<int>(endpoints_.size())) selected_endpoint_ = 0;
         if (endpoints_.empty()) return;
+
+        // Keep previous concrete endpoint selection whenever possible.
+        if (!previous_path.empty()) {
+            for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
+                if (endpoints_[i].kind == previous_kind && endpoints_[i].path == previous_path) {
+                    selected_endpoint_ = i;
+                    return;
+                }
+            }
+        }
+
         // Auto-select the first USB endpoint when the intended mode is USB (default at startup).
         if (intended_kind_ == TransportKind::UsbSerial) {
             for (int i = 0; i < static_cast<int>(endpoints_.size()); ++i) {
@@ -555,7 +582,7 @@ public:
                 connection_ = ConnectionState{};
                 intended_kind_ = endpoints_[i].kind;
                 selected_endpoint_ = i;
-                storage_.save_last_transport_kind(intended_kind_);
+                storage_.save_last_endpoint(intended_kind_, endpoints_[i].path);
                 return true;
             }
         }
@@ -730,7 +757,11 @@ public:
         if (transport_) { transport_->close(); transport_.reset(); }
         connection_ = ConnectionState{};
         intended_kind_ = target_kind;
-        storage_.save_last_transport_kind(target_kind);
+        if (target_index >= 0 && target_index < static_cast<int>(endpoints_.size())) {
+            storage_.save_last_endpoint(target_kind, endpoints_[target_index].path);
+        } else {
+            storage_.save_last_endpoint(target_kind, "");
+        }
 
         if (target_index < 0) {
             // No physical device for this kind – stay in the slot, report it
@@ -850,6 +881,7 @@ public:
         connection_.detail = connection_.endpoint.path;
         connection_.pn532_ready = false;
         connection_.device_kind = DeviceKind::Unknown;
+        storage_.save_last_endpoint(connection_.endpoint.kind, connection_.endpoint.path);
 
         // Set log file mode prefix based on transport type.
         if (connection_.endpoint.kind == TransportKind::I2cBus) {
