@@ -26,6 +26,12 @@ if os.environ.get("CONFIG_DEFAULT_FILE") == None:
     if platform.machine() == 'x86_64':
         os.environ["CONFIG_DEFAULT_FILE"] = "linux_x86_sdl2_config_defaults.mk"
 
+# Kconfig generation may reset CONFIG_TOOLCHAIN_PATH to an empty value on macOS.
+# Keep an explicit fallback so cross-compiler executables are always resolvable.
+if 'mac_cross_cp0_config_defaults.mk' in os.environ.get("CONFIG_DEFAULT_FILE", ''):
+    if not os.environ.get("CONFIG_TOOLCHAIN_PATH"):
+        os.environ["CONFIG_TOOLCHAIN_PATH"] = "/opt/homebrew/bin"
+
 if "cross" in os.environ.get("CONFIG_DEFAULT_FILE", ''):
     cross_package_enabled = True
     if not os.path.exists("build/config"):

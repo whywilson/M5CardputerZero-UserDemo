@@ -537,6 +537,35 @@ private:
             }
         }
 
+        // Global Ctrl+S: save EMU dump from any state when on Emulator tab
+        if ((mods & KBD_MOD_CTRL) && raw_key == KEY_S &&
+            (current_tab_ == Tab::Emulator || modal_ == Modal::EmulatorAction)) {
+            const auto conn2 = service_.connection_state();
+            cache_serial_device_kind(conn2);
+            const auto dev_kind2 = effective_emu_device_kind(conn2);
+            const auto ep2 = active_endpoint_for_ui(conn2);
+            const bool nfc_unit2 = (dev_kind2 == nfc_app::DeviceKind::NFCUnit ||
+                                    ep2.kind == nfc_app::TransportKind::I2cBus);
+            const bool pn532_ndef2 = (dev_kind2 == nfc_app::DeviceKind::PN532);
+            const int slot2 = nfc_unit2 ? 0 : hw_emu_slot_;
+            if (!nfc_unit2 && !pn532_ndef2 &&
+                service_.emu_dump_loaded(service_.current_emulator_protocol(), slot2)) {
+                std::string save_err;
+                if (service_.save_emu_dump_cached(
+                        service_.current_emulator_protocol(), slot2, &save_err)) {
+                    refresh_saved_records();
+                    show_toast("Saved");
+                    ui_message_ = "Dump saved to records";
+                } else {
+                    ui_message_ = "Save failed: " + save_err;
+                }
+                modal_ = Modal::None;
+                modal_idx_ = 0;
+            }
+            render_all();
+            return;
+        }
+
         // Global Ctrl+L: toggle HexLog overlay (works from any tab/state)
         if ((mods & KBD_MOD_CTRL) && raw_key == KEY_L) {
             if (modal_ == Modal::HexLog) {
@@ -2282,7 +2311,7 @@ private:
         const int emu_slot = nfc_unit_mode ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
         const int n_opts = pn532_ndef_menu ? 3 :
-                          (nfc_unit_mode ? (nfc_unit_url_mode ? 5 : 4) : (dump_ready ? 4 : 3));
+                          (nfc_unit_mode ? (nfc_unit_url_mode ? 5 : 4) : 3);
         const int visible_opts = std::min(n_opts, 4);
         int first_opt = 0;
         if (n_opts > visible_opts) {
@@ -2300,7 +2329,7 @@ private:
                 create_text(card, 8, 5, (std::string(nfc_app::to_string(service_.current_emulator_protocol())) + " Slot " + std::to_string(slot)).c_str(), 0xFFFFFF, 12);
             }
         }
-        const char *options[] = {"Download Data", "Upload Data", "Set Default", "Save Dump"};
+        const char *options[] = {"Download Data", "Upload Data", "Set Default"};  // Save via Ctrl+S
         const char *nfc_unit_opts[] = {
             service_.nfcunit_emulation_running() ? "Stop Emulation" : "Start Emulating",
             "Download Data",
@@ -4579,7 +4608,7 @@ private:
         const int emu_slot = nfc_unit_mode ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
         const int n_opts = pn532_ndef_menu ? 3 :
-                          (nfc_unit_mode ? (nfc_unit_url_mode ? 5 : 4) : (dump_ready ? 4 : 3));
+                          (nfc_unit_mode ? (nfc_unit_url_mode ? 5 : 4) : 3);
         switch (key) {
         case KEY_UP:
         case KEY_F:    modal_idx_ = (modal_idx_ + n_opts - 1) % n_opts; break;
@@ -4747,17 +4776,6 @@ private:
             } else if (!nfc_unit_mode && modal_idx_ == 2) {
                 service_.set_default_slot();
                 ui_message_ = "Set as module default mode";
-            } else if (!nfc_unit_mode && modal_idx_ == 3) {
-                // Save Dump: persist the cached dump to storage
-                std::string save_err;
-                if (service_.save_emu_dump_cached(
-                        service_.current_emulator_protocol(), emu_slot, &save_err)) {
-                    refresh_saved_records();
-                    show_toast("Saved");
-                    ui_message_ = "Dump saved to records";
-                } else {
-                    ui_message_ = "Save failed: " + save_err;
-                }
             }
             modal_ = Modal::None;
             modal_idx_ = 0;

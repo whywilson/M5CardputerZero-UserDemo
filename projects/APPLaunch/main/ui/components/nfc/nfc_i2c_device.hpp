@@ -22,9 +22,33 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#ifdef __linux__
 #include <linux/i2c-dev.h>
+#include <linux/i2c.h>
+#endif
 #ifndef I2C_SLAVE
 #define I2C_SLAVE 0x0703
+#endif
+#ifndef I2C_RDWR
+#define I2C_RDWR  0x0707
+#endif
+#ifndef I2C_M_RD
+#define I2C_M_RD  0x0001
+#endif
+#ifndef __linux__
+typedef uint8_t  __u8;
+typedef uint16_t __u16;
+typedef uint32_t __u32;
+struct i2c_msg {
+    __u16 addr;
+    __u16 flags;
+    __u16 len;
+    __u8 *buf;
+};
+struct i2c_rdwr_ioctl_data {
+    struct i2c_msg *msgs;
+    __u32 nmsgs;
+};
 #endif
 
 #include <chrono>

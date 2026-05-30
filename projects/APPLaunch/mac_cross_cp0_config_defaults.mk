@@ -2,8 +2,9 @@
 #brew tap messense/macos-cross-toolchains
 #brew install aarch64-unknown-linux-gnu
 
+CONFIG_TOOLCHAIN_PATH="/opt/homebrew/bin"
 
-CONFIG_TOOLCHAIN_PREFIX="aarch64-unknown-linux-gnu-"
+CONFIG_TOOLCHAIN_PREFIX="/opt/homebrew/bin/aarch64-unknown-linux-gnu-"
 
 
 

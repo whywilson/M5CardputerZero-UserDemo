@@ -32,6 +32,39 @@
 #else
 #define NFC_SPI_HAS_I2CDEV 0
 #endif
+#else
+// Non-Linux stub: enough to compile, SPI/GPIO ops always fail at runtime
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#define NFC_SPI_HAS_I2CDEV 0
+#ifndef SPI_MODE_0
+#define SPI_MODE_0 0
+#define SPI_MODE_1 1
+#define SPI_MODE_2 2
+#define SPI_MODE_3 3
+#define SPI_NO_CS  4
+#endif
+#ifndef SPI_IOC_WR_MODE
+#define SPI_IOC_WR_MODE         _IOW('k', 1, uint8_t)
+#define SPI_IOC_WR_BITS_PER_WORD _IOW('k', 3, uint8_t)
+#define SPI_IOC_WR_MAX_SPEED_HZ  _IOW('k', 4, uint32_t)
+#define SPI_IOC_MESSAGE(n)       _IOW('k', 0, char[32])
+#endif
+struct spi_ioc_transfer { uint64_t tx_buf, rx_buf; uint32_t len; uint32_t speed_hz; uint16_t delay_usecs; uint8_t bits_per_word; uint8_t cs_change; uint32_t pad; };
+#ifndef GPIO_GET_CHIPINFO_IOCTL
+#define GPIO_GET_CHIPINFO_IOCTL       _IOR('B', 1, char[68])
+#define GPIO_GET_LINEINFO_IOCTL       _IOWR('B', 2, char[72])
+#define GPIO_GET_LINEHANDLE_IOCTL     _IOWR('B', 3, char[364])
+#define GPIOHANDLE_GET_LINE_VALUES_IOCTL _IOWR(0xB4, 8, char[8])
+#define GPIOHANDLE_SET_LINE_VALUES_IOCTL _IOWR(0xB4, 9, char[8])
+#define GPIOHANDLE_REQUEST_INPUT      1
+#define GPIOHANDLE_REQUEST_OUTPUT     2
+struct gpiochip_info { char name[32]; char label[32]; uint32_t lines; };
+struct gpioline_info { uint32_t line_offset; uint32_t flags; char name[32]; char consumer[32]; };
+struct gpiohandle_request { uint32_t lineoffsets[64]; uint32_t flags; uint8_t default_values[64]; char consumer_label[32]; uint32_t lines; int fd; };
+struct gpiohandle_data { uint8_t values[64]; };
+#endif
 #endif
 
 #include <chrono>
