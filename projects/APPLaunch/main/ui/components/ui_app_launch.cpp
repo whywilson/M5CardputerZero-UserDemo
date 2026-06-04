@@ -134,7 +134,7 @@ public:
     {
         // 固定图标，不允许用户修改
         app_list.emplace_back("RFID",
-                              img_path("ic-rfid.png"), page_v<UINfcPage>);
+                              img_path("ic_rfid.png"), page_v<UINfcPage>);
         app_list.emplace_back("Python",
                               img_path("python_100.png"), "python3", true, false);
         app_list.emplace_back("STORE",

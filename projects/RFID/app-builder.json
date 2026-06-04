@@ -3,6 +3,6 @@
   "version": "0.1",
   "app_name": "RFID",
   "bin_name": "M5CardputerZero-RFID",
-  "icon": "share/images/ic-rfid.png",
+  "icon": "share/images/ic_rfid.png",
   "description": "CardputerZero RFID Independent Application"
 }

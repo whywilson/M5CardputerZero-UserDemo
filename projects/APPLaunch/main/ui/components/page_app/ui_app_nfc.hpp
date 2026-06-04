@@ -701,10 +701,21 @@ private:
                 const auto conn = service_.connection_state();
                 cache_serial_device_kind(conn);
                 const auto endpoint = active_endpoint_for_ui(conn);
+                const auto emu_device_kind = effective_emu_device_kind(conn);
                 const bool st25r_mode =
-                    (effective_emu_device_kind(conn) == nfc_app::DeviceKind::ST25RNFC) ||
+                    (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) ||
                     (endpoint.kind == nfc_app::TransportKind::SpiBus && conn.connected);
-                if (endpoint.kind == nfc_app::TransportKind::I2cBus || effective_emu_device_kind(conn) == nfc_app::DeviceKind::NFCUnit) {
+                if (emu_device_kind == nfc_app::DeviceKind::PN532) {
+                    std::string err;
+                    if (service_.pn532_ndef_state().running) {
+                        ui_message_ = "PN532 NDEF already running";
+                    } else if (service_.start_pn532_ndef_emulation(pn532_ndef_uri_, &err)) {
+                        ui_message_ = "PN532 NDEF emulation running";
+                    } else {
+                        ui_message_ = err.empty() ? "NDEF start failed" : err;
+                    }
+                    render_all();
+                } else if (endpoint.kind == nfc_app::TransportKind::I2cBus || emu_device_kind == nfc_app::DeviceKind::NFCUnit) {
                     if (service_.nfcunit_emulation_running()) {
                         ui_message_ = "NFC Unit already running";
                     } else if (nfcunit_emu_autostart_running_) {
@@ -743,10 +754,15 @@ private:
                 const auto conn = service_.connection_state();
                 cache_serial_device_kind(conn);
                 const auto endpoint = active_endpoint_for_ui(conn);
+                const auto emu_device_kind = effective_emu_device_kind(conn);
                 const bool st25r_mode =
-                    (effective_emu_device_kind(conn) == nfc_app::DeviceKind::ST25RNFC) ||
+                    (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) ||
                     (endpoint.kind == nfc_app::TransportKind::SpiBus && conn.connected);
-                if (endpoint.kind == nfc_app::TransportKind::I2cBus || effective_emu_device_kind(conn) == nfc_app::DeviceKind::NFCUnit) {
+                if (emu_device_kind == nfc_app::DeviceKind::PN532) {
+                    service_.stop_pn532_ndef_emulation();
+                    ui_message_ = "PN532 NDEF emulation stopped";
+                    render_all();
+                } else if (endpoint.kind == nfc_app::TransportKind::I2cBus || emu_device_kind == nfc_app::DeviceKind::NFCUnit) {
                     service_.grovenfc_deactivate();
                     ui_message_ = "NFC Unit emulation stopped";
                     render_all();
@@ -2489,16 +2505,16 @@ private:
             create_text(left, 6, 4,  "NDEF EMU", 0x00D2FF, 12);
             create_text(left, 6, 22, ndef.running ? "Running" : "Stopped",
                         ndef.running ? 0x00FF88 : 0x9E9E9E, 11);
-            create_text(left, 6, 40, "OK:menu", 0xF7A600, 10);
-            create_text(left, 6, 54, "Enter URI + loop", 0x9E9E9E, 10);
+            create_text(left, 6, 40, "S:start P:stop", 0xF7A600, 10);
+            create_text(left, 6, 54, "OK:edit URI", 0x9E9E9E, 10);
 
             create_text(right, 6, 4,  "PN532 Type4 NDEF", 0x8E8E8E, 11);
             create_text(right, 6, 20, to_compact(pn532_ndef_uri_, 30).c_str(), 0x00D2FF, 10);
             create_text(right, 6, 34, to_compact(std::string("Status: ") + ndef.status, 30).c_str(), 0xD8D8D8, 10);
             if (!ndef.error.empty()) {
-                create_text(right, 6, 50, to_compact(std::string("ERR: ") + ndef.error, 30).c_str(), 0xFF8888, 10);
+                create_text(right, 6, 50, to_compact(std::string("ERR: ") + ndef.error, 44).c_str(), 0xFF8888, 10);
             }
-            create_text(right, 6, 76, "OK: Start / Edit URI / Stop", 0x555555, 10);
+            create_text(right, 6, 76, "Quick key: S/P, OK edits URI", 0x555555, 10);
         } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC ||
                emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
                emu_device_kind == nfc_app::DeviceKind::ST25RNFC ||
@@ -2620,7 +2636,7 @@ private:
             service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso14443A;
         const int emu_slot = (nfc_unit_mode || st25r_mode) ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
-        const int n_opts = pn532_ndef_menu ? 3 :
+        const int n_opts = pn532_ndef_menu ? 1 :
                           (nfc_unit_mode ? (nfc_unit_url_mode ? 5 : 4)
                                          : (st25r_mode ? 4 : 3));
         const int visible_opts = std::min(n_opts, 4);
@@ -2662,7 +2678,7 @@ private:
             "Upload Data",
             "Cancel"
         };
-        const char *pn532_opts[] = {"Start NDEF Emu", "Edit URI", "Stop NDEF Emu"};
+        const char *pn532_opts[] = {"Edit URI"};
         for (int row_idx = 0; row_idx < visible_opts; ++row_idx) {
             const int i = first_opt + row_idx;
             const bool sel = (modal_idx_ == i);
@@ -4947,18 +4963,6 @@ private:
             }
             if (pn532_ndef_menu) {
                 if (modal_idx_ == 0) {
-                    // Start NDEF Emu with current URI directly
-                    std::string err;
-                    if (service_.start_pn532_ndef_emulation(pn532_ndef_uri_, &err)) {
-                        ui_message_ = "PN532 NDEF emulation running";
-                    } else {
-                        ui_message_ = err.empty() ? "NDEF start failed" : err;
-                    }
-                    modal_ = Modal::None;
-                    modal_idx_ = 0;
-                    break;
-                }
-                if (modal_idx_ == 1) {
                     // Edit URI: parse existing URI to pre-fill type + body
                     static const char *PFXS[] = {"https://", "http://", "tel:", "mailto:"};
                     uri_edit_for_nfcunit_ = false;
@@ -4974,13 +4978,6 @@ private:
                         }
                     }
                     modal_ = Modal::Pn532NdefInput;
-                    modal_idx_ = 0;
-                    break;
-                }
-                if (modal_idx_ == 2) {
-                    service_.stop_pn532_ndef_emulation();
-                    ui_message_ = "PN532 NDEF emulation stopped";
-                    modal_ = Modal::None;
                     modal_idx_ = 0;
                     break;
                 }

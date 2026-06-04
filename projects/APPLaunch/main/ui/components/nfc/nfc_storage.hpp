@@ -423,6 +423,76 @@ public:
         return ensure_dir_recursive(keys_dict_dir());
     }
 
+    static std::string trim_copy(const std::string &value)
+    {
+        size_t start = 0;
+        size_t end = value.size();
+        while (start < end && std::isspace(static_cast<unsigned char>(value[start]))) ++start;
+        while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) --end;
+        return value.substr(start, end - start);
+    }
+
+    static bool parse_12hex_line(const std::string &line, std::string *normalized)
+    {
+        const std::string trimmed = trim_copy(line);
+        if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';') return false;
+        if (trimmed.size() != 12) return false;
+        std::string key;
+        key.reserve(12);
+        for (char c : trimmed) {
+            if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+            key.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+        if (normalized) *normalized = key;
+        return true;
+    }
+
+    static std::vector<std::string> default_key_dict_lines()
+    {
+        return {
+            "FFFFFFFFFFFF",
+            "000000000000",
+            "A0A1A2A3A4A5",
+            "A5A4A3A2A1A0",
+            "89ECA97F8C2A",
+            "5C8FF9990DA2",
+            "75CCB59C9BED",
+            "D01AFEEB890A",
+            "4B791BEA7BCC",
+            "2612C6DE84CA",
+            "707B11FC1481",
+            "03F9067646AE",
+            "2352C5B56D85",
+            "B0B1B2B3B4B5",
+            "C0C1C2C3C4C5",
+            "D0D1D2D3D4D5",
+            "AABBCCDDEEFF",
+            "4D3A99C351DD",
+            "1A982C7E459A",
+            "FAFAFAFAFAFA",
+            "FBFBFBFBFBFB",
+            "D3F7D3F7D3F7",
+        };
+    }
+
+    bool ensure_default_key_file() const
+    {
+        if (!ensure_keys_dir()) return false;
+        const std::string path = keys_dict_dir() + "/default_keys.dic";
+        {
+            std::ifstream in(path.c_str());
+            if (in.is_open()) return true;
+        }
+        std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc);
+        if (!out.is_open()) return false;
+        out << "# Auto-generated default MIFARE keys\n";
+        for (const auto &line : default_key_dict_lines()) {
+            std::string key;
+            if (parse_12hex_line(line, &key)) out << key << "\n";
+        }
+        return out.good();
+    }
+
     // List .dic and .txt files in the keys directory.
     std::vector<std::string> list_key_files() const
     {
@@ -439,6 +509,9 @@ public:
             else if (fn.size() > 4 && fn.substr(fn.size() - 4) == ".txt") result.push_back(fn);
         }
         closedir(dir);
+        if (result.empty() && ensure_default_key_file()) {
+            result.push_back("default_keys.dic");
+        }
         std::sort(result.begin(), result.end());
         return result;
     }
@@ -452,20 +525,8 @@ public:
         if (!f.is_open()) return keys;
         std::string line;
         while (std::getline(f, line)) {
-            // Strip whitespace and comments
-            size_t start = 0;
-            while (start < line.size() && std::isspace(static_cast<unsigned char>(line[start]))) ++start;
-            line = line.substr(start);
-            if (line.empty() || line[0] == '#' || line[0] == ';') continue;
-            // Keep only hex characters, take first 12
-            std::string hex;
-            for (char c : line) {
-                if (std::isxdigit(static_cast<unsigned char>(c))) {
-                    hex += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                    if (hex.size() == 12) break;
-                }
-            }
-            if (hex.size() == 12) keys.push_back(hex);
+            std::string key;
+            if (parse_12hex_line(line, &key)) keys.push_back(key);
         }
         return keys;
     }
@@ -487,14 +548,8 @@ public:
             return false;
         }
         for (const auto &raw : keys) {
-            std::string hex;
-            for (char c : raw) {
-                if (std::isxdigit(static_cast<unsigned char>(c))) {
-                    hex += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                    if (hex.size() == 12) break;
-                }
-            }
-            if (hex.size() == 12) out << hex << "\n";
+            std::string key;
+            if (parse_12hex_line(raw, &key)) out << key << "\n";
         }
         return true;
     }
