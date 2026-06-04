@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
@@ -242,6 +243,7 @@ public:
                   const std::vector<std::string> *mfc_key_hex,
                   std::string *magic_type,
                   std::vector<std::string> &out_lines,
+                  const std::function<void(const std::string &)> *progress = nullptr,
                   std::string *error = nullptr)
     {
         out_lines.clear();
@@ -269,7 +271,7 @@ public:
             // If MFU path fails, fall back to MFC dump path automatically.
             std::string mfc_err;
             std::string detected_magic;
-            if (dumpNFCUnitMFC(uid_hint, tag_type, mfc_key_hex, &detected_magic, out_lines, &mfc_err)) {
+            if (dumpNFCUnitMFC(uid_hint, tag_type, mfc_key_hex, &detected_magic, out_lines, progress, &mfc_err)) {
                 if (magic_type && !detected_magic.empty()) *magic_type = detected_magic;
                 if (error) error->clear();
                 return true;
@@ -281,7 +283,7 @@ public:
             return false;
         }
         case ProtocolKind::MifareClassic:
-            return dumpNFCUnitMFC(uid_hint, tag_type, mfc_key_hex, magic_type, out_lines, error);
+            return dumpNFCUnitMFC(uid_hint, tag_type, mfc_key_hex, magic_type, out_lines, progress, error);
         default:
             if (error) *error = "Unsupported protocol for I2C dump";
             return false;
@@ -2143,12 +2145,12 @@ private:
     public:
         void init(uint64_t key48)
         {
-            state_.reset();
-            for (int i = 0; i < 48; ++i) {
-                const int byte_index = i >> 3;
-                const int bit_index = i & 0x07;
-                const int reversed = (byte_index << 3) + (bit_index ^ 7);
-                state_[i] = ((key48 >> reversed) & 1ULL) != 0;
+            odd_ = 0U;
+            even_ = 0U;
+
+            for (int bit = 47; bit > 0; bit -= 2) {
+                odd_ = (odd_ << 1) | static_cast<uint32_t>((key48 >> (((bit - 1) ^ 7))) & 0x01ULL);
+                even_ = (even_ << 1) | static_cast<uint32_t>((key48 >> ((bit ^ 7))) & 0x01ULL);
             }
         }
 
@@ -2159,35 +2161,49 @@ private:
 
         bool step_with(bool in, bool enc = false)
         {
-            const bool z = filter();
-            step();
-            const bool ext = in ^ (enc ? z : false);
-            state_[0] = state_[0] ^ ext;
-            return z;
+            const uint8_t out_bit = filter();
+            uint32_t feedback = enc ? static_cast<uint32_t>(out_bit) : 0U;
+
+            feedback ^= in ? 1U : 0U;
+            feedback ^= (odd_ & 0x0029CE5CU);
+            feedback ^= (even_ & 0x00870804U);
+
+            even_ = ((even_ << 1) & 0x00FFFFFFU) | evenparity32(feedback);
+
+            const uint32_t previous_odd = odd_;
+            odd_ = even_;
+            even_ = previous_odd;
+
+            return out_bit != 0;
         }
 
-        uint8_t step8(uint8_t in, bool enc = false)
+        uint8_t step8(uint8_t in, bool enc = false, uint8_t *last_ks_bit = nullptr)
         {
-            uint8_t v = 0;
-            for (uint_fast8_t i = 0; i < 8; ++i) {
-                v |= static_cast<uint8_t>(step_with(((in >> i) & 1U) != 0, enc)) << i;
+            uint8_t v = 0U;
+            for (uint8_t bit = 0U; bit < 8U; ++bit) {
+                v |= static_cast<uint8_t>(step_with(((in >> bit) & 0x01U) != 0U, enc)) << bit;
             }
+            if (last_ks_bit) *last_ks_bit = parity_keystream_bit();
             return v;
+        }
+
+        uint8_t parity_keystream_bit() const
+        {
+            return filter();
         }
 
         uint32_t step32(uint32_t in, bool enc = false)
         {
-            uint32_t v = 0;
-            for (uint32_t i = 0; i < 32; ++i) {
-                const bool t = step_with(((in >> (i ^ 24U)) & 1U) != 0, enc);
-                v |= static_cast<uint32_t>(t) << (24U ^ i);
+            uint32_t out = 0U;
+            for (uint8_t bit = 0U; bit < 32U; ++bit) {
+                out |= static_cast<uint32_t>(step_with(crypto_big_endian_bit(in, bit) != 0U, enc)) << (bit ^ 24U);
             }
-            return v;
+            return out;
         }
 
         static uint8_t oddparity8(uint8_t x)
         {
-            return static_cast<uint8_t>(!__builtin_parity(x));
+            return static_cast<uint8_t>(!__builtin_parity(static_cast<unsigned int>(x)));
         }
 
         uint8_t encrypt_nr_ar(uint8_t out[8], uint32_t nr, uint32_t ar)
@@ -2195,17 +2211,14 @@ private:
             uint8_t parity = 0;
             for (uint_fast8_t i = 0; i < 4; ++i) {
                 const uint8_t v = static_cast<uint8_t>((nr >> ((i ^ 0x03U) << 3)) & 0xFFU);
-                out[i] = step8(v) ^ v;
-                const uint8_t z = static_cast<uint8_t>(filter());
-                parity |= static_cast<uint8_t>((z ^ oddparity8(v)) & 0x01U) << i;
+                out[i] = static_cast<uint8_t>(step8(v, false) ^ v);
+                parity |= static_cast<uint8_t>((parity_keystream_bit() ^ oddparity8(v)) & 0x01U) << i;
             }
             for (uint_fast8_t pos = 4; pos < 8; ++pos) {
                 const uint8_t i = static_cast<uint8_t>(pos - 4);
                 const uint8_t v = static_cast<uint8_t>((ar >> (i << 3)) & 0xFFU);
-                const uint8_t ks = step8(0x00);
-                out[pos] = ks ^ v;
-                const uint8_t z = static_cast<uint8_t>(filter());
-                parity |= static_cast<uint8_t>((z ^ oddparity8(v)) & 0x01U) << pos;
+                out[pos] = static_cast<uint8_t>(step8(0x00, false) ^ v);
+                parity |= static_cast<uint8_t>((parity_keystream_bit() ^ oddparity8(v)) & 0x01U) << pos;
             }
             return parity;
         }
@@ -2214,67 +2227,36 @@ private:
         {
             uint32_t parity = 0;
             for (uint_fast8_t i = 0; i < len; ++i) {
-                const uint8_t ks = step8(0);
-                out[i] = in[i] ^ ks;
-                parity |= static_cast<uint32_t>((filter() ^ oddparity8(in[i])) & 1U) << i;
+                out[i] = static_cast<uint8_t>(in[i] ^ step8(0x00, false));
+                parity |= static_cast<uint32_t>((parity_keystream_bit() ^ oddparity8(in[i])) & 1U) << i;
             }
             return parity;
         }
 
     private:
-        bool step()
+        static uint8_t evenparity32(uint32_t value)
         {
-            bool fb = false;
-            fb ^= state_[4];
-            fb ^= state_[5];
-            fb ^= state_[6];
-            fb ^= state_[8];
-            fb ^= state_[12];
-            fb ^= state_[18];
-            fb ^= state_[20];
-            fb ^= state_[22];
-            fb ^= state_[23];
-            fb ^= state_[28];
-            fb ^= state_[30];
-            fb ^= state_[32];
-            fb ^= state_[33];
-            fb ^= state_[35];
-            fb ^= state_[37];
-            fb ^= state_[38];
-            fb ^= state_[42];
-            fb ^= state_[47];
-
-            state_ <<= 1;
-            state_[0] = fb;
-            return fb;
+            return static_cast<uint8_t>(__builtin_parity(value));
         }
 
-        static bool fa(bool a, bool b, bool c, bool d)
+        static uint8_t crypto_big_endian_bit(uint32_t value, uint8_t bit)
         {
-            return ((a || b) ^ (a && d)) ^ (c && ((a ^ b) || d));
+            return static_cast<uint8_t>((value >> (bit ^ 24U)) & 0x01U);
         }
 
-        static bool fb(bool a, bool b, bool c, bool d)
+        uint8_t filter() const
         {
-            return ((a && b) || c) ^ ((a ^ b) && (c || d));
+            uint32_t f = 0U;
+            f |= (0x000F22C0U >> (odd_ & 0x0FU)) & 0x10U;
+            f |= (0x0006C9C0U >> ((odd_ >> 4U) & 0x0FU)) & 0x08U;
+            f |= (0x0003C8B0U >> ((odd_ >> 8U) & 0x0FU)) & 0x04U;
+            f |= (0x0001E458U >> ((odd_ >> 12U) & 0x0FU)) & 0x02U;
+            f |= (0x0000D938U >> ((odd_ >> 16U) & 0x0FU)) & 0x01U;
+            return static_cast<uint8_t>((0xEC57E80AU >> f) & 0x01U);
         }
 
-        static bool fc(bool a, bool b, bool c, bool d, bool e)
-        {
-            return (a || ((b || e) && (d ^ e))) ^ ((a ^ (b && d)) && ((c ^ d) || (b && e)));
-        }
-
-        bool filter() const
-        {
-            const bool b5 = fb(state_[6], state_[4], state_[2], state_[0]);
-            const bool a4 = fa(state_[14], state_[12], state_[10], state_[8]);
-            const bool b3 = fb(state_[22], state_[20], state_[18], state_[16]);
-            const bool b2 = fb(state_[30], state_[28], state_[26], state_[24]);
-            const bool a1 = fa(state_[38], state_[36], state_[34], state_[32]);
-            return fc(a1, b2, b3, a4, b5);
-        }
-
-        std::bitset<48> state_;
+        uint32_t odd_ = 0U;
+        uint32_t even_ = 0U;
     };
 
     static uint32_t bswap32_local(uint32_t v)
@@ -2283,6 +2265,16 @@ private:
                ((v & 0x0000FF00U) << 8) |
                ((v & 0x00FF0000U) >> 8) |
                ((v & 0xFF000000U) >> 24);
+    }
+
+    static uint32_t prng_successor_local(uint32_t value, uint32_t steps)
+    {
+        uint32_t prng = bswap32_local(value);
+        while (steps-- != 0U) {
+            const uint32_t feedback = ((prng >> 16U) ^ (prng >> 18U) ^ (prng >> 19U) ^ (prng >> 21U)) & 0x01U;
+            prng = (prng >> 1U) | (feedback << 31U);
+        }
+        return bswap32_local(prng);
     }
 
     static void suc_23(uint32_t nt, uint32_t &suc2, uint32_t &suc3)
@@ -2339,6 +2331,32 @@ private:
         }
     }
 
+    static bool decode_st25r3916_parity_frame(const uint8_t *encoded,
+                                              uint16_t encoded_bits,
+                                              uint8_t *out,
+                                              uint8_t *parity,
+                                              uint16_t max_out,
+                                              uint16_t &out_len)
+    {
+        if (!encoded || !out || !parity) return false;
+        const uint16_t bytes = static_cast<uint16_t>(encoded_bits / 9U);
+        if (bytes == 0 || bytes > max_out) return false;
+        std::memset(out, 0, max_out);
+        std::memset(parity, 0, max_out);
+
+        for (uint16_t i = 0; i < bytes; ++i) {
+            for (uint16_t bit = 0; bit < 8; ++bit) {
+                const uint16_t src_bit = static_cast<uint16_t>(i * 9U + bit);
+                const uint8_t b = static_cast<uint8_t>((encoded[src_bit >> 3] >> (src_bit & 7U)) & 0x01U);
+                out[i] = static_cast<uint8_t>(out[i] | (b << bit));
+            }
+            const uint16_t parity_bit = static_cast<uint16_t>(i * 9U + 8U);
+            parity[i] = static_cast<uint8_t>((encoded[parity_bit >> 3] >> (parity_bit & 7U)) & 0x01U);
+        }
+        out_len = bytes;
+        return true;
+    }
+
     static int mfc_sector_count_from_sak_tag(uint8_t sak, const std::string &tag_type)
     {
         const uint8_t sak_norm = normalize_mifare_classic_sak(sak);
@@ -2381,10 +2399,10 @@ private:
         std::string hex;
         hex.reserve(12);
         for (char c : raw) {
-            if (std::isxdigit(static_cast<unsigned char>(c))) {
-                hex.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-                if (hex.size() == 12) break;
-            }
+            const unsigned char uc = static_cast<unsigned char>(c);
+            if (std::isspace(uc)) continue;
+            if (!std::isxdigit(uc)) return false;
+            hex.push_back(static_cast<char>(std::toupper(uc)));
         }
         if (hex.size() != 12) return false;
 
@@ -2440,12 +2458,12 @@ private:
         uint8_t bitstream[40] = {0};
         append_parity(bitstream, sizeof(bitstream), enc, tx_with_crc, parity);
 
-        if (!st25r_write_reg(0x05, 0x80)) return false;  // no_tx_par
+        if (!st25r_write_reg(0x05, 0xC0)) return false;  // no_tx_par | no_rx_par (MFC encrypted parity framing)
 
         st25r_cmd(0xDB);
         if (!st25r_fifo_write(bitstream, stream_len)) return false;
         st25r_set_ntx(static_cast<uint16_t>(total_bits >> 3), static_cast<uint8_t>(total_bits & 0x07));
-        { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }
+        st25r_clear_irq_regs();
         st25r_cmd(0xC5);  // TRANSMIT_WITHOUT_CRC
         return true;
     }
@@ -2464,16 +2482,41 @@ private:
         if (!st25r_set_aux_crc_mode(include_crc)) return false;
         if (!st25r_mfc_send_encrypted(crypto, tx, tx_len)) return false;
 
-        const uint8_t expect = static_cast<uint8_t>(rx_len + (include_crc ? 2 : 0));
-        if (!st25r_wait_fifo(expect, timeout_ms)) return false;
+        const uint8_t expect_plain = static_cast<uint8_t>(rx_len + (include_crc ? 2 : 0));
+        const uint16_t expect_bits = static_cast<uint16_t>(expect_plain * 9U);
+        const uint8_t expect_encoded = static_cast<uint8_t>((expect_bits + 7U) >> 3);
 
-        uint8_t rbuf[40] = {0};
-        uint8_t fifo_cnt = 0;
-        if (!st25r_read_reg(0x1E, fifo_cnt) || fifo_cnt < expect) return false;
-        if (!st25r_fifo_read(rbuf, expect)) return false;
+        uint8_t encoded[48] = {0};
+        St25rIrqStatus first_irq;
+        St25rIrqStatus last_irq;
+        uint16_t fifo_cnt = 0;
+        if (!st25r_wait_for_nfca_rx(first_irq, last_irq, timeout_ms)) {
+            if (!st25r_wait_fifo_after_missed_rxe(fifo_cnt)) return false;
+        } else {
+            if (!st25r_read_fifo_count(fifo_cnt)) return false;
+        }
+        if (fifo_cnt < expect_encoded) return false;
+        if (!st25r_fifo_read(encoded, expect_encoded)) return false;
+        if (fifo_cnt > expect_encoded) {
+            uint8_t sink[32] = {0};
+            uint16_t rem = static_cast<uint16_t>(fifo_cnt - expect_encoded);
+            while (rem > 0) {
+                const uint8_t n = static_cast<uint8_t>(std::min<uint16_t>(rem, sizeof(sink)));
+                st25r_fifo_read(sink, n);
+                rem = static_cast<uint16_t>(rem - n);
+            }
+        }
+
+        uint8_t rbuf[34] = {0};
+        uint8_t rpar[34] = {0};
+        uint16_t decoded_len = 0;
+        if (!decode_st25r3916_parity_frame(encoded, expect_bits, rbuf, rpar, sizeof(rbuf), decoded_len) ||
+            decoded_len != expect_plain) {
+            return false;
+        }
 
         if (decrypt) {
-            if (expect == 1) {
+            if (expect_plain == 1) {
                 const uint8_t ret = static_cast<uint8_t>(rbuf[0] & 0x0F);
                 uint8_t res = 0;
                 res |= static_cast<uint8_t>(crypto.step_with(0) ^ ((ret >> 0) & 1U)) << 0;
@@ -2486,16 +2529,18 @@ private:
                 return true;
             }
 
-            for (uint8_t i = 0; i < expect; ++i) {
-                rbuf[i] ^= crypto.step8(0);
+            for (uint8_t i = 0; i < expect_plain; ++i) {
+                rbuf[i] ^= crypto.step8(0, false);
+                const uint8_t plain_parity = static_cast<uint8_t>(crypto.parity_keystream_bit() ^ rpar[i]);
+                if (Crypto1Local::oddparity8(rbuf[i]) != plain_parity) return false;
             }
         }
 
         if (include_crc) {
-            if (expect < 3) return false;
+            if (expect_plain < 3) return false;
             const uint16_t crc_calc = crc_a(rbuf, rx_len);
-            const uint16_t crc_rx = static_cast<uint16_t>(rbuf[expect - 2]) |
-                                    (static_cast<uint16_t>(rbuf[expect - 1]) << 8);
+            const uint16_t crc_rx = static_cast<uint16_t>(rbuf[expect_plain - 2]) |
+                                    (static_cast<uint16_t>(rbuf[expect_plain - 1]) << 8);
             if (crc_calc != crc_rx) return false;
         }
 
@@ -2509,12 +2554,19 @@ private:
                                 const std::vector<uint8_t> &uid,
                                 Crypto1Local &crypto)
     {
+        auto &hexlog = NfcHexLog::get();
+        char auth_label[32];
+        std::snprintf(auth_label, sizeof(auth_label), "MFC-AUTH blk%02X cmd%02X", block, auth_cmd);
+
         uint8_t rb_len = 8;
         uint8_t rb[8] = {0};
         const uint8_t auth_frame[2] = {auth_cmd, block};
+        hexlog.log_tx(auth_label, auth_frame, 2);
         if (!st25r_nfca_transceive(auth_frame, 2, true, rb, rb_len, 40, 0x00, false, 0) || rb_len < 4) {
+            hexlog.log_event(auth_label, "FAIL: no NT response");
             return false;
         }
+        hexlog.log_rx(auth_label, rb, rb_len);  // NT
 
         if (uid.size() < 4) return false;
         std::this_thread::sleep_for(std::chrono::microseconds(90));
@@ -2523,43 +2575,125 @@ private:
         const uint32_t u32 = array_to32(tail4);
         const uint32_t nt = array_to32(rb);
 
-        uint32_t ar = 0;
-        uint32_t suc3 = 0;
-        suc_23(bswap32_local(nt), ar, suc3);
-
         static thread_local std::mt19937 rng(static_cast<uint32_t>(
             std::chrono::steady_clock::now().time_since_epoch().count()));
-        const uint32_t nr = rng();
+        const uint32_t nr_seed = rng();
+        uint8_t nr_bytes[4] = {
+            static_cast<uint8_t>((nr_seed >> 24) & 0xFFU),
+            static_cast<uint8_t>((nr_seed >> 16) & 0xFFU),
+            static_cast<uint8_t>((nr_seed >> 8) & 0xFFU),
+            static_cast<uint8_t>(nr_seed & 0xFFU)
+        };
+
+        uint8_t ab[8] = {0};
+        uint8_t parity = 0;
 
         crypto.init(key_to64(key));
         (void)crypto.inject(u32, nt, false);
 
-        uint8_t ab[8] = {0};
-        const uint8_t parity = crypto.encrypt_nr_ar(ab, nr, ar);
+        uint32_t reader_prng = prng_successor_local(nt, 32U);
+        for (uint8_t i = 0; i < 4; ++i) {
+            const uint8_t v = nr_bytes[i];
+            ab[i] = static_cast<uint8_t>(crypto.step8(v, false) ^ v);
+            parity |= static_cast<uint8_t>((crypto.parity_keystream_bit() ^ Crypto1Local::oddparity8(v)) & 0x01U) << i;
+        }
+        for (uint8_t i = 0; i < 4; ++i) {
+            reader_prng = prng_successor_local(reader_prng, 8U);
+            const uint8_t plain_byte = static_cast<uint8_t>(reader_prng & 0xFFU);
+            ab[4U + i] = static_cast<uint8_t>(crypto.step8(0x00, false) ^ plain_byte);
+            parity |= static_cast<uint8_t>((crypto.parity_keystream_bit() ^ Crypto1Local::oddparity8(plain_byte)) & 0x01U) << (4U + i);
+        }
+        const uint32_t expected_at = prng_successor_local(reader_prng, 32U);
+        const uint8_t expected_at_bytes[4] = {
+            static_cast<uint8_t>((expected_at >> 24) & 0xFFU),
+            static_cast<uint8_t>((expected_at >> 16) & 0xFFU),
+            static_cast<uint8_t>((expected_at >> 8) & 0xFFU),
+            static_cast<uint8_t>(expected_at & 0xFFU)
+        };
+
         uint8_t bitstream[9] = {0};
         append_parity(bitstream, sizeof(bitstream), ab, sizeof(ab), parity);
 
         st25r_cmd(0xD5);  // RESET_RX_GAIN
-        if (!st25r_write_reg(0x05, 0x80)) return false;  // no_tx_par
+        if (!st25r_write_reg(0x05, 0xC0)) return false;  // no_tx_par | no_rx_par
         if (!st25r_set_aux_crc_mode(true)) return false; // no_crc_rx
 
         st25r_cmd(0xDB);
-        if (!st25r_fifo_write(bitstream, sizeof(bitstream))) return false;
+        hexlog.log_tx(auth_label, bitstream, sizeof(bitstream));  // {NR,AR} encrypted
+        if (!st25r_fifo_write(bitstream, sizeof(bitstream))) {
+            hexlog.log_event(auth_label, "FAIL: FIFO write NR/AR");
+            return false;
+        }
         st25r_set_ntx(sizeof(bitstream), 0);
-        { uint8_t dummy = 0; st25r_read_reg(0x1A, dummy); }
+        st25r_clear_irq_regs();
         st25r_cmd(0xC5);  // TRANSMIT_WITHOUT_CRC
 
-        if (!st25r_wait_fifo(4, 50)) return false;
+        constexpr uint16_t at_bits = 4U * 9U;
+        constexpr uint8_t at_encoded_len = static_cast<uint8_t>((at_bits + 7U) >> 3);
+        St25rIrqStatus first_irq;
+        St25rIrqStatus last_irq;
+        uint16_t fifo_cnt = 0;
+        if (!st25r_wait_for_nfca_rx(first_irq, last_irq, 50)) {
+            if (!st25r_wait_fifo_after_missed_rxe(fifo_cnt)) {
+                hexlog.log_event(auth_label, "FAIL: timeout waiting AT");
+                return false;
+            }
+        } else {
+            if (!st25r_read_fifo_count(fifo_cnt)) {
+                hexlog.log_event(auth_label, "FAIL: timeout waiting AT");
+                return false;
+            }
+        }
+        if (fifo_cnt < at_encoded_len) {
+            hexlog.log_event(auth_label, "FAIL: timeout waiting AT");
+            return false;
+        }
+
+        uint8_t ba_encoded[at_encoded_len] = {0};
+        if (!st25r_fifo_read(ba_encoded, sizeof(ba_encoded))) {
+            hexlog.log_event(auth_label, "FAIL: FIFO read AT");
+            return false;
+        }
+        if (fifo_cnt > at_encoded_len) {
+            uint8_t sink[16] = {0};
+            uint16_t rem = static_cast<uint16_t>(fifo_cnt - at_encoded_len);
+            while (rem > 0) {
+                const uint8_t n = static_cast<uint8_t>(std::min<uint16_t>(rem, sizeof(sink)));
+                st25r_fifo_read(sink, n);
+                rem = static_cast<uint16_t>(rem - n);
+            }
+        }
+        hexlog.log_rx(auth_label, ba_encoded, sizeof(ba_encoded));  // AT encoded
+
         uint8_t ba[4] = {0};
-        if (!st25r_fifo_read(ba, sizeof(ba))) return false;
+        uint8_t ba_parity[4] = {0};
+        uint16_t ba_len = 0;
+        if (!decode_st25r3916_parity_frame(ba_encoded, at_bits, ba, ba_parity, sizeof(ba), ba_len) || ba_len != 4) {
+            hexlog.log_event(auth_label, "FAIL: decode AT frame");
+            return false;
+        }
 
         uint8_t at2[4] = {0};
-        for (int i = 0; i < 4; ++i) at2[i] = ba[i] ^ crypto.step8(0);
-        const uint32_t at32 = static_cast<uint32_t>(at2[0]) |
-                              (static_cast<uint32_t>(at2[1]) << 8) |
-                              (static_cast<uint32_t>(at2[2]) << 16) |
-                              (static_cast<uint32_t>(at2[3]) << 24);
-        return at32 == suc3;
+        for (int i = 0; i < 4; ++i) {
+            at2[i] = static_cast<uint8_t>(ba[i] ^ crypto.step8(0, false));
+            const uint8_t plain_parity = static_cast<uint8_t>(crypto.parity_keystream_bit() ^ ba_parity[i]);
+            if (Crypto1Local::oddparity8(at2[i]) != plain_parity) {
+                char pmsg[48];
+                std::snprintf(pmsg, sizeof(pmsg), "FAIL: parity mismatch byte %d", i);
+                hexlog.log_event(auth_label, pmsg);
+                hexlog.log_rx(auth_label, at2, 4);  // partial AT decrypt for inspection
+                return false;
+            }
+        }
+
+        if (std::memcmp(at2, expected_at_bytes, sizeof(at2)) != 0) {
+            hexlog.log_rx(auth_label, at2, 4);
+            hexlog.log_event(auth_label, "FAIL: AT mismatch suc3");
+            return false;
+        }
+
+        hexlog.log_event(auth_label, "OK");
+        return true;
     }
 
     bool st25r_mfc_read_block(Crypto1Local &crypto, uint8_t block, std::array<uint8_t, 16> &out)
@@ -3291,6 +3425,7 @@ private:
                         const std::vector<std::string> *mfc_key_hex,
                         std::string *magic_type,
                         std::vector<std::string> &out_lines,
+                        const std::function<void(const std::string &)> *progress,
                         std::string *error)
     {
         std::vector<uint8_t> uid;
@@ -3340,67 +3475,131 @@ private:
             }
         }
 
-        static const std::array<std::array<uint8_t, 6>, 9> common_keys = {{
+        static const std::array<std::array<uint8_t, 6>, 22> common_keys = {{
             {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
+            {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
             {{0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}},
+            {{0xA5, 0xA4, 0xA3, 0xA2, 0xA1, 0xA0}},
+            {{0x89, 0xEC, 0xA9, 0x7F, 0x8C, 0x2A}},
+            {{0x5C, 0x8F, 0xF9, 0x99, 0x0D, 0xA2}},
+            {{0x75, 0xCC, 0xB5, 0x9C, 0x9B, 0xED}},
+            {{0xD0, 0x1A, 0xFE, 0xEB, 0x89, 0x0A}},
+            {{0x4B, 0x79, 0x1B, 0xEA, 0x7B, 0xCC}},
+            {{0x26, 0x12, 0xC6, 0xDE, 0x84, 0xCA}},
+            {{0x70, 0x7B, 0x11, 0xFC, 0x14, 0x81}},
+            {{0x03, 0xF9, 0x06, 0x76, 0x46, 0xAE}},
+            {{0x23, 0x52, 0xC5, 0xB5, 0x6D, 0x85}},
             {{0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7}},
             {{0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5}},
+            {{0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5}},
+            {{0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5}},
             {{0x4D, 0x3A, 0x99, 0xC3, 0x51, 0xDD}},
             {{0x1A, 0x98, 0x2C, 0x7E, 0x45, 0x9A}},
             {{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}},
-            {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-            {{0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56}},
+            {{0xFA, 0xFA, 0xFA, 0xFA, 0xFA, 0xFA}},
+            {{0xFB, 0xFB, 0xFB, 0xFB, 0xFB, 0xFB}},
         }};
         std::vector<std::array<uint8_t, 6>> auth_keys(common_keys.begin(), common_keys.end());
         append_external_mfc_keys(auth_keys, mfc_key_hex);
 
-        out_lines.assign(static_cast<size_t>(block_count), std::string());
-        bool any_block_ok = false;
+        struct SectorAuthPlan {
+            bool valid = false;
+            uint8_t auth_cmd = 0x60;
+            std::array<uint8_t, 6> key{};
+        };
+        std::vector<SectorAuthPlan> sector_auth(static_cast<size_t>(sector_count));
+
         bool any_auth_ok = false;
         int first_failed_sector = -1;
 
-        for (int sector = 0; sector < sector_count; ++sector) {
-            const int first_block = mfc_sector_first_block(sector);
-            const int sector_blocks = mfc_sector_block_count(sector);
-            const int trailer_block = mfc_sector_trailer_block(sector);
+        auto emit_progress = [&](const std::string &line) {
+            if (progress && *progress) (*progress)(line);
+        };
 
+        auto key_to_hex = [](const std::array<uint8_t, 6> &key) {
+            char buf[13];
+            std::snprintf(buf, sizeof(buf), "%02X%02X%02X%02X%02X%02X",
+                          key[0], key[1], key[2], key[3], key[4], key[5]);
+            return std::string(buf);
+        };
+
+        auto select_same_card = [&](std::vector<uint8_t> &sector_uid, uint8_t &sector_sak) {
+            sector_uid.clear();
+            sector_sak = 0;
+            if (!st25r_nfca_select_uid(sector_uid, sector_sak)) return false;
+            const std::string sector_uid_hex = hex_compact(sector_uid.data(), sector_uid.size());
+            return sector_uid_hex == selected_uid;
+        };
+
+        auto authenticate_after_select = [&](uint8_t auth_cmd,
+                                             int trailer_block,
+                                             const std::array<uint8_t, 6> &key,
+                                             Crypto1Local &crypto) {
             std::vector<uint8_t> sector_uid;
             uint8_t sector_sak = 0;
-            if (!st25r_nfca_select_uid(sector_uid, sector_sak)) {
-                if (first_failed_sector < 0) first_failed_sector = sector;
-                continue;
-            }
-            const std::string sector_uid_hex = hex_compact(sector_uid.data(), sector_uid.size());
-            if (sector_uid_hex != selected_uid) {
-                if (error) *error = "Card moved during MFC dump, please keep card still";
-                st25r_write_reg(0x02, 0x80);
-                return false;
-            }
+            if (!select_same_card(sector_uid, sector_sak)) return false;
+            return st25r_mfc_authenticate(auth_cmd, static_cast<uint8_t>(trailer_block), key, sector_uid, crypto);
+        };
 
-            Crypto1Local crypto;
-            bool auth_ok = false;
+        // Phase 1: probe each sector with the key list and remember usable auth mode/key.
+        for (int sector = 0; sector < sector_count; ++sector) {
+            const int trailer_block = mfc_sector_trailer_block(sector);
+            std::string progress_line = "Check Keys for Sector " + std::to_string(sector) + " ";
+
             for (const auto &k : auth_keys) {
-                if (st25r_mfc_authenticate(0x60, static_cast<uint8_t>(trailer_block), k, sector_uid, crypto) ||
-                    st25r_mfc_authenticate(0x61, static_cast<uint8_t>(trailer_block), k, sector_uid, crypto)) {
-                    auth_ok = true;
+                progress_line.push_back('.');
+                Crypto1Local probe_crypto;
+                if (authenticate_after_select(0x60, trailer_block, k, probe_crypto)) {
+                    sector_auth[static_cast<size_t>(sector)] = {true, 0x60, k};
                     any_auth_ok = true;
+                    progress_line += " OK KeyA " + key_to_hex(k);
+                    break;
+                }
+                if (authenticate_after_select(0x61, trailer_block, k, probe_crypto)) {
+                    sector_auth[static_cast<size_t>(sector)] = {true, 0x61, k};
+                    any_auth_ok = true;
+                    progress_line += " OK KeyB " + key_to_hex(k);
                     break;
                 }
             }
 
-            if (!auth_ok) {
-                if (first_failed_sector < 0) first_failed_sector = sector;
+            if (!sector_auth[static_cast<size_t>(sector)].valid && first_failed_sector < 0) {
+                first_failed_sector = sector;
+            }
+            if (!sector_auth[static_cast<size_t>(sector)].valid) progress_line += " FAIL";
+            emit_progress(progress_line);
+        }
+
+        out_lines.assign(static_cast<size_t>(block_count), std::string());
+        bool any_block_ok = false;
+
+        // Phase 2: read each sector only after a valid key/auth mode has been found.
+        for (int sector = 0; sector < sector_count; ++sector) {
+            const auto &plan = sector_auth[static_cast<size_t>(sector)];
+            if (!plan.valid) continue;
+
+            const int first_block = mfc_sector_first_block(sector);
+            const int sector_blocks = mfc_sector_block_count(sector);
+            const int trailer_block = mfc_sector_trailer_block(sector);
+
+            Crypto1Local crypto;
+            if (!authenticate_after_select(plan.auth_cmd, trailer_block, plan.key, crypto)) {
                 continue;
             }
 
+            int read_ok = 0;
             for (int i = 0; i < sector_blocks; ++i) {
                 const int block = first_block + i;
                 std::array<uint8_t, 16> data{};
                 if (st25r_mfc_read_block(crypto, static_cast<uint8_t>(block), data)) {
                     out_lines[static_cast<size_t>(block)] = format_mfc_block_line(block, data);
                     any_block_ok = true;
+                    ++read_ok;
                 }
             }
+            emit_progress("Read Sector " + std::to_string(sector) + " " +
+                          std::string(static_cast<size_t>(read_ok), '.') +
+                          " " + std::to_string(read_ok) + "/" + std::to_string(sector_blocks));
         }
 
         st25r_write_reg(0x02, 0x80);

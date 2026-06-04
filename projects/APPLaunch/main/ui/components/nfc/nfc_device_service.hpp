@@ -5277,7 +5277,7 @@ private:
                 }
 
                 std::vector<std::string> mfc_default_keys;
-                if (!success && is_mfc) {
+                if (!success && is_mfc && record.tag.magic_type != "Gen1A") {
                     std::set<std::string> uniq;
                     auto append_key = [&](const std::string &raw_hex) {
                         std::string key;
@@ -5305,19 +5305,23 @@ private:
                     }
 
                     char key_msg[48];
-                    std::snprintf(key_msg, sizeof(key_msg), "MFC keys loaded: %d", static_cast<int>(mfc_default_keys.size()));
+                    std::snprintf(key_msg, sizeof(key_msg), "MFC Key loaded: %d", static_cast<int>(mfc_default_keys.size()));
                     push_log(key_msg);
                 }
 
                 std::vector<std::string> dump_lines;
                 std::string i2c_magic_type;
                 std::string dump_err;
+                const std::function<void(const std::string &)> dump_progress = [this](const std::string &line) {
+                    push_log(line);
+                };
                 if (!success && i2c_dev->dumpCard(dump_protocol,
                                                   record.tag.uid,
                                                   record.tag.tag_type,
                                                   is_mfc ? &mfc_default_keys : nullptr,
                                                   &i2c_magic_type,
                                                   dump_lines,
+                                                  is_mfc ? &dump_progress : nullptr,
                                                   &dump_err)) {
                     record.tag.protocol = dump_protocol;
                     record.tag.raw_data = dump_lines;
