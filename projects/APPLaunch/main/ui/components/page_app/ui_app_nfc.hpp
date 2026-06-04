@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <mutex>
@@ -663,13 +664,13 @@ private:
                     service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
                 } else if (emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
                            emu_device_kind == nfc_app::DeviceKind::ST25RNFC) {
-                    service_.toggle_nfcunit_profile_protocol();
-                    if (emu_device_kind == nfc_app::DeviceKind::ST25RNFC &&
-                        service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso15693) {
-                        // SPI ST25R listener path currently supports NFC-A profiles only.
+                    if (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) {
+                        service_.toggle_spi_profile();
+                        ui_message_ = std::string("Profile -> ") + service_.spi_profile_label();
+                    } else {
                         service_.toggle_nfcunit_profile_protocol();
+                        ui_message_ = std::string("Profile -> ") + service_.nfcunit_profile_label();
                     }
-                    ui_message_ = std::string("Profile -> ") + service_.nfcunit_profile_label();
                 } else {
                     service_.toggle_slot_protocol();
                 }
@@ -717,26 +718,11 @@ private:
                     if (service_.spi_listener_active()) {
                         ui_message_ = "SPI ST25R already running";
                     } else {
-                        std::vector<uint8_t> uid;
-                        uint16_t atqa = 0x0000;
-                        uint8_t sak = 0x00;
-                        const auto proto = service_.current_emulator_protocol();
                         std::string emu_err;
-                        bool ok = false;
-                        if (proto == nfc_app::ProtocolKind::MifareClassic) {
-                            uid = {0x11, 0x22, 0x33, 0x44};
-                            atqa = 0x0004;
-                            sak = 0x08;
-                            ok = service_.spi_start_listener_a(uid, atqa, sak, &emu_err);
-                        } else if (proto == nfc_app::ProtocolKind::Iso14443A) {
-                            uid = {0x28, 0x44, 0x10, 0x0A, 0xE3, 0x6C, 0x1C};
-                            atqa = 0x0042;
-                            sak = 0x18;
-                            ok = service_.spi_start_listener_a(uid, atqa, sak, &emu_err);
-                        } else {
-                            emu_err = "SPI ST25R supports NFC-A profile only";
-                        }
-                        ui_message_ = ok ? "SPI ST25R emulating..." : ("SPI start failed: " + emu_err);
+                        const bool ok = service_.spi_start_current_profile(&emu_err);
+                        ui_message_ = ok
+                            ? ("SPI ST25R " + service_.spi_profile_label() + " emulating...")
+                            : ("SPI start failed: " + emu_err);
                     }
                     render_all();
                 }
@@ -1020,6 +1006,21 @@ private:
         return -1;
     }
 
+    static int spi_profile_index_from_token(const std::string &token)
+    {
+        const std::string n = normalize_profile_token(token);
+        if (n == "MIFARE" || n == "MIFARE1K" || n == "MIFARECLASSIC" || n == "MIFARECLASSIC1K" || n == "MFC" || n == "MFC1K") return 0;
+        if (n == "NTAG" || n == "NTAG215" || n == "ISO14443A" || n == "NFCA") return 1;
+        if (n == "NTAG216") return 2;
+        return -1;
+    }
+
+    static bool is_iso15693_token(const std::string &token)
+    {
+        const std::string n = normalize_profile_token(token);
+        return (n == "ISO15693" || n == "NFCV");
+    }
+
     void write_nfc_automation_status(const std::string &line) const
     {
         std::ofstream out(kNfcAutomationStatusPath, std::ios::trunc);
@@ -1077,6 +1078,31 @@ private:
         return true;
     }
 
+    bool ensure_spi_connected_for_automation(const std::string &path, std::string *error)
+    {
+        const std::string spi_path = path.empty() ? "/dev/spidev0.2" : path;
+        auto conn = service_.connection_state();
+        if (conn.connected &&
+            conn.endpoint.kind == nfc_app::TransportKind::SpiBus &&
+            conn.endpoint.path == spi_path) {
+            return true;
+        }
+
+        nfc_app::TransportEndpoint ep;
+        ep.kind = nfc_app::TransportKind::SpiBus;
+        ep.path = spi_path;
+        ep.label = "SPI " + spi_path;
+        service_.select_spi_endpoint(ep);
+
+        if (!service_.connect_current()) {
+            conn = service_.connection_state();
+            if (error) *error = conn.detail.empty() ? "SPI connect failed" : conn.detail;
+            return false;
+        }
+        if (error) error->clear();
+        return true;
+    }
+
     void process_nfc_automation_command()
     {
         const uint32_t now = lv_tick_get();
@@ -1104,13 +1130,25 @@ private:
             oss << "status connected=" << (conn.connected ? 1 : 0)
                 << " device=" << nfc_app::to_string(conn.device_kind)
                 << " profile=" << service_.nfcunit_profile_label()
-                << " running=" << (service_.nfcunit_emulation_running() ? 1 : 0);
+                << " running=" << (service_.nfcunit_emulation_running() ? 1 : 0)
+                << " nfc_profile=" << service_.nfcunit_profile_label()
+                << " nfc_running=" << (service_.nfcunit_emulation_running() ? 1 : 0)
+                << " spi_profile=" << service_.spi_profile_label()
+                << " spi_running=" << (service_.spi_listener_active() ? 1 : 0)
+                << " spi_iso15693_emu=" << (service_.spi_supports_iso15693_emulation() ? 1 : 0);
             emit_ok(oss.str());
             ui_message_ = "Automation status exported";
             return;
         }
 
+        if (verb_upper == "SPI_CAPS") {
+            emit_ok(service_.spi_caps_status_line());
+            ui_message_ = "Automation SPI caps exported";
+            return;
+        }
+
         if (verb_upper == "STOP") {
+            service_.spi_stop_listener();
             const bool ok = service_.grovenfc_deactivate();
             if (ok) {
                 emit_ok("stop emulation");
@@ -1136,6 +1174,24 @@ private:
             service_.set_nfcunit_profile_index(profile);
             emit_ok("profile=" + service_.nfcunit_profile_label());
             ui_message_ = "Automation profile: " + service_.nfcunit_profile_label();
+            return;
+        }
+
+        if (verb_upper == "SPI_PROFILE") {
+            if (is_iso15693_token(arg)) {
+                emit_err("SPI ISO15693 emulation requires transparent GPIO timing");
+                ui_message_ = "Automation: SPI ISO15693 unsupported";
+                return;
+            }
+            const int profile = spi_profile_index_from_token(arg);
+            if (profile < 0) {
+                emit_err("unknown spi profile: " + arg);
+                ui_message_ = "Automation: bad SPI profile";
+                return;
+            }
+            service_.set_spi_profile_index(profile);
+            emit_ok("spi_profile=" + service_.spi_profile_label());
+            ui_message_ = "Automation SPI profile: " + service_.spi_profile_label();
             return;
         }
 
@@ -1185,6 +1241,163 @@ private:
                 emit_err(status.empty() ? "scan failed" : status);
                 ui_message_ = "Automation: scan failed";
             }
+            return;
+        }
+
+        if (verb_upper == "SPI_RUN") {
+            std::istringstream args_ss(arg);
+            std::string token1;
+            std::string token2;
+            args_ss >> token1 >> token2;
+
+            int run_profile = -1;
+            bool run_iso15693 = false;
+            std::string spi_path = "/dev/spidev0.2";
+            if (!token1.empty()) {
+                const int p = spi_profile_index_from_token(token1);
+                if (p >= 0) {
+                    run_profile = p;
+                    if (!token2.empty()) spi_path = token2;
+                } else if (is_iso15693_token(token1)) {
+                    run_iso15693 = true;
+                    if (!token2.empty()) spi_path = token2;
+                } else {
+                    spi_path = token1;
+                }
+            }
+
+            std::string err;
+            if (!ensure_spi_connected_for_automation(spi_path, &err)) {
+                emit_err(err.empty() ? "SPI connect failed" : err);
+                ui_message_ = "Automation SPI connect failed";
+                return;
+            }
+            if (run_profile >= 0) {
+                service_.set_spi_profile_index(run_profile);
+            }
+            if (run_iso15693) {
+                if (!service_.spi_start_iso15693_emulation(&err)) {
+                    emit_err(err.empty() ? "SPI ISO15693 emulation unsupported" : err);
+                    ui_message_ = "Automation SPI ISO15693 unsupported";
+                    return;
+                }
+                emit_ok("spi run profile=ISO15693 running=1");
+                ui_message_ = "Automation SPI: ISO15693 emulating";
+                return;
+            }
+            if (!service_.spi_start_current_profile(&err)) {
+                emit_err(err.empty() ? "spi emu start failed" : err);
+                ui_message_ = "Automation SPI start failed";
+                return;
+            }
+
+            std::ostringstream oss;
+            oss << "spi run profile=" << service_.spi_profile_label()
+                << " running=" << (service_.spi_listener_active() ? 1 : 0);
+            emit_ok(oss.str());
+            ui_message_ = "Automation SPI: " + service_.spi_profile_label() + " emulating";
+            return;
+        }
+
+        if (verb_upper == "SPI_EMU_START") {
+            std::istringstream args_ss(arg);
+            std::string token1;
+            std::string token2;
+            args_ss >> token1 >> token2;
+
+            std::string err;
+            if (is_iso15693_token(token1)) {
+                const std::string spi_path = token2.empty() ? "/dev/spidev0.2" : token2;
+                if (!ensure_spi_connected_for_automation(spi_path, &err)) {
+                    emit_err(err.empty() ? "SPI connect failed" : err);
+                    ui_message_ = "Automation SPI connect failed";
+                    return;
+                }
+                if (!service_.spi_start_iso15693_emulation(&err)) {
+                    emit_err(err.empty() ? "SPI ISO15693 emulation unsupported" : err);
+                    ui_message_ = "Automation SPI ISO15693 unsupported";
+                    return;
+                }
+                emit_ok("spi emu started profile=ISO15693");
+                ui_message_ = "Automation SPI: ISO15693 emulating";
+                return;
+            }
+            const int profile = spi_profile_index_from_token(token1);
+            if (profile >= 0) {
+                const std::string spi_path = token2.empty() ? "/dev/spidev0.2" : token2;
+                if (!ensure_spi_connected_for_automation(spi_path, &err)) {
+                    emit_err(err.empty() ? "SPI connect failed" : err);
+                    ui_message_ = "Automation SPI connect failed";
+                    return;
+                }
+                service_.set_spi_profile_index(profile);
+                if (!service_.spi_start_current_profile(&err)) {
+                    emit_err(err.empty() ? "spi emu start failed" : err);
+                    ui_message_ = "Automation SPI start failed";
+                    return;
+                }
+                emit_ok("spi emu started profile=" + service_.spi_profile_label());
+                ui_message_ = "Automation SPI: " + service_.spi_profile_label() + " emulating";
+                return;
+            }
+
+            // Legacy raw mode: SPI_EMU_START uid atqa sak [spi_path]
+            std::string uid_hex = token1;
+            std::string atqa_hex = token2;
+            std::string sak_hex;
+            std::string emu_path;
+            args_ss >> sak_hex >> emu_path;
+            if (emu_path.empty()) emu_path = "/dev/spidev0.2";
+
+            auto hex_to_bytes = [](const std::string &hex) -> std::vector<uint8_t> {
+                std::vector<uint8_t> out;
+                for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                    char buf[3] = {hex[i], hex[i + 1], '\0'};
+                    out.push_back(static_cast<uint8_t>(std::strtoul(buf, nullptr, 16)));
+                }
+                return out;
+            };
+
+            const auto uid_bytes = hex_to_bytes(uid_hex);
+            if (uid_bytes.size() != 4 && uid_bytes.size() != 7) {
+                emit_err("SPI_EMU_START: uid must be 4 or 7 bytes (8 or 14 hex digits)");
+                ui_message_ = "Automation SPI param error";
+                return;
+            }
+            if (atqa_hex.size() < 4 || sak_hex.size() < 2) {
+                emit_err("SPI_EMU_START: invalid atqa/sak");
+                ui_message_ = "Automation SPI param error";
+                return;
+            }
+            char *atqa_end = nullptr;
+            const unsigned long atqa_ul = std::strtoul(atqa_hex.c_str(), &atqa_end, 16);
+            if (atqa_end == nullptr || *atqa_end != '\0' || atqa_ul > 0xFFFFul) {
+                emit_err("SPI_EMU_START: invalid atqa value");
+                ui_message_ = "Automation SPI param error";
+                return;
+            }
+            const uint16_t atqa = static_cast<uint16_t>(atqa_ul);
+            const uint8_t sak = hex_to_bytes(sak_hex)[0];
+
+            if (!ensure_spi_connected_for_automation(emu_path, &err)) {
+                emit_err(err.empty() ? "SPI connect failed" : err);
+                ui_message_ = "Automation SPI connect failed";
+                return;
+            }
+            if (!service_.spi_start_listener_a(uid_bytes, atqa, sak, &err)) {
+                emit_err(err.empty() ? "spi emu start failed" : err);
+                ui_message_ = "Automation SPI start failed";
+                return;
+            }
+            emit_ok("spi emu started");
+            ui_message_ = "Automation SPI emulating";
+            return;
+        }
+
+        if (verb_upper == "SPI_EMU_STOP") {
+            service_.spi_stop_listener();
+            emit_ok("spi emu stopped");
+            ui_message_ = "Automation SPI stopped";
             return;
         }
 
@@ -1748,7 +1961,7 @@ private:
         case nfc_app::TransportKind::I2cBus:
             return "NFC Unit, GroveNFC";
         case nfc_app::TransportKind::SpiBus:
-            return "ST25R3916";
+            return "M5 NFC CAP";
         default:
             return "Demo/Unknown";
         }
@@ -2320,9 +2533,9 @@ private:
             create_text(left, 6, 38, (is_nfc_unit || is_st25r) ? "Tab:profile" : "Tab:proto", 0xD8D8D8, 10);
             create_text(left, 6, 50, (is_nfc_unit || is_st25r) ? "OK:start" : "F/X:slot", (is_nfc_unit || is_st25r) ? 0xF7A600 : 0xD8D8D8, 10);
             if (!is_nfc_unit && !is_st25r) create_text(left, 6, 62, "OK:menu", 0xF7A600, 10);
-            create_text(left, 6, 80, is_st25r ? "ST25R SPI" : (is_nfc_unit ? "NFC Unit I2C" : "GroveNFC I2C"), is_st25r ? 0x00B4FF : 0x00FF88, 10);
+            create_text(left, 6, 80, is_st25r ? "M5 NFC CAP SPI" : (is_nfc_unit ? "NFC Unit I2C" : "GroveNFC I2C"), is_st25r ? 0x00B4FF : 0x00FF88, 10);
 
-            create_text(right, 6, 4,  is_nfc_unit ? nfc_unit_profile.c_str() : (is_st25r ? service_.nfcunit_profile_label().c_str() : proto_name.c_str()), 0x00D2FF, 12);
+            create_text(right, 6, 4,  is_nfc_unit ? nfc_unit_profile.c_str() : (is_st25r ? service_.spi_profile_label().c_str() : proto_name.c_str()), 0x00D2FF, 12);
             const auto start_state = service_.nfcunit_emu_start_state();
             if (is_nfc_unit) {
                 const auto emu_protocol = service_.current_emulator_protocol();
@@ -2341,19 +2554,19 @@ private:
                     create_text(right, 6, 66, start_state.running ? "starting in background" : "background worker", 0x666666, 10);
                 }
             } else if (is_st25r) {
-                const auto emu_protocol = service_.current_emulator_protocol();
+                const int spi_profile = service_.spi_profile_index();
                 const bool running = service_.spi_listener_active();
                 create_text(right, 6, 20, "S:start P:stop OK:menu", 0xD8D8D8, 10);
                 create_text(right, 6, 34, running ? "Status: RUNNING" : "Status: READY", running ? 0x00FF88 : 0x9E9E9E, 10);
-                if (emu_protocol == nfc_app::ProtocolKind::Iso15693) {
-                    create_text(right, 6, 52, "ISO15693 unsupported on SPI", 0xFF8888, 10);
-                    create_text(right, 6, 66, "Tab to switch profile", 0x666666, 10);
-                } else if (emu_protocol == nfc_app::ProtocolKind::MifareClassic) {
+                if (spi_profile == 0) {
                     create_text(right, 6, 52, "UID:11223344 ATQA:0004", 0x9E9E9E, 10);
                     create_text(right, 6, 66, "SAK:08 (MFC profile)", 0x9E9E9E, 10);
+                } else if (spi_profile == 1) {
+                    create_text(right, 6, 52, "UID:04512233445566", 0x9E9E9E, 10);
+                    create_text(right, 6, 66, "ATQA:0044 SAK:00", 0x9E9E9E, 10);
                 } else {
-                    create_text(right, 6, 52, "UID:2844100AE36C1C", 0x9E9E9E, 10);
-                    create_text(right, 6, 66, "ATQA:0042 SAK:18", 0x9E9E9E, 10);
+                    create_text(right, 6, 52, "UID:0452A1B2C3D4E5", 0x9E9E9E, 10);
+                    create_text(right, 6, 66, "ATQA:0044 SAK:00", 0x9E9E9E, 10);
                 }
             } else {
                 create_text(right, 6, 20, "OK menu: Dn/Up/Save", 0xD8D8D8, 10);
@@ -2423,7 +2636,7 @@ private:
             if (nfc_unit_mode) {
                 create_text(card, 8, 5, (service_.nfcunit_profile_label() + " Profile").c_str(), 0xFFFFFF, 12);
             } else if (st25r_mode) {
-                create_text(card, 8, 5, (service_.nfcunit_profile_label() + " SPI").c_str(), 0xFFFFFF, 12);
+                create_text(card, 8, 5, (service_.spi_profile_label() + " SPI").c_str(), 0xFFFFFF, 12);
             } else {
                 const auto slot = service_.selected_slot_index();
                 create_text(card, 8, 5, (std::string(nfc_app::to_string(service_.current_emulator_protocol())) + " Slot " + std::to_string(slot)).c_str(), 0xFFFFFF, 12);
@@ -4826,35 +5039,14 @@ private:
                 break;
             }
             if (st25r_mode) {
-                auto start_spi_listener_for_profile = [this](std::string *error) {
-                    const auto proto = service_.current_emulator_protocol();
-                    std::vector<uint8_t> uid;
-                    uint16_t atqa = 0x0000;
-                    uint8_t sak = 0x00;
-
-                    if (proto == nfc_app::ProtocolKind::MifareClassic) {
-                        uid = {0x11, 0x22, 0x33, 0x44};
-                        atqa = 0x0004;
-                        sak = 0x08;
-                    } else if (proto == nfc_app::ProtocolKind::Iso14443A) {
-                        uid = {0x28, 0x44, 0x10, 0x0A, 0xE3, 0x6C, 0x1C};
-                        atqa = 0x0042;
-                        sak = 0x18;
-                    } else {
-                        if (error) *error = "SPI ST25R supports NFC-A profile only";
-                        return false;
-                    }
-                    return service_.spi_start_listener_a(uid, atqa, sak, error);
-                };
-
                 if (modal_idx_ == 0) {
                     if (service_.spi_listener_active()) {
                         service_.spi_stop_listener();
                         ui_message_ = "SPI ST25R emulation stopped";
                     } else {
                         std::string emu_err;
-                        if (start_spi_listener_for_profile(&emu_err)) {
-                            ui_message_ = "SPI ST25R emulating...";
+                        if (service_.spi_start_current_profile(&emu_err)) {
+                            ui_message_ = "SPI ST25R " + service_.spi_profile_label() + " emulating...";
                         } else {
                             ui_message_ = "SPI start failed" +
                                          (emu_err.empty() ? std::string() : (": " + emu_err));

@@ -150,6 +150,7 @@ public:
         cancel_hw_mfkey_.store(true);
         if (nfc_unit_emu_start_thread_.joinable()) nfc_unit_emu_start_thread_.join();
         stop_nfcunit_emulation_worker(false);
+        stop_spi_emulation_worker(false);
         stop_pn532_ndef_emulation();
         if (uart_test_thread_.joinable()) uart_test_thread_.join();
         if (hw_upload_thread_.joinable()) hw_upload_thread_.join();
@@ -1235,6 +1236,7 @@ public:
     void disconnect()
     {
         stop_nfcunit_emulation_worker(true);
+        stop_spi_emulation_worker(true);
         stop_nfcunit_mfkey_sniffer(false);
         std::lock_guard<std::mutex> lock(mutex_);
         if (transport_) transport_->close();
@@ -1903,21 +1905,96 @@ public:
     // ── SPI passive-target (EMU) control ─────────────────────────────────────
     // All methods require SPI to be connected.
 
+    bool spi_start_current_profile(std::string *error = nullptr)
+    {
+        int profile = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!spi_device_ || !spi_device_->is_open()) {
+                if (error) *error = "SPI not connected";
+                return false;
+            }
+            profile = spi_emu_profile_;
+            selected_emulator_protocol_ = spi_profile_protocol_for_index(profile);
+        }
+
+        std::vector<uint8_t> uid;
+        uint16_t atqa = 0;
+        uint8_t sak = 0;
+        if (!spi_profile_params_for_index(profile, &uid, &atqa, &sak)) {
+            if (error) *error = "Unknown SPI profile";
+            return false;
+        }
+        return spi_start_listener_a(uid, atqa, sak, error);
+    }
+
+    bool spi_start_iso15693_emulation(std::string *error = nullptr)
+    {
+        stop_spi_emulation_worker(true);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!spi_device_ || !spi_device_->is_open()) {
+                if (error) *error = "SPI not connected";
+                return false;
+            }
+        }
+
+        push_log("[SPI] ISO15693 emulation unsupported: transparent listener requires MCU GPIO timing");
+        if (error) *error = "SPI ISO15693 emulation requires transparent GPIO timing";
+        return false;
+    }
+
+    bool spi_supports_iso15693_emulation() const
+    {
+        return false;
+    }
+
+    static std::string spi_iso15693_emulation_reason()
+    {
+        return "transparent_gpio_timing_required";
+    }
+
+    std::string spi_caps_status_line() const
+    {
+        std::ostringstream oss;
+        oss << "spi_caps"
+            << " nfca_emu=1"
+            << " mfc1k=1"
+            << " ntag215=1"
+            << " ntag216=1"
+            << " iso15693_emu=" << (spi_supports_iso15693_emulation() ? 1 : 0)
+            << " iso15693_reason=" << spi_iso15693_emulation_reason();
+        return oss.str();
+    }
+
     bool spi_start_listener_a(const std::vector<uint8_t> &uid, uint16_t atqa, uint8_t sak,
                               std::string *error = nullptr)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!spi_device_ || !spi_device_->is_open()) {
-            if (error) *error = "SPI not connected";
-            return false;
+        stop_spi_emulation_worker(true);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!spi_device_ || !spi_device_->is_open()) {
+                if (error) *error = "SPI not connected";
+                return false;
+            }
+            if (!spi_device_->start_listener_a(uid, atqa, sak, error)) {
+                return false;
+            }
+            spi_emu_uid_ = uid;
+            spi_emu_atqa_ = atqa;
+            spi_emu_sak_ = sak;
         }
-        return spi_device_->start_listener_a(uid, atqa, sak, error);
+
+        spi_emu_cancel_.store(false);
+        spi_emu_thread_ = std::thread([this]() { spi_listener_worker(); });
+        return true;
     }
 
     void spi_stop_listener()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (spi_device_) spi_device_->stop_listener();
+        stop_spi_emulation_worker(true);
     }
 
     bool spi_listener_active() const
@@ -2536,6 +2613,83 @@ public:
         case 0:
         default:
             return ProtocolKind::Iso14443A;
+        }
+    }
+
+    static ProtocolKind spi_profile_protocol_for_index(int profile)
+    {
+        switch (profile) {
+        case 0: return ProtocolKind::MifareClassic;
+        case 1:
+        case 2:
+            return ProtocolKind::Iso14443A;
+        default:
+            return ProtocolKind::MifareClassic;
+        }
+    }
+
+    static bool spi_profile_params_for_index(int profile,
+                                             std::vector<uint8_t> *uid,
+                                             uint16_t *atqa,
+                                             uint8_t *sak)
+    {
+        if (!uid || !atqa || !sak) return false;
+        switch (profile) {
+        case 0: // MFC1K
+            *uid = {0x04, 0xA1, 0xB2, 0xC3};
+            *atqa = 0x0004;
+            *sak = 0x08;
+            return true;
+        case 1: // NTAG215
+            *uid = {0x04, 0x51, 0x22, 0x33, 0x44, 0x55, 0x66};
+            *atqa = 0x0044;
+            *sak = 0x00;
+            return true;
+        case 2: // NTAG216
+            *uid = {0x04, 0x52, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5};
+            *atqa = 0x0044;
+            *sak = 0x00;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool set_spi_profile_index(int profile)
+    {
+        if (profile < 0 || profile > 2) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        spi_emu_profile_ = profile;
+        selected_emulator_protocol_ = spi_profile_protocol_for_index(spi_emu_profile_);
+        return true;
+    }
+
+    int spi_profile_index() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return spi_emu_profile_;
+    }
+
+    void toggle_spi_profile()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        spi_emu_profile_ = (spi_emu_profile_ + 1) % 3;
+        selected_emulator_protocol_ = spi_profile_protocol_for_index(spi_emu_profile_);
+    }
+
+    std::string spi_profile_label() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return spi_profile_label_for_index(spi_emu_profile_);
+    }
+
+    static std::string spi_profile_label_for_index(int profile)
+    {
+        switch (profile) {
+        case 0: return "MFC 1K";
+        case 1: return "NTAG215";
+        case 2: return "NTAG216";
+        default: return "MFC 1K";
         }
     }
 
@@ -3520,6 +3674,18 @@ private:
         }
     }
 
+    void stop_spi_emulation_worker(bool stop_listener)
+    {
+        spi_emu_cancel_.store(true);
+        if (spi_emu_thread_.joinable()) spi_emu_thread_.join();
+        if (stop_listener) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (spi_device_) {
+                spi_device_->stop_listener();
+            }
+        }
+    }
+
     void nfcunit_ntag213_worker()
     {
         static constexpr uint8_t kAck = 0x0A;
@@ -3659,6 +3825,153 @@ private:
                 // Keep polling even when payload frames are ignored.
                 got = dev->nfcunit_poll_listener_frame(frame, 20);
             }
+            if (!got) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+    }
+
+    void spi_listener_worker()
+    {
+        auto calc_bcc = [](uint8_t a, uint8_t b, uint8_t c, uint8_t d) -> uint8_t {
+            return static_cast<uint8_t>(a ^ b ^ c ^ d);
+        };
+
+        bool anticollision_started = false;
+
+        while (!spi_emu_cancel_.load()) {
+            std::vector<uint8_t> frame;
+            bool got = false;
+            NfcSpiDevice *dev = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                dev = spi_device_.get();
+            }
+            if (dev && dev->is_open() && dev->listener_active()) {
+                // Keep polling to drive listener state transitions even when
+                // payload frames are ignored.
+                got = dev->poll_listener_frame(frame, 20);
+            }
+
+            if (got && !frame.empty()) {
+                std::vector<uint8_t> uid;
+                uint16_t atqa = 0;
+                uint8_t sak = 0;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    uid = spi_emu_uid_;
+                    atqa = spi_emu_atqa_;
+                    sak = spi_emu_sak_;
+                }
+
+                const uint8_t cmd0 = frame[0];
+                const uint8_t cmd1 = frame.size() > 1 ? frame[1] : 0x00;
+
+                const bool is_short_poll = (cmd0 == 0x26 || cmd0 == 0x52);
+                const bool is_shifted_short_poll = (cmd0 == 0x13 || cmd0 == 0x29);
+                if (anticollision_started && (is_short_poll || is_shifted_short_poll)) {
+                    std::fprintf(stderr, "[SPI-EMU] reset anticollision on short poll cmd=%02X\n", cmd0);
+                    std::fflush(stderr);
+                    anticollision_started = false;
+                }
+
+                if ((cmd0 == 0x93 && (cmd1 == 0x20 || cmd1 == 0x70)) ||
+                    (cmd0 == 0x95 && (cmd1 == 0x20 || cmd1 == 0x70))) {
+                    anticollision_started = true;
+                }
+                if (cmd0 == 0x50 && cmd1 == 0x00) {
+                    anticollision_started = false;
+                }
+
+                // Some readers can expose a right-shifted echo of short frames
+                // (e.g. 0x52 -> 0x29). Do not answer those artifacts.
+                if (is_shifted_short_poll) {
+                    std::fprintf(stderr, "[SPI-EMU] ignore shifted short poll cmd=%02X\n", cmd0);
+                    std::fflush(stderr);
+                    continue;
+                }
+
+                std::vector<uint8_t> response;
+                bool with_crc = false;
+                bool handled = false;
+
+                // REQA / WUPA short frame: ATQA (2 bytes, no CRC).
+                if (is_short_poll) {
+                    response = {
+                        static_cast<uint8_t>((atqa >> 8) & 0xFF),
+                        static_cast<uint8_t>(atqa & 0xFF)
+                    };
+                    handled = true;
+                }
+                // ANTICOLLISION CL1 -> UID CL1/BCC (no CRC)
+                else if (cmd0 == 0x93 && cmd1 == 0x20) {
+                    if (uid.size() == 4) {
+                        response = {uid[0], uid[1], uid[2], uid[3],
+                                    calc_bcc(uid[0], uid[1], uid[2], uid[3])};
+                    } else if (uid.size() == 7) {
+                        response = {0x88, uid[0], uid[1], uid[2],
+                                    calc_bcc(0x88, uid[0], uid[1], uid[2])};
+                    }
+                    with_crc = false;
+                    handled = !response.empty();
+                }
+                // SELECT CL1 -> SAK (with CRC)
+                else if (cmd0 == 0x93 && cmd1 == 0x70) {
+                    const uint8_t sak_cl1 = (uid.size() == 7)
+                        ? static_cast<uint8_t>(sak | 0x04)
+                        : static_cast<uint8_t>(sak & static_cast<uint8_t>(~0x04));
+                    response = {sak_cl1};
+                    with_crc = true;
+                    handled = true;
+                    // 4-byte UID selection completes at CL1; allow fresh REQA/WUPA.
+                    if (uid.size() == 4) {
+                        anticollision_started = false;
+                    }
+                }
+                // ANTICOLLISION CL2 (for 7-byte UID)
+                else if (uid.size() == 7 && cmd0 == 0x95 && cmd1 == 0x20) {
+                    response = {uid[3], uid[4], uid[5], uid[6],
+                                calc_bcc(uid[3], uid[4], uid[5], uid[6])};
+                    handled = true;
+                }
+                // SELECT CL2 -> final SAK (with CRC)
+                else if (uid.size() == 7 && cmd0 == 0x95 && cmd1 == 0x70) {
+                    response = {static_cast<uint8_t>(sak & static_cast<uint8_t>(~0x04))};
+                    with_crc = true;
+                    handled = true;
+                    anticollision_started = false;
+                }
+
+                if (handled && !response.empty()) {
+                    bool tx_ok = false;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        NfcSpiDevice *tx_dev = spi_device_.get();
+                        if (tx_dev && tx_dev->is_open() && tx_dev->listener_active()) {
+                            tx_ok = tx_dev->send_listener_frame(
+                                response.data(),
+                                static_cast<uint8_t>(response.size()),
+                                with_crc);
+                        }
+                    }
+                    std::fprintf(stderr, "[SPI-EMU] tx len=%zu crc=%u ok=%u cmd=%02X/%02X data=%s\n",
+                                 response.size(),
+                                 with_crc ? 1u : 0u,
+                                 tx_ok ? 1u : 0u,
+                                 cmd0,
+                                 cmd1,
+                                 bytes_to_hex_string(response.data(), response.size()).c_str());
+                    std::fflush(stderr);
+                } else {
+                    std::fprintf(stderr, "[SPI-EMU] unhandled cmd=%02X/%02X len=%zu data=%s\n",
+                                 cmd0,
+                                 cmd1,
+                                 frame.size(),
+                                 bytes_to_hex_string(frame.data(), frame.size()).c_str());
+                    std::fflush(stderr);
+                }
+            }
+
             if (!got) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -4646,7 +4959,7 @@ private:
             return;
         } else if (use_spi_path) {
             NfcHexLog::get().log_event("scan", "path spi");
-            push_log("> Scanning SPI NFC (ST25R3916)...");
+            push_log("> Scanning M5 NFC CAP (SPI)...");
             I2cCardInfo card;
             const bool card_ok = spi_dev->readCard(&card);
             if (card_ok && card.valid) {
@@ -5688,6 +6001,12 @@ private:
     std::thread nfc_unit_emu_start_thread_;
     std::thread nfc_unit_emu_thread_;
     std::atomic<bool> nfc_unit_emu_cancel_{false};
+    std::thread spi_emu_thread_;
+    std::atomic<bool> spi_emu_cancel_{false};
+    int spi_emu_profile_ = 0;  // 0=MFC 1K, 1=NTAG215, 2=NTAG216
+    std::vector<uint8_t> spi_emu_uid_;
+    uint16_t spi_emu_atqa_ = 0;
+    uint8_t spi_emu_sak_ = 0;
     std::atomic<bool> nfc_unit_emu_running_{false};
     ProtocolKind nfc_unit_emu_protocol_ = ProtocolKind::Iso14443A;
     int nfc_unit_emu_profile_ = 0;  // 0=NTAG213, 1=MFC 1K, 2=ISO15693

@@ -23,7 +23,7 @@ enum class TransportKind {
     UsbSerial,
     UartSerial,
     I2cBus,
-    SpiBus,   // SPI NFC HAT (ST25R3916)
+    SpiBus,   // SPI NFC device (M5 NFC CAP)
 };
 
 // What kind of device was identified on a port
@@ -36,7 +36,7 @@ enum class DeviceKind {
     OtherSerial,   // port opened, non-PN532 data received
     GroveNFC,      // Grove NFC 2 at I2C 0x48 (register-based, emulation supported)
     NFCUnit,       // M5Stack NFC Unit at I2C 0x50 (read-only on Linux)
-    ST25RNFC,      // ST25R3916 SPI NFC HAT
+    ST25RNFC,      // M5 NFC CAP (ST25R3916 over SPI)
 };
 
 inline const char *to_string(DeviceKind value)
@@ -50,7 +50,7 @@ inline const char *to_string(DeviceKind value)
     case DeviceKind::OtherSerial: return "Unknown Device";
     case DeviceKind::GroveNFC:    return "GroveNFC";
     case DeviceKind::NFCUnit:     return "NFC Unit";
-    case DeviceKind::ST25RNFC:    return "ST25R NFC";
+    case DeviceKind::ST25RNFC:    return "M5 NFC CAP";
     default:                      return "?";
     }
 }

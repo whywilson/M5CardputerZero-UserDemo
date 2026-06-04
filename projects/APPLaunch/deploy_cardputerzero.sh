@@ -28,7 +28,7 @@ REMOTE_BIN_DIR="${REMOTE_APP_ROOT}/bin"
 RFID_ROOT="${REPO_ROOT}/projects/RFID"
 RFID_BIN="${RFID_ROOT}/dist/M5CardputerZero-RFID"
 RFID_DESKTOP="${RFID_ROOT}/applications/rfid.desktop"
-RFID_ICON="${RFID_ROOT}/share/images/rfid.png"
+RFID_ICON="${RFID_ROOT}/share/images/ic-rfid.png"
 MFKEY_SRC="${RFID_ROOT}/mfkey32v2"
 MFKEY_DIST="${RFID_ROOT}/dist_mfkey"
 
@@ -168,8 +168,8 @@ _SSH "${DEVICE_USER}@${DEVICE_HOST}" "
   if [ -f '${REMOTE_STAGE}/rfid.desktop' ]; then
     echo '${DEVICE_PASS}' | sudo -S install -m 644 '${REMOTE_STAGE}/rfid.desktop' '${REMOTE_APP_ROOT}/applications/rfid.desktop'
   fi
-  if [ -f '${REMOTE_STAGE}/rfid.png' ]; then
-    echo '${DEVICE_PASS}' | sudo -S install -m 644 '${REMOTE_STAGE}/rfid.png' '${REMOTE_APP_ROOT}/share/images/rfid.png'
+  if [ -f '${REMOTE_STAGE}/ic-rfid.png' ]; then
+    echo '${DEVICE_PASS}' | sudo -S install -m 644 '${REMOTE_STAGE}/ic-rfid.png' '${REMOTE_APP_ROOT}/share/images/ic-rfid.png'
   fi
   if [ -f '${REMOTE_STAGE}/mfkey32v2' ]; then
     echo '${DEVICE_PASS}' | sudo -S install -m 755 '${REMOTE_STAGE}/mfkey32v2' '${REMOTE_BIN_DIR}/mfkey32v2'

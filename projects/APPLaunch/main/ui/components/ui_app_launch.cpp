@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <chrono>
 #include <atomic>
@@ -133,7 +134,7 @@ public:
     {
         // 固定图标，不允许用户修改
         app_list.emplace_back("RFID",
-                              img_path("rfid.png"), page_v<UINfcPage>);
+                              img_path("ic-rfid.png"), page_v<UINfcPage>);
         app_list.emplace_back("Python",
                               img_path("python_100.png"), "python3", true, false);
         app_list.emplace_back("STORE",
@@ -651,6 +652,29 @@ public:
         return -1;
     }
 
+    static int spi_profile_index_from_token(const std::string &token)
+    {
+        std::string out;
+        out.reserve(token.size());
+        for (unsigned char ch : token) {
+            if (std::isalnum(ch)) out.push_back(static_cast<char>(std::toupper(ch)));
+        }
+        if (out == "MIFARE" || out == "MIFARE1K" || out == "MIFARECLASSIC" || out == "MIFARECLASSIC1K" || out == "MFC" || out == "MFC1K") return 0;
+        if (out == "NTAG" || out == "NTAG215" || out == "ISO14443A" || out == "NFCA") return 1;
+        if (out == "NTAG216") return 2;
+        return -1;
+    }
+
+    static bool is_iso15693_token(const std::string &token)
+    {
+        std::string out;
+        out.reserve(token.size());
+        for (unsigned char ch : token) {
+            if (std::isalnum(ch)) out.push_back(static_cast<char>(std::toupper(ch)));
+        }
+        return (out == "ISO15693" || out == "NFCV");
+    }
+
     void write_nfc_automation_status(const std::string &line) const
     {
         std::ofstream out(kNfcAutomationStatusPath, std::ios::trunc);
@@ -707,6 +731,31 @@ public:
         return true;
     }
 
+    bool ensure_spi_connected_for_automation(const std::string &path, std::string *error)
+    {
+        const std::string spi_path = path.empty() ? "/dev/spidev0.2" : path;
+        auto conn = nfc_automation_service_.connection_state();
+        if (conn.connected &&
+            conn.endpoint.kind == nfc_app::TransportKind::SpiBus &&
+            conn.endpoint.path == spi_path) {
+            return true;
+        }
+
+        nfc_app::TransportEndpoint ep;
+        ep.kind = nfc_app::TransportKind::SpiBus;
+        ep.path = spi_path;
+        ep.label = "SPI " + spi_path;
+        nfc_automation_service_.select_spi_endpoint(ep);
+
+        if (!nfc_automation_service_.connect_current()) {
+            conn = nfc_automation_service_.connection_state();
+            if (error) *error = conn.detail.empty() ? "SPI connect failed" : conn.detail;
+            return false;
+        }
+        if (error) error->clear();
+        return true;
+    }
+
     void process_nfc_automation_command()
     {
         std::string command;
@@ -730,12 +779,23 @@ public:
             oss << "status connected=" << (conn.connected ? 1 : 0)
                 << " device=" << nfc_app::to_string(conn.device_kind)
                 << " profile=" << nfc_automation_service_.nfcunit_profile_label()
-                << " running=" << (nfc_automation_service_.nfcunit_emulation_running() ? 1 : 0);
+                << " running=" << (nfc_automation_service_.nfcunit_emulation_running() ? 1 : 0)
+                << " nfc_profile=" << nfc_automation_service_.nfcunit_profile_label()
+                << " nfc_running=" << (nfc_automation_service_.nfcunit_emulation_running() ? 1 : 0)
+                << " spi_profile=" << nfc_automation_service_.spi_profile_label()
+                << " spi_running=" << (nfc_automation_service_.spi_listener_active() ? 1 : 0)
+                << " spi_iso15693_emu=" << (nfc_automation_service_.spi_supports_iso15693_emulation() ? 1 : 0);
             emit_ok(oss.str());
             return;
         }
 
+        if (verb_upper == "SPI_CAPS") {
+            emit_ok(nfc_automation_service_.spi_caps_status_line());
+            return;
+        }
+
         if (verb_upper == "STOP") {
+            nfc_automation_service_.spi_stop_listener();
             const bool ok = nfc_automation_service_.grovenfc_deactivate();
             if (ok) emit_ok("stop emulation");
             else emit_err("stop failed");
@@ -754,6 +814,21 @@ public:
             }
             nfc_automation_service_.set_nfcunit_profile_index(profile);
             emit_ok("profile=" + nfc_automation_service_.nfcunit_profile_label());
+            return;
+        }
+
+        if (verb_upper == "SPI_PROFILE") {
+            if (is_iso15693_token(arg)) {
+                emit_err("SPI ISO15693 emulation requires transparent GPIO timing");
+                return;
+            }
+            const int profile = spi_profile_index_from_token(arg);
+            if (profile < 0) {
+                emit_err("unknown spi profile: " + arg);
+                return;
+            }
+            nfc_automation_service_.set_spi_profile_index(profile);
+            emit_ok("spi_profile=" + nfc_automation_service_.spi_profile_label());
             return;
         }
 
@@ -797,6 +872,56 @@ public:
             } else {
                 emit_err(status.empty() ? "scan failed" : status);
             }
+            return;
+        }
+
+        if (verb_upper == "SPI_RUN") {
+            std::istringstream args_ss(arg);
+            std::string token1;
+            std::string token2;
+            args_ss >> token1 >> token2;
+
+            int run_profile = -1;
+            bool run_iso15693 = false;
+            std::string spi_path = "/dev/spidev0.2";
+            if (!token1.empty()) {
+                const int p = spi_profile_index_from_token(token1);
+                if (p >= 0) {
+                    run_profile = p;
+                    if (!token2.empty()) spi_path = token2;
+                } else if (is_iso15693_token(token1)) {
+                    run_iso15693 = true;
+                    if (!token2.empty()) spi_path = token2;
+                } else {
+                    spi_path = token1;
+                }
+            }
+
+            std::string err;
+            if (!ensure_spi_connected_for_automation(spi_path, &err)) {
+                emit_err(err.empty() ? "SPI connect failed" : err);
+                return;
+            }
+            if (run_profile >= 0) {
+                nfc_automation_service_.set_spi_profile_index(run_profile);
+            }
+            if (run_iso15693) {
+                if (!nfc_automation_service_.spi_start_iso15693_emulation(&err)) {
+                    emit_err(err.empty() ? "SPI ISO15693 emulation unsupported" : err);
+                    return;
+                }
+                emit_ok("spi run profile=ISO15693 running=1");
+                return;
+            }
+            if (!nfc_automation_service_.spi_start_current_profile(&err)) {
+                emit_err(err.empty() ? "spi emu start failed" : err);
+                return;
+            }
+
+            std::ostringstream oss;
+            oss << "spi run profile=" << nfc_automation_service_.spi_profile_label()
+                << " running=" << (nfc_automation_service_.spi_listener_active() ? 1 : 0);
+            emit_ok(oss.str());
             return;
         }
 
@@ -888,15 +1013,52 @@ public:
 
         // SPI_EMU_START [uid_hex] [atqa_hex] [sak_hex] [spi_path]
         //   uid_hex : 8 or 14 hex digits (4 or 7 bytes)
-        //   atqa_hex: 4 hex digits (2 bytes, little-endian)
+        //   atqa_hex: 4 hex digits (e.g. 0004, 0042)
         //   sak_hex : 2 hex digits
         //   spi_path: optional, default /dev/spidev0.2
+        // Or SPI_EMU_START [profile] [spi_path], e.g. SPI_EMU_START NTAG216
         // Example: SPI_EMU_START 01020304 0004 08
         if (verb_upper == "SPI_EMU_START") {
             // Parse arguments: uid atqa sak [path]
             std::istringstream args_ss(arg);
             std::string uid_hex, atqa_hex, sak_hex, emu_path;
             args_ss >> uid_hex >> atqa_hex >> sak_hex >> emu_path;
+
+            if (is_iso15693_token(uid_hex)) {
+                const std::string iso_path = atqa_hex.empty() ? "/dev/spidev0.2" : atqa_hex;
+                std::string emu_err;
+                if (!ensure_spi_connected_for_automation(iso_path, &emu_err)) {
+                    emit_err(emu_err.empty() ? "SPI connect failed" : emu_err);
+                    return;
+                }
+                if (!nfc_automation_service_.spi_start_iso15693_emulation(&emu_err)) {
+                    emit_err(emu_err.empty() ? "SPI ISO15693 emulation unsupported" : emu_err);
+                    return;
+                }
+                emit_ok("spi emu started profile=ISO15693");
+                return;
+            }
+
+            const int profile = spi_profile_index_from_token(uid_hex);
+            if (profile >= 0) {
+                const std::string profile_path = atqa_hex.empty() ? "/dev/spidev0.2" : atqa_hex;
+                std::string emu_err;
+                if (!ensure_spi_connected_for_automation(profile_path, &emu_err)) {
+                    emit_err(emu_err.empty() ? "SPI connect failed" : emu_err);
+                    return;
+                }
+                nfc_automation_service_.set_spi_profile_index(profile);
+                if (!nfc_automation_service_.spi_start_current_profile(&emu_err)) {
+                    emit_err(emu_err.empty() ? "spi emu start failed" : emu_err);
+                    return;
+                }
+
+                std::ostringstream oss;
+                oss << "spi emu started profile=" << nfc_automation_service_.spi_profile_label();
+                emit_ok(oss.str());
+                return;
+            }
+
             if (emu_path.empty()) emu_path = "/dev/spidev0.2";
 
             auto hex_to_bytes = [](const std::string &hex) -> std::vector<uint8_t> {
@@ -922,20 +1084,18 @@ public:
                 return;
             }
 
-            const auto atqa_bytes = hex_to_bytes(atqa_hex);
-            const uint16_t atqa = static_cast<uint16_t>(atqa_bytes[0]) |
-                                  (static_cast<uint16_t>(atqa_bytes.size() > 1 ? atqa_bytes[1] : 0) << 8);
+            char *atqa_end = nullptr;
+            const unsigned long atqa_ul = std::strtoul(atqa_hex.c_str(), &atqa_end, 16);
+            if (atqa_end == nullptr || *atqa_end != '\0' || atqa_ul > 0xFFFFul) {
+                emit_err("SPI_EMU_START: invalid atqa value");
+                return;
+            }
+            const uint16_t atqa = static_cast<uint16_t>(atqa_ul);
             const uint8_t sak = hex_to_bytes(sak_hex)[0];
 
-            nfc_app::TransportEndpoint ep;
-            ep.kind  = nfc_app::TransportKind::SpiBus;
-            ep.path  = emu_path;
-            ep.label = "SPI " + emu_path;
-            nfc_automation_service_.select_spi_endpoint(ep);
-
-            if (!nfc_automation_service_.connect_current()) {
-                const auto conn = nfc_automation_service_.connection_state();
-                emit_err(conn.detail.empty() ? "SPI connect failed" : conn.detail);
+            std::string connect_err;
+            if (!ensure_spi_connected_for_automation(emu_path, &connect_err)) {
+                emit_err(connect_err.empty() ? "SPI connect failed" : connect_err);
                 return;
             }
 

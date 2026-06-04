@@ -452,7 +452,7 @@ public:
 #if defined(__linux__)
         for (auto &ep : probe_i2c_devices())
             endpoints.push_back(ep);
-        // Add SPI endpoints (ST25R3916 HAT)
+        // Add SPI endpoints (M5 NFC CAP)
         for (auto &ep : enumerate_spi_devices())
             endpoints.push_back(ep);
 #endif
@@ -473,7 +473,7 @@ public:
             TransportEndpoint ep;
             ep.kind      = TransportKind::SpiBus;
             ep.path      = std::string("/dev/") + name;
-            ep.label     = std::string("ST25R NFC ") + name;
+            ep.label     = std::string("M5 NFC CAP ") + name;
             ep.baud_rate = 0;
             result.push_back(ep);
         }
