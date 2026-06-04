@@ -324,6 +324,14 @@ static bool copy_dylib(const char *src, char *dst, size_t dst_size, int gen)
         fwrite(buf, 1, n, out);
     fclose(in);
     fclose(out);
+#ifdef __APPLE__
+    // macOS: re-sign the copy so dlopen doesn't trigger CS_KILL
+    {
+        char cmd[600];
+        snprintf(cmd, sizeof(cmd), "codesign -s - --force \"%s\" 2>/dev/null", dst);
+        system(cmd);
+    }
+#endif
     return true;
 }
 
