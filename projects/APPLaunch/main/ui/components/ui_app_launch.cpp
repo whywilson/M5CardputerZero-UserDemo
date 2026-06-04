@@ -460,18 +460,20 @@ public:
                 fprintf(stderr, "applications_load: skip %s (missing Name or Exec)\n", filepath.c_str());
                 continue;
             }
-            bool in_list = false;
-            for (const auto &it : app_list)
+            app *duplicate = nullptr;
+            for (auto &it : app_list)
             {
                 if ((!it.Exec.empty() && it.Exec == app_exec) || it.Name == app_name)
                 {
-                    in_list = true;
+                    duplicate = &it;
                     break;
                 }
             }
-            if (in_list)
+            if (duplicate)
             {
-                fprintf(stderr, "applications_load: skip %s (duplicate Name/Exec)\n", filepath.c_str());
+                // Keep launch behavior of built-in entries, but allow .desktop to override icon.
+                if (!app_icon.empty()) duplicate->Icon = app_icon;
+                fprintf(stderr, "applications_load: merged %s (duplicate Name/Exec, icon updated)\n", filepath.c_str());
                 continue;
             }
 
