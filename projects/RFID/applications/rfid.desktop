@@ -2,5 +2,5 @@
 Name=RFID
 Exec=/usr/share/APPLaunch/bin/M5CardputerZero-RFID
 Terminal=false
-Icon=share/images/rfid.png
+Icon=share/images/ic-rfid.png
 Type=Application

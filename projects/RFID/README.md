@@ -41,7 +41,7 @@ The script creates a package layout compatible with the APPLaunch guide:
 - DEBIAN/prerm
 - usr/share/APPLaunch/applications/rfid.desktop
 - usr/share/APPLaunch/bin/M5CardputerZero-RFID
-- usr/share/APPLaunch/share/images/rfid.png
+- usr/share/APPLaunch/share/images/ic-rfid.png
 
 Build and package:
 
