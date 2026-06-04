@@ -4947,7 +4947,7 @@ private:
             service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso14443A;
         const int emu_slot = (nfc_unit_mode || st25r_mode) ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
-        const int n_opts = pn532_ndef_menu ? 3 :
+        const int n_opts = pn532_ndef_menu ? 1 :
                           (nfc_unit_mode ? (nfc_unit_url_mode ? 5 : 4)
                                          : (st25r_mode ? 4 : 3));
         switch (key) {
