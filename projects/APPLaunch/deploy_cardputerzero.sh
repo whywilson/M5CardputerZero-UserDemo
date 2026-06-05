@@ -28,8 +28,8 @@ REMOTE_BIN_DIR="${REMOTE_APP_ROOT}/bin"
 RFID_ROOT="${REPO_ROOT}/projects/RFID"
 RFID_BIN="${RFID_ROOT}/dist/M5CardputerZero-RFID"
 RFID_DESKTOP="${RFID_ROOT}/applications/rfid.desktop"
-RFID_ICON="${RFID_ROOT}/share/images/ic_rfid.png"
-MFKEY_SRC="${RFID_ROOT}/mfkey32v2"
+RFID_ICON="${SCRIPT_DIR}/APPLaunch/share/images/ic_rfid.png"
+MFKEY_SRC="${RFID_ROOT}/main/tools/mfkey"
 MFKEY_DIST="${RFID_ROOT}/dist_mfkey"
 
 detect_jobs() {
@@ -93,6 +93,13 @@ fi
 
 echo "==> Built artifact: ${SCRIPT_DIR}/dist/M5CardputerZero-APPLaunch"
 ls -lh "${SCRIPT_DIR}/dist/M5CardputerZero-APPLaunch"
+
+if [[ -f "${RFID_ICON}" ]]; then
+  mkdir -p "${SCRIPT_DIR}/dist/APPLaunch/share/images"
+  install -m 644 "${RFID_ICON}" "${SCRIPT_DIR}/dist/APPLaunch/share/images/ic_rfid.png"
+  install -m 644 "${RFID_ICON}" "${SCRIPT_DIR}/dist/APPLaunch/share/images/rfid.png"
+  install -m 644 "${RFID_ICON}" "${SCRIPT_DIR}/dist/APPLaunch/share/images/ic-rfid.png"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 1b — Cross-compile mfkey tools if not already built
@@ -158,6 +165,13 @@ _SSH "${DEVICE_USER}@${DEVICE_HOST}" "
   echo '${DEVICE_PASS}' | sudo -S install -m 755 '${REMOTE_STAGE}/M5CardputerZero-APPLaunch' '${REMOTE_BIN_DIR}/M5CardputerZero-APPLaunch'
   if [ -d '${REMOTE_STAGE}/APPLaunch' ]; then
     echo '${DEVICE_PASS}' | sudo -S cp -a '${REMOTE_STAGE}/APPLaunch/.' '${REMOTE_APP_ROOT}/'
+  fi
+  # Keep legacy icon names as aliases to the current RFID icon so old desktop/cache paths cannot show stale art.
+  if [ -f '${REMOTE_STAGE}/ic_rfid.png' ]; then
+    echo '${DEVICE_PASS}' | sudo -S mkdir -p '${REMOTE_APP_ROOT}/share/images'
+    echo '${DEVICE_PASS}' | sudo -S install -m 644 '${REMOTE_STAGE}/ic_rfid.png' '${REMOTE_APP_ROOT}/share/images/ic_rfid.png'
+    echo '${DEVICE_PASS}' | sudo -S install -m 644 '${REMOTE_STAGE}/ic_rfid.png' '${REMOTE_APP_ROOT}/share/images/rfid.png'
+    echo '${DEVICE_PASS}' | sudo -S rm -f '${REMOTE_APP_ROOT}/share/rfid.png' '${REMOTE_APP_ROOT}/share/ic-rfid.png' '${REMOTE_APP_ROOT}/share/ic_rfid.png'
   fi
   if [ -f '${REMOTE_STAGE}/store_cache_sync.py' ]; then
     echo '${DEVICE_PASS}' | sudo -S install -m 644 '${REMOTE_STAGE}/store_cache_sync.py' '${REMOTE_BIN_DIR}/store_cache_sync.py'
