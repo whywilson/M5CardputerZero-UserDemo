@@ -7,14 +7,14 @@ with open(env["PROJECT_TOOL_S"]) as f:
 component_dir = env.get("component_dir", os.getcwd())
 projects_dir = os.path.abspath(os.path.join(component_dir, "..", ".."))
 emulator_vendor = os.path.join(projects_dir, "CardputerZero-Emulator", "vendor")
-shared_nfc_root = os.path.join(projects_dir, "shared_nfc")
+nfc_shared_root = os.path.join(component_dir, "ui", "components")
 
 SRCS = Glob("src/*.c*")
 SRCS += [os.path.join(component_dir, "hal", "hal_paths_rfid.c")]
 INCLUDE = [
     ADir("."),
     ADir("include"),
-    shared_nfc_root,
+    nfc_shared_root,
     emulator_vendor,
 ]
 PRIVATE_INCLUDE = []

@@ -88,7 +88,7 @@ python3 tools/package_deb.py --build-if-missing --maintainer "yourname <you@exam
 
 NFC read/write stack is now shared between APPLaunch and RFID under:
 
-- ../shared_nfc/nfc/
+- main/ui/components/nfc/
 
 Both projects include this shared directory in their build scripts, and no
 longer keep separate per-project NFC component copies.

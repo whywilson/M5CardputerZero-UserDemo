@@ -11,7 +11,7 @@ with open(env['PROJECT_TOOL_S']) as f:
 
 rootfs_path=os.environ.get("CONFIG_TOOLCHAIN_SYSROOT", "")
 projects_dir = os.path.abspath(os.path.join(env['component_dir'], '..', '..'))
-shared_nfc_root = os.path.join(projects_dir, 'shared_nfc')
+nfc_shared_root = os.path.join(projects_dir, 'RFID', 'main', 'ui', 'components')
 
 def wget_github(url):
     repo = _parse.parse("{}://{}/{}/{}.git", url)
@@ -80,7 +80,7 @@ print('-- Launcher git commit: %s' % _git_commit)
 SRCS += Glob('src/*.c*')
 SRCS += append_srcs_dir(ADir('ui'))
 # add includes
-INCLUDE += [ADir('.'), ADir('include'), shared_nfc_root]
+INCLUDE += [ADir('.'), ADir('include'), nfc_shared_root]
 
 # add requirements
 REQUIREMENTS += ['lvgl_component', 'pthread']
