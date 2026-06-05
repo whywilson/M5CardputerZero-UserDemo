@@ -574,6 +574,25 @@ private:
             return;
         }
 
+        // Global Ctrl+S: save current Read dump result into Saved records.
+        // This must run before the generic KEY_S shortcut (which triggers Scan on Read tab).
+        if ((mods & KBD_MOD_CTRL) && raw_key == KEY_S && current_tab_ == Tab::Read) {
+            std::string save_error;
+            if (service_.save_last_scan(&save_error)) {
+                refresh_saved_records();
+                show_toast("Saved");
+                ui_message_ = "Record saved to JSON";
+                if (modal_ == Modal::ReadMenu || modal_ == Modal::PostScan) {
+                    modal_ = Modal::None;
+                    modal_idx_ = 0;
+                }
+            } else {
+                ui_message_ = save_error.empty() ? "Save failed" : save_error;
+            }
+            render_all();
+            return;
+        }
+
         // Global Ctrl+L: toggle HexLog overlay (works from any tab/state)
         if ((mods & KBD_MOD_CTRL) && raw_key == KEY_L) {
             if (modal_ == Modal::HexLog) {
@@ -2226,9 +2245,10 @@ private:
             const std::string sak_str  = find_identity_ci("SAK");
 
             lv_obj_t *info = create_panel(parent, 0, 20, 320, 13, 0x0C1810);
-            // Unified single-line header for all readers: type + uid + SAK + ATQA
-            const std::string card_line =
-                type_text + " " + uid_clean + " SAK:" + sak_str + " ATQA:" + atqa_str;
+            std::string card_line = type_text + " " + uid_clean;
+            if (tag.protocol != nfc_app::ProtocolKind::Iso15693) {
+                card_line += " SAK:" + sak_str + " ATQA:" + atqa_str;
+            }
             create_text(info, 4, 2, to_compact(card_line, 52).c_str(), 0x00FF88, 10);
             log_y = 34;
             log_h = 86;
@@ -3968,7 +3988,7 @@ private:
                 create_text(parent, 8, 22, "(1) Set sniffer UID (optional)", 0xF7A600, 11);
                 create_text(parent, 8, 38, "Target card UID (8 hex chars):", 0xD8D8D8, 11);
                 const std::string disp = mfkey_uid_input_.empty() ? "_" : mfkey_uid_input_ + "_";
-                create_text(parent, 8, 54, disp.c_str(), 0x00FFAA, 12);
+                create_text_mono(parent, 8, 54, disp.c_str(), 0x00FFAA, 12);
                 create_text(parent, 8, 74, "Leave empty to use device default UID", 0x888888, 10);
                 create_text(parent, 8, 90, "Bsp:del  Enter:confirm  ESC:back", 0x7A7A7A, 10);
                 break;
@@ -3978,7 +3998,7 @@ private:
                 if (mfkey_uid_input_.empty()) {
                     create_text(parent, 8, 38, "No UID set. Device uses its own UID.", 0xD8D8D8, 11);
                 } else {
-                    create_text(parent, 8, 38, (std::string("UID: ") + mfkey_uid_input_).c_str(), 0xD8D8D8, 11);
+                    create_text_mono(parent, 8, 38, (std::string("UID: ") + mfkey_uid_input_).c_str(), 0xD8D8D8, 11);
                 }
                 create_text(parent, 8, 54, "Approach reader, capture auth sessions.", 0xD8D8D8, 11);
                 create_text(parent, 8, 70, "Press Enter when done sniffing.", 0x8DB6FF, 11);
@@ -4066,7 +4086,7 @@ private:
             const std::string kd = res.key_hex.empty() ? "(not found)" : res.key_hex;
             std::snprintf(val, sizeof(val), "%s", kd.c_str());
             create_text(row, 4, 1, col, sel ? 0x000000 : 0xFFFFFF, 10);
-            create_text(row, 80, 1, val, sel ? 0x2F2F2F : 0x8DB6FF, 10);
+            create_text_mono(row, 80, 1, val, sel ? 0x2F2F2F : 0x8DB6FF, 10);
         }
         create_text(parent, 6, 92, "Enter:import  S:save all  R:retry  ESC:back", 0x7A7A7A, 10);
         // Save-to-file filename input overlay
@@ -4096,7 +4116,7 @@ private:
             const uint32_t col_key = (mifare_key_field_idx_ == 1) ? 0xFFFF00 : 0xD8D8D8;
             const uint32_t col_type = (mifare_key_field_idx_ == 2) ? 0xFFFF00 : 0x8DB6FF;
             create_text(parent, 6, 22, (std::string("Label: ") + to_compact(mifare_key_edit_.label.empty() ? "(unnamed)" : mifare_key_edit_.label, 18)).c_str(), col_label, 11);
-            create_text(parent, 6, 38, (std::string("Key: ") + (mifare_key_edit_.key_hex.empty() ? "_" : mifare_key_edit_.key_hex + "_")).c_str(), col_key, 11);
+            create_text_mono(parent, 6, 38, (std::string("Key: ") + (mifare_key_edit_.key_hex.empty() ? "_" : mifare_key_edit_.key_hex + "_")).c_str(), col_key, 11);
             create_text(parent, 6, 54, (std::string("Type: Key ") + nfc_app::to_string(mifare_key_edit_.type)).c_str(), col_type, 11);
             create_text(parent, 6, 70, mifare_key_creating_ ? "New key entry" : "Edit selected key", 0x7A7A7A, 10);
             create_text(parent, 6, 92, "U/D field  Tab type  Enter save  ESC back", 0x7A7A7A, 10);
@@ -4168,7 +4188,7 @@ private:
                         char idx_buf[8];
                         std::snprintf(idx_buf, sizeof(idx_buf), "%03d", idx + 1);
                         create_text(row, 4, 3, idx_buf, sel ? 0x000000 : 0x7A7A7A, 10);
-                        create_text(row, 40, 3, to_compact(disp, 24).c_str(), sel ? 0x000000 : 0x8DB6FF, 10);
+                        create_text_mono(row, 40, 3, to_compact(disp, 24).c_str(), sel ? 0x000000 : 0x8DB6FF, 10);
                     }
                     create_text(parent, 6, 92, "Hex edit  Enter:+line  Del:line  S:save", 0x7A7A7A, 10);
                     create_text(parent, 6, 104, "U/D line  Bsp:erase  ESC back", 0x7A7A7A, 10);
@@ -4197,7 +4217,7 @@ private:
                     lv_obj_set_style_bg_color(row, lv_color_hex(sel ? 0x00D2FF : 0x181818), LV_PART_MAIN | LV_STATE_DEFAULT);
                     lv_obj_set_style_bg_opa(row, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
                     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-                    create_text(row, 4, 3, key_file_keys_[static_cast<size_t>(idx)].c_str(), sel ? 0x000000 : 0x8DB6FF, 10);
+                    create_text_mono(row, 4, 3, key_file_keys_[static_cast<size_t>(idx)].c_str(), sel ? 0x000000 : 0x8DB6FF, 10);
                 }
                 char countbuf[32];
                 std::snprintf(countbuf, sizeof(countbuf), "%d keys", total);
@@ -4234,7 +4254,7 @@ private:
                 const std::string head = (key.enabled ? "[on] " : "[off] ") + key.label;
                 const std::string tail = std::string("K") + nfc_app::to_string(key.type) + " " + key.key_hex;
                 create_text(entry, 4, 1, to_compact(head, 18).c_str(), selected ? 0x000000 : 0xFFFFFF, 10);
-                create_text(entry, 4, 9, to_compact(tail, 18).c_str(), selected ? 0x2F2F2F : 0x8DB6FF, 10);
+                create_text_mono(entry, 4, 9, to_compact(tail, 18).c_str(), selected ? 0x2F2F2F : 0x8DB6FF, 10);
             }
         }
         create_text(parent, 6, 92, "U/D select  Enter edit  T on/off  Bsp del  Tab files  ESC back", 0x7A7A7A, 10);
@@ -4418,6 +4438,15 @@ private:
             font_size >= 8  ? &lv_font_montserrat_8 :
                               &lv_font_unscii_8,
             LV_PART_MAIN | LV_STATE_DEFAULT);
+        return label;
+    }
+
+    lv_obj_t *create_text_mono(lv_obj_t *parent, int x, int y, const char *text, uint32_t color, int font_size)
+    {
+        lv_obj_t *label = create_text(parent, x, y, text, color, font_size);
+        const lv_font_t *mono_font = &lv_font_unscii_8;
+        if (font_size >= 12 && g_font_mono_12 != nullptr) mono_font = g_font_mono_12;
+        lv_obj_set_style_text_font(label, mono_font, LV_PART_MAIN | LV_STATE_DEFAULT);
         return label;
     }
 

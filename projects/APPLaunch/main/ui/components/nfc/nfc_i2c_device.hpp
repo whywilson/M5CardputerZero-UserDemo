@@ -2217,7 +2217,7 @@ private:
             for (uint_fast8_t pos = 4; pos < 8; ++pos) {
                 const uint8_t i = static_cast<uint8_t>(pos - 4);
                 const uint8_t v = static_cast<uint8_t>((ar >> (i << 3)) & 0xFFU);
-                out[pos] = static_cast<uint8_t>(step8(0x00, false) ^ v);
+                out[pos] = static_cast<uint8_t>(step8(v, false) ^ v);
                 parity |= static_cast<uint8_t>((parity_keystream_bit() ^ oddparity8(v)) & 0x01U) << pos;
             }
             return parity;
@@ -2600,7 +2600,7 @@ private:
         for (uint8_t i = 0; i < 4; ++i) {
             reader_prng = prng_successor_local(reader_prng, 8U);
             const uint8_t plain_byte = static_cast<uint8_t>(reader_prng & 0xFFU);
-            ab[4U + i] = static_cast<uint8_t>(crypto.step8(0x00, false) ^ plain_byte);
+            ab[4U + i] = static_cast<uint8_t>(crypto.step8(plain_byte, false) ^ plain_byte);
             parity |= static_cast<uint8_t>((crypto.parity_keystream_bit() ^ Crypto1Local::oddparity8(plain_byte)) & 0x01U) << (4U + i);
         }
         const uint32_t expected_at = prng_successor_local(reader_prng, 32U);
@@ -2675,7 +2675,7 @@ private:
 
         uint8_t at2[4] = {0};
         for (int i = 0; i < 4; ++i) {
-            at2[i] = static_cast<uint8_t>(ba[i] ^ crypto.step8(0, false));
+            at2[i] = static_cast<uint8_t>(ba[i] ^ crypto.step8(ba[i], true));
             const uint8_t plain_parity = static_cast<uint8_t>(crypto.parity_keystream_bit() ^ ba_parity[i]);
             if (Crypto1Local::oddparity8(at2[i]) != plain_parity) {
                 char pmsg[48];
@@ -3895,9 +3895,51 @@ private:
                               decoded[0], decoded[1], uid15.c_str());
                 hexlog.log_event("NFC-I2C", msg15);
             }
+            std::string dsfid_hex = "00";
+            std::string afi_hex = "00";
+            std::string ic_ref_hex;
+            uint16_t block_count = 0;
+            uint8_t block_bytes = 0;
+            bool has_block_layout = false;
+
+            uint8_t sys_req[10] = {0x22, 0x2B};
+            for (size_t i = 0; i < 8; ++i) sys_req[2 + i] = decoded[2 + i];
+            uint8_t sys_dec[64] = {0};
+            uint8_t sys_len = 0;
+            if (st25r_nfcv_transceive(sys_req, sizeof(sys_req), sys_dec, sys_len, 100) &&
+                sys_len >= 10 && (sys_dec[0] & 0x01) == 0) {
+                const uint8_t info_flags = sys_dec[1];
+                size_t idx = 2 + 8;  // response_flags + info_flags + UID(LSB)
+
+                auto hex2 = [](uint8_t v) {
+                    char buf[3];
+                    std::snprintf(buf, sizeof(buf), "%02X", v);
+                    return std::string(buf);
+                };
+
+                if ((info_flags & 0x01) && idx < sys_len) dsfid_hex = hex2(sys_dec[idx++]);
+                if ((info_flags & 0x02) && idx < sys_len) afi_hex = hex2(sys_dec[idx++]);
+                if ((info_flags & 0x04) && idx + 1 < sys_len) {
+                    const uint8_t blocks_minus_one = sys_dec[idx++];
+                    const uint8_t block_size_raw = sys_dec[idx++];
+                    block_count = static_cast<uint16_t>(blocks_minus_one) + 1;
+                    block_bytes = static_cast<uint8_t>(block_size_raw & 0x1F) + 1;
+                    has_block_layout = true;
+                }
+                if ((info_flags & 0x08) && idx < sys_len) ic_ref_hex = hex2(sys_dec[idx++]);
+            }
+
             card.uid      = uid15;
             card.protocol = "ISO15693";
-            card.detail   = "ISO15693 Tag";
+            {
+                std::string detail = "ISO15693 Tag DSFID:" + dsfid_hex + ", AFI:" + afi_hex;
+                if (!ic_ref_hex.empty()) detail += ", IC Reference:" + ic_ref_hex;
+                if (has_block_layout) {
+                    detail += ", Block size:" + std::to_string(block_count);
+                    detail += ", Block bytes:" + std::to_string(block_bytes);
+                }
+                card.detail = detail;
+            }
             card.valid    = true;
             card.atqa_hex.clear();
             card.sak_hex.clear();

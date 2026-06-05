@@ -4799,19 +4799,58 @@ private:
             return out;
         };
 
-        auto emit_scan_summary = [&](const std::string &protocol,
-                                     const std::string &uid,
-                                     const std::string &type,
-                                     const std::string &atqa,
-                                     const std::string &sak,
-                                     const std::string &magic_type) {
+        auto extract_detail_field_text = [&](const std::string &detail, const char *key) -> std::string {
+            if (!key || !*key || detail.empty()) return {};
+            const std::string key_token = to_upper(std::string(key) + ":");
+            const std::string detail_up = to_upper(detail);
+            const size_t pos = detail_up.find(key_token);
+            if (pos == std::string::npos) return {};
+
+            size_t start = pos + key_token.size();
+            while (start < detail.size() && std::isspace(static_cast<unsigned char>(detail[start]))) ++start;
+            size_t end = start;
+            while (end < detail.size()) {
+                const char ch = detail[end];
+                if (ch == ',' || ch == ';' || ch == '|' || ch == '\r' || ch == '\n') break;
+                ++end;
+            }
+
+            while (end > start && std::isspace(static_cast<unsigned char>(detail[end - 1]))) --end;
+            if (end <= start) return {};
+            return detail.substr(start, end - start);
+        };
+
+        auto emit_scan_summary = [&](const TagInfo &tag) {
+            const std::string protocol = to_string(tag.protocol);
+            const std::string uid = tag.uid;
+            const std::string type = tag.tag_type;
             push_log("Result: Tag Found");
             push_log(std::string("Protocol: ") + protocol);
             push_log("UID: " + uid);
             if (!type.empty()) push_log("Type: " + type);
 
-            const std::string atqa_norm = normalize_identity_hex(atqa);
-            const std::string sak_norm = normalize_identity_hex(sak);
+            if (tag.protocol == ProtocolKind::Iso15693) {
+                const std::string afi = normalize_identity_hex(find_identity(tag, "AFI"));
+                const std::string dsfid = normalize_identity_hex(find_identity(tag, "DSFID"));
+                std::string ic_ref = normalize_identity_hex(find_identity(tag, "IC_REF"));
+                if (ic_ref.empty()) ic_ref = normalize_identity_hex(find_identity(tag, "IC Reference"));
+
+                std::string block_size = find_identity(tag, "BLOCK_SIZE");
+                if (block_size.empty()) block_size = find_identity(tag, "BLOCK_COUNT");
+                const std::string block_bytes = find_identity(tag, "BLOCK_BYTES");
+
+                push_log(std::string("AFI: ") + (afi.empty() ? "-" : ("0x" + afi)));
+                push_log(std::string("DSFID: ") + (dsfid.empty() ? "-" : ("0x" + dsfid)));
+                push_log(std::string("IC Reference: ") + (ic_ref.empty() ? "-" : ("0x" + ic_ref)));
+                push_log(std::string("Block size: ") + (block_size.empty() ? "-" : block_size));
+                if (!block_bytes.empty()) {
+                    push_log(std::string("Block bytes: ") + block_bytes);
+                }
+                return;
+            }
+
+            const std::string atqa_norm = normalize_identity_hex(find_identity(tag, "ATQA"));
+            const std::string sak_norm = normalize_identity_hex(find_identity(tag, "SAK"));
             push_log(std::string("ATQA: ") + (atqa_norm.empty() ? "-" : atqa_norm));
             push_log(std::string("SAK: ") + (sak_norm.empty() ? "-" : sak_norm));
 
@@ -4830,7 +4869,7 @@ private:
                   type_up.find("4K") != std::string::npos ||
                   type_up.find("MINI") != std::string::npos));
             if (is_mfc_family) {
-                push_log(std::string("MAGIC: ") + (magic_type.empty() ? "Normal" : magic_type));
+                push_log(std::string("MAGIC: ") + (tag.magic_type.empty() ? "Normal" : tag.magic_type));
             }
         };
 
@@ -4920,19 +4959,33 @@ private:
                 tag.tag_type = i2c_protocol_to_tag_type(card.protocol);
                 tag.magic_type = card.magic_type;
                 tag.raw_data.clear();
-                if (!card.atqa_hex.empty()) tag.identity_fields["ATQA"] = card.atqa_hex;
-                if (!card.sak_hex.empty()) tag.identity_fields["SAK"] = card.sak_hex;
 
-                const std::string detail_atqa = !card.atqa_hex.empty()
-                    ? card.atqa_hex : extract_detail_field_hex(card.detail, "ATQA");
-                const std::string detail_sak = !card.sak_hex.empty()
-                    ? card.sak_hex : extract_detail_field_hex(card.detail, "SAK");
-                emit_scan_summary(to_string(tag.protocol),
-                                  tag.uid,
-                                  tag.tag_type,
-                                  detail_atqa,
-                                  detail_sak,
-                                  tag.magic_type);
+                if (tag.protocol == ProtocolKind::Iso15693) {
+                    tag.identity_fields.erase("ATQA");
+                    tag.identity_fields.erase("SAK");
+
+                    const std::string dsfid = extract_detail_field_hex(card.detail, "DSFID");
+                    const std::string afi = extract_detail_field_hex(card.detail, "AFI");
+                    const std::string ic_ref = extract_detail_field_hex(card.detail, "IC Reference");
+                    const std::string block_size = extract_detail_field_text(card.detail, "Block size");
+                    const std::string block_bytes = extract_detail_field_text(card.detail, "Block bytes");
+                    if (!dsfid.empty()) tag.identity_fields["DSFID"] = dsfid;
+                    if (!afi.empty()) tag.identity_fields["AFI"] = afi;
+                    if (!ic_ref.empty()) tag.identity_fields["IC_REF"] = ic_ref;
+                    if (!block_size.empty()) tag.identity_fields["BLOCK_SIZE"] = block_size;
+                    if (!block_bytes.empty()) tag.identity_fields["BLOCK_BYTES"] = block_bytes;
+                    if (tag.identity_fields.find("DSFID") == tag.identity_fields.end()) tag.identity_fields["DSFID"] = "00";
+                    if (tag.identity_fields.find("AFI") == tag.identity_fields.end()) tag.identity_fields["AFI"] = "00";
+                } else {
+                    const std::string detail_atqa = !card.atqa_hex.empty()
+                        ? card.atqa_hex : extract_detail_field_hex(card.detail, "ATQA");
+                    const std::string detail_sak = !card.sak_hex.empty()
+                        ? card.sak_hex : extract_detail_field_hex(card.detail, "SAK");
+                    if (!detail_atqa.empty()) tag.identity_fields["ATQA"] = detail_atqa;
+                    if (!detail_sak.empty()) tag.identity_fields["SAK"] = detail_sak;
+                }
+
+                emit_scan_summary(tag);
                 emit_scan_tail();
 
                 const std::string src = dev->is_nfc_unit() ? "nfc_unit" : "grovenfc";
@@ -4991,14 +5044,16 @@ private:
                     }
                 }
 
-                if (!card.atqa_hex.empty()) tag.identity_fields["ATQA"] = card.atqa_hex;
-                if (!card.sak_hex.empty()) tag.identity_fields["SAK"] = card.sak_hex;
-                emit_scan_summary(to_string(tag.protocol),
-                                  tag.uid,
-                                  tag.tag_type,
-                                  card.atqa_hex,
-                                  card.sak_hex,
-                                  tag.magic_type);
+                if (tag.protocol == ProtocolKind::Iso15693) {
+                    tag.identity_fields.erase("ATQA");
+                    tag.identity_fields.erase("SAK");
+                    if (tag.identity_fields.find("DSFID") == tag.identity_fields.end()) tag.identity_fields["DSFID"] = "00";
+                    if (tag.identity_fields.find("AFI") == tag.identity_fields.end()) tag.identity_fields["AFI"] = "00";
+                } else {
+                    if (!card.atqa_hex.empty()) tag.identity_fields["ATQA"] = card.atqa_hex;
+                    if (!card.sak_hex.empty()) tag.identity_fields["SAK"] = card.sak_hex;
+                }
+                emit_scan_summary(tag);
                 emit_scan_tail();
                 record = make_record_from_tag(tag, endpoint, false, "st25r");
                 success = true;
@@ -5027,14 +5082,7 @@ private:
 
         if (endpoint.kind == TransportKind::Mock) {
             record = build_mock_record(endpoint);
-            const std::string atqa = find_identity(record.tag, "ATQA");
-            const std::string sak = find_identity(record.tag, "SAK");
-            emit_scan_summary(to_string(record.tag.protocol),
-                              record.tag.uid,
-                              record.tag.tag_type,
-                              atqa,
-                              sak,
-                              record.tag.magic_type);
+            emit_scan_summary(record.tag);
             emit_scan_tail();
             success = true;
         } else {
@@ -5077,6 +5125,14 @@ private:
                 if (!real_ok) error = err15;
             }
             if (real_ok) {
+                if (tag.protocol == ProtocolKind::Iso15693) {
+                    tag.identity_fields.erase("ATQA");
+                    tag.identity_fields.erase("SAK");
+                    tag.magic_type.clear();
+                    if (find_identity(tag, "DSFID").empty()) tag.identity_fields["DSFID"] = "00";
+                    if (find_identity(tag, "AFI").empty()) tag.identity_fields["AFI"] = "00";
+                }
+
                 auto is_mfc_like = [&]() {
                     if (tag.protocol == ProtocolKind::MifareClassic) return true;
                     const std::string type_up = to_upper(tag.tag_type);
@@ -5108,14 +5164,7 @@ private:
                     }
                 }
 
-                const std::string atqa = find_identity(tag, "ATQA");
-                const std::string sak = find_identity(tag, "SAK");
-                emit_scan_summary(to_string(tag.protocol),
-                                  tag.uid,
-                                  tag.tag_type,
-                                  atqa,
-                                  sak,
-                                  tag.magic_type);
+                emit_scan_summary(tag);
 
                 for (const auto &kv : tag.identity_fields) {
                     if (equals_ci(kv.first, "ATQA") || equals_ci(kv.first, "SAK") ||
