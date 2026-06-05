@@ -1,15 +1,18 @@
 {
-  "package_name": "rfid",
-  "version": "0.1",
-  "app_name": "RFID",
-  "bin_name": "M5CardputerZero-RFID",
-  "icon": "share/images/ic_rfid.png",
-  "description": "CardputerZero RFID Independent Application",
   "title": "RFID",
   "summary": "Scan, dump, emulate and manage NFC/UHF tags",
+  "description": "RFID standalone app for CardputerZero. Supports READ/SAVED/EMU/TOOLS workflow, NFC Unit, PN532 and PN532Killer scenarios.",
+  "locales": {
+    "zh-CN": {
+      "title": "RFID",
+      "summary": "NFC/UHF 扫描、Dump、模拟与工具集"
+    }
+  },
   "categories": ["Utilities", "Development"],
   "license": "MIT",
   "source_repo": "https://github.com/wilson-elechouse/M5CardputerZero-UserDemo",
+  "icon": "share/images/ic_rfid.png",
+  "screenshots": ["screenshots/01.png"],
   "permissions": {
     "keyboard_input": true,
     "external_hardware": true,

@@ -46,6 +46,7 @@ enum class PendingOp {
 
 struct RfidReadUi {
     nfc_app::NfcDeviceService service;
+    lv_obj_t *tabview = nullptr;
     lv_obj_t *endpoint_label = nullptr;
     lv_obj_t *status_label = nullptr;
     lv_obj_t *log_label = nullptr;
@@ -68,10 +69,39 @@ struct RfidReadUi {
     bool emu_start_result_seen = false;
 };
 
+constexpr uint32_t CTRL_S = 0x13; // ASCII Ctrl+S
+constexpr uint32_t CTRL_L = 0x0C; // ASCII Ctrl+L
+
+enum class ShortcutTab {
+    Read = 0,
+    Saved = 1,
+    Emu = 2,
+    Tools = 3,
+};
+
 const char *getenv_default(const char *name, const char *fallback)
 {
     const char *value = std::getenv(name);
     return value ? value : fallback;
+}
+
+void configure_rfid_storage_paths()
+{
+    const char *base_dir = std::getenv("M5CZ_RFID_APP_DIR");
+    if (!base_dir || !base_dir[0]) {
+        if (::access("/usr/share/APPLaunch/apps/rfid", F_OK) == 0) {
+            base_dir = "/usr/share/APPLaunch/apps/rfid";
+        } else {
+            base_dir = ".";
+        }
+    }
+
+    std::string root = std::string(base_dir) + "/nfc_data";
+    std::string records = std::string(base_dir) + "/share/nfc/records";
+    std::string keys = std::string(base_dir) + "/share/nfc/keys";
+    setenv("M5CZ_NFC_ROOT_DIR", root.c_str(), 1);
+    setenv("M5CZ_NFC_RECORDS_DIR", records.c_str(), 1);
+    setenv("M5CZ_NFC_KEYS_DIR", keys.c_str(), 1);
 }
 
 void on_signal(int)
@@ -308,6 +338,42 @@ void apply_pn532killer_slot_profile(RfidReadUi *ui, const char *action)
     append_log(ui, std::string("OK ") + action + ": "
         + current_protocol_text(ui->service) + " slot " + std::to_string(slot));
     set_status(ui, "EMU slot/protocol applied");
+}
+
+std::string scan_status_text(const nfc_app::SavedRecord &record)
+{
+    const std::string uid = record.tag.uid.empty() ? "-" : record.tag.uid;
+    const std::string type = record.tag.tag_type.empty() ? "Unknown" : record.tag.tag_type;
+
+    // ISO15693 cards should not display NFC-A identity fields like ATQA/SAK.
+    if (record.tag.protocol == nfc_app::ProtocolKind::Iso15693) {
+        return std::string("ISO15693 UID=") + uid + " [" + type + "]";
+    }
+
+    auto find_identity = [&](const char *key) -> std::string {
+        if (!key || !*key) return "";
+        std::string key_up(key);
+        std::transform(key_up.begin(), key_up.end(), key_up.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        for (const auto &kv : record.tag.identity_fields) {
+            std::string kk = kv.first;
+            std::transform(kk.begin(), kk.end(), kk.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+            if (kk == key_up) return kv.second;
+        }
+        return "";
+    };
+
+    const std::string atqa = find_identity("ATQA");
+    const std::string sak = find_identity("SAK");
+    std::string text = "UID=" + uid + " [" + type + "]";
+    if (!atqa.empty() || !sak.empty()) {
+        text += " ";
+        if (!atqa.empty()) text += "ATQA=" + atqa;
+        if (!atqa.empty() && !sak.empty()) text += " ";
+        if (!sak.empty()) text += "SAK=" + sak;
+    }
+    return text;
 }
 
 void refresh_emu_label(RfidReadUi *ui)
@@ -903,6 +969,480 @@ void on_tools_import_result(lv_event_t *e)
     refresh_tools_label(ui);
 }
 
+ShortcutTab active_tab(const RfidReadUi *ui)
+{
+    if (!ui || !ui->tabview) return ShortcutTab::Read;
+    const uint32_t idx = lv_tabview_get_tab_active(ui->tabview);
+    switch (idx) {
+    case 1: return ShortcutTab::Saved;
+    case 2: return ShortcutTab::Emu;
+    case 3: return ShortcutTab::Tools;
+    default: return ShortcutTab::Read;
+    }
+}
+
+void shortcut_read_tab(RfidReadUi *ui, uint32_t key)
+{
+    if (!ui) return;
+    if (key == CTRL_S) {
+        std::string err;
+        if (!ui->service.save_last_scan(&err)) {
+            if (err.empty()) err = "Save failed";
+            append_log(ui, "ERR save: " + err);
+            set_status(ui, err);
+            return;
+        }
+        append_log(ui, "OK save: record stored");
+        set_status(ui, "Saved");
+        refresh_saved_records(ui);
+        return;
+    }
+
+    if (key == CTRL_L) {
+        ui->log_lines.clear();
+        refresh_log_label(ui);
+        set_status(ui, "Log cleared");
+        return;
+    }
+
+    switch (key) {
+    case 'm':
+    case 'M': {
+        std::string status;
+        ui->service.cycle_device_mode(&status);
+        append_log(ui, "> " + status);
+        set_status(ui, status.empty() ? "Mode switched" : status);
+        refresh_endpoint_label(ui);
+        break;
+    }
+    case 'c':
+    case 'C': {
+        switch_to_pn532killer_preferred_mode(ui);
+        const bool ok = ui->service.connect_current();
+        const auto conn = ui->service.connection_state();
+        if (!ok) {
+            append_log(ui, "ERR connect: " + conn.detail);
+            set_status(ui, "Connect failed");
+        } else {
+            append_log(ui, "OK connect: " + conn.status);
+            append_log(ui, "    " + conn.detail);
+            set_status(ui, conn.status);
+        }
+        refresh_endpoint_label(ui);
+        refresh_emu_label(ui);
+        refresh_mifare_keys(ui);
+        refresh_tools_label(ui);
+        break;
+    }
+    case 's':
+    case 'S':
+    case 'r':
+    case 'R': {
+        const auto conn = ui->service.connection_state();
+        if (!conn.connected) {
+            set_status(ui, "Connect device first");
+            append_log(ui, "ERR: not connected");
+            break;
+        }
+
+        std::string err;
+        bool ok = false;
+        if (ui->service.is_current_device_uhf()) {
+            ok = ui->service.start_uhf_scan_once(&err);
+            append_log(ui, "> UHF inventory once...");
+        } else {
+            ok = ui->service.start_scan();
+            append_log(ui, "> Scan card...");
+        }
+
+        if (!ok) {
+            const auto state = ui->service.scan_state();
+            if (err.empty()) err = state.error;
+            if (err.empty()) err = "scan failed";
+            append_log(ui, "ERR: " + err);
+            set_status(ui, err);
+            break;
+        }
+        set_status(ui, "Scanning...");
+        ui->pending_op = PendingOp::Scan;
+        ui->scan_was_running = true;
+        break;
+    }
+    case 'd':
+    case 'D': {
+        if (!ui->service.start_dump_last_scan()) {
+            const auto scan = ui->service.scan_state();
+            const std::string msg = scan.error.empty() ? scan.status : scan.error;
+            append_log(ui, "ERR dump: " + msg);
+            set_status(ui, msg.empty() ? "Dump failed" : msg);
+            break;
+        }
+        append_log(ui, "> Dump card...");
+        set_status(ui, "Dumping...");
+        ui->pending_op = PendingOp::Dump;
+        ui->scan_was_running = true;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void shortcut_saved_tab(RfidReadUi *ui, uint32_t key)
+{
+    if (!ui) return;
+    switch (key) {
+    case LV_KEY_UP:
+    case LV_KEY_LEFT:
+    case 'f':
+    case 'F':
+        if (!ui->saved_records.empty()) {
+            ui->saved_index = (ui->saved_index - 1 + static_cast<int>(ui->saved_records.size()))
+                % static_cast<int>(ui->saved_records.size());
+            refresh_saved_list_label(ui);
+        }
+        break;
+    case LV_KEY_DOWN:
+    case LV_KEY_RIGHT:
+    case 'x':
+    case 'X':
+        if (!ui->saved_records.empty()) {
+            ui->saved_index = (ui->saved_index + 1) % static_cast<int>(ui->saved_records.size());
+            refresh_saved_list_label(ui);
+        }
+        break;
+    case 'r':
+    case 'R':
+        refresh_saved_records(ui);
+        break;
+    case 'd':
+    case 'D': {
+        if (ui->saved_records.empty()) {
+            append_log(ui, "ERR delete: no saved records");
+            set_status(ui, "No saved records");
+            break;
+        }
+        const auto &record = ui->saved_records[static_cast<size_t>(ui->saved_index)];
+        std::string err;
+        if (!ui->service.delete_saved_record(record.meta.record_id, &err)) {
+            if (err.empty()) err = "Delete failed";
+            append_log(ui, "ERR delete: " + err);
+            set_status(ui, err);
+            break;
+        }
+        append_log(ui, "OK delete: " + record.meta.record_id);
+        set_status(ui, "Saved record deleted");
+        refresh_saved_records(ui);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void shortcut_emu_tab(RfidReadUi *ui, uint32_t key)
+{
+    if (!ui) return;
+
+    if (key == CTRL_S) {
+        const auto protocol = ui->service.current_emulator_protocol();
+        const int slot = ui->service.selected_slot_index();
+        std::string err;
+        if (!ui->service.save_emu_dump_cached(protocol, slot, &err)) {
+            if (err.empty()) err = "No cached dump";
+            append_log(ui, "ERR save dump: " + err);
+            set_status(ui, err);
+            return;
+        }
+        append_log(ui, "OK save dump: slot " + std::to_string(slot));
+        set_status(ui, "EMU dump saved");
+        refresh_saved_records(ui);
+        return;
+    }
+
+    const auto conn = ui->service.connection_state();
+    switch (key) {
+    case 'p':
+    case 'P': {
+        if (conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+            ui->service.toggle_nfcunit_profile_protocol();
+        } else {
+            ui->service.cycle_hw_emu_protocol();
+        }
+        append_log(ui, "> EMU protocol: " + current_protocol_text(ui->service));
+        apply_pn532killer_slot_profile(ui, "protocol");
+        refresh_emu_label(ui);
+        break;
+    }
+    case 'f':
+    case 'F':
+        ui->service.cycle_slot(-1);
+        append_log(ui, "> EMU slot: " + std::to_string(ui->service.selected_slot_index()));
+        apply_pn532killer_slot_profile(ui, "slot");
+        refresh_emu_label(ui);
+        break;
+    case 'x':
+    case 'X':
+        ui->service.cycle_slot(1);
+        append_log(ui, "> EMU slot: " + std::to_string(ui->service.selected_slot_index()));
+        apply_pn532killer_slot_profile(ui, "slot");
+        refresh_emu_label(ui);
+        break;
+    case 's':
+    case 'S': {
+        if (!conn.connected) {
+            append_log(ui, "ERR emu: connect device first");
+            set_status(ui, "Connect device first");
+            break;
+        }
+
+        const auto protocol = ui->service.current_emulator_protocol();
+        const int slot = ui->service.selected_slot_index();
+        std::string err;
+        bool ok = false;
+
+        if (conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+            ok = ui->service.start_nfcunit_current_profile_emulation_async();
+            ui->emu_start_result_seen = false;
+            if (!ok) err = "NFCUnit start already running";
+        } else if (conn.device_kind == nfc_app::DeviceKind::GroveNFC) {
+            ok = ui->service.grovenfc_activate(protocol, slot, &err);
+        } else if (conn.device_kind == nfc_app::DeviceKind::PN532Killer) {
+            ok = ui->service.hw_switch_emu_slot_and_probe(protocol, slot);
+            if (!ok) err = "Probe/start rejected";
+        } else if (conn.device_kind == nfc_app::DeviceKind::PN532) {
+            ok = ui->service.start_pn532_ndef_emulation("https://m5stack.com", &err);
+        } else {
+            err = "Current device does not support emulation";
+        }
+
+        if (!ok) {
+            append_log(ui, "ERR emu start: " + err);
+            set_status(ui, err.empty() ? "EMU start failed" : err);
+        } else {
+            append_log(ui, "OK emu start: " + current_protocol_text(ui->service)
+                + " slot " + std::to_string(slot));
+            set_status(ui, "EMU started");
+        }
+        refresh_emu_label(ui);
+        break;
+    }
+    case 'q':
+    case 'Q': {
+        bool ok = false;
+        if (conn.device_kind == nfc_app::DeviceKind::PN532) {
+            ui->service.stop_pn532_ndef_emulation();
+            ok = true;
+        } else if (conn.device_kind == nfc_app::DeviceKind::GroveNFC ||
+                   conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+            ok = ui->service.grovenfc_deactivate();
+        } else if (conn.device_kind == nfc_app::DeviceKind::PN532Killer) {
+            ui->service.hw_switch_to_reader_mode();
+            ok = true;
+        }
+        if (ok) {
+            append_log(ui, "OK emu stop");
+            set_status(ui, "EMU stopped");
+        } else {
+            append_log(ui, "ERR emu stop: unsupported or failed");
+            set_status(ui, "EMU stop failed");
+        }
+        refresh_emu_label(ui);
+        break;
+    }
+    case 'c':
+    case 'C': {
+        const auto protocol = ui->service.current_emulator_protocol();
+        const int slot = ui->service.selected_slot_index();
+        std::string err;
+        bool ok = false;
+        if (conn.device_kind == nfc_app::DeviceKind::PN532Killer) {
+            ok = ui->service.hw_switch_emu_slot_and_probe(protocol, slot);
+            if (!ok) err = "probe busy";
+        } else if (conn.device_kind == nfc_app::DeviceKind::GroveNFC ||
+                   conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+            ok = ui->service.cache_i2c_slot_dump(protocol, slot, &err);
+        } else {
+            err = "Probe available on PN532Killer/I2C emu only";
+        }
+        if (!ok) {
+            append_log(ui, "ERR emu probe: " + err);
+            set_status(ui, err.empty() ? "Probe failed" : err);
+        } else {
+            append_log(ui, "OK emu probe slot " + std::to_string(slot));
+            set_status(ui, "Probe done");
+        }
+        refresh_emu_label(ui);
+        break;
+    }
+    case 'd':
+    case 'D': {
+        const auto protocol = ui->service.current_emulator_protocol();
+        const int slot = ui->service.selected_slot_index();
+        std::string err;
+        bool ok = false;
+        if (conn.device_kind == nfc_app::DeviceKind::PN532Killer) {
+            ok = ui->service.hw_start_emu_dump_async(protocol, slot);
+            if (!ok) err = "dump busy";
+        } else if (conn.device_kind == nfc_app::DeviceKind::GroveNFC ||
+                   conn.device_kind == nfc_app::DeviceKind::NFCUnit) {
+            ok = ui->service.cache_i2c_slot_dump(protocol, slot, &err);
+        } else {
+            err = "Dump available on PN532Killer/I2C emu only";
+        }
+        if (!ok) {
+            append_log(ui, "ERR emu dump: " + err);
+            set_status(ui, err.empty() ? "Dump failed" : err);
+        } else {
+            append_log(ui, "> EMU dump slot " + std::to_string(slot));
+            set_status(ui, "Dump in progress");
+        }
+        refresh_emu_label(ui);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void shortcut_tools_tab(RfidReadUi *ui, uint32_t key)
+{
+    if (!ui) return;
+    switch (key) {
+    case 'f':
+    case 'F':
+        if (!ui->mifare_keys.empty()) {
+            ui->mifare_key_index = (ui->mifare_key_index - 1 + static_cast<int>(ui->mifare_keys.size()))
+                % static_cast<int>(ui->mifare_keys.size());
+            refresh_tools_label(ui);
+        }
+        break;
+    case 'x':
+    case 'X':
+        if (!ui->mifare_keys.empty()) {
+            ui->mifare_key_index = (ui->mifare_key_index + 1) % static_cast<int>(ui->mifare_keys.size());
+            refresh_tools_label(ui);
+        }
+        break;
+    case 't':
+    case 'T': {
+        if (ui->mifare_keys.empty()) break;
+        std::string err;
+        if (!ui->service.toggle_mifare_key_enabled(ui->mifare_key_index, &err)) {
+            append_log(ui, "ERR key toggle: " + err);
+            set_status(ui, err.empty() ? "Toggle key failed" : err);
+            break;
+        }
+        append_log(ui, "OK key toggle");
+        set_status(ui, "Key toggled");
+        refresh_mifare_keys(ui);
+        refresh_tools_label(ui);
+        break;
+    }
+    case 'r':
+    case 'R':
+        refresh_mifare_keys(ui);
+        ui->mfkey_results = ui->service.hw_mfkey_results();
+        if (ui->mfkey_results.empty()) ui->mfkey_result_index = 0;
+        if (!ui->mfkey_results.empty()) ui->mfkey_result_index = static_cast<int>(ui->mfkey_results.size()) - 1;
+        append_log(ui, "OK tools reload");
+        refresh_tools_label(ui);
+        break;
+    case 'c':
+    case 'C': {
+        const std::string uid_hex = derive_sniff_uid_hex(ui->service.scan_state());
+        if (ui->service.hw_sniff_set_uid(uid_hex)) {
+            append_log(ui, "> Sniff UID set: " + uid_hex);
+        }
+        if (!ui->service.hw_start_mfkey_async(false)) {
+            append_log(ui, "ERR mfkey: already running");
+            set_status(ui, "MFKey already running");
+            break;
+        }
+        append_log(ui, "> MFKey crack start");
+        set_status(ui, "MFKey running");
+        refresh_tools_label(ui);
+        break;
+    }
+    case '6': {
+        const std::string uid_hex = derive_sniff_uid_hex(ui->service.scan_state());
+        if (ui->service.hw_sniff_set_uid(uid_hex)) {
+            append_log(ui, "> Sniff UID set: " + uid_hex);
+        }
+        if (!ui->service.hw_start_mfkey_async(true)) {
+            append_log(ui, "ERR mfkey64: already running");
+            set_status(ui, "MFKey64 already running");
+            break;
+        }
+        append_log(ui, "> MFKey64 crack start");
+        set_status(ui, "MFKey64 running");
+        refresh_tools_label(ui);
+        break;
+    }
+    case 'u':
+    case 'U': {
+        const std::string uid_hex = derive_sniff_uid_hex(ui->service.scan_state());
+        if (!ui->service.hw_sniff_set_uid(uid_hex)) {
+            append_log(ui, "ERR set uid: device not ready");
+            set_status(ui, "Set UID failed");
+            break;
+        }
+        append_log(ui, "OK sniff UID: " + uid_hex);
+        set_status(ui, "Sniff UID updated");
+        break;
+    }
+    case 'i':
+    case 'I': {
+        if (ui->mfkey_results.empty()) {
+            append_log(ui, "ERR import: no mfkey result");
+            set_status(ui, "No MFKey result");
+            break;
+        }
+        if (ui->mfkey_result_index < 0) ui->mfkey_result_index = 0;
+        if (ui->mfkey_result_index >= static_cast<int>(ui->mfkey_results.size())) {
+            ui->mfkey_result_index = static_cast<int>(ui->mfkey_results.size()) - 1;
+        }
+        std::string err;
+        const auto &result = ui->mfkey_results[static_cast<size_t>(ui->mfkey_result_index)];
+        if (!ui->service.import_mfkey_result(result, &err)) {
+            append_log(ui, "ERR import: " + err);
+            set_status(ui, err.empty() ? "Import failed" : err);
+            break;
+        }
+        append_log(ui, "OK import: " + summarize_mfkey_result(result));
+        set_status(ui, "MFKey imported");
+        refresh_mifare_keys(ui);
+        refresh_tools_label(ui);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void on_global_key(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_KEY) return;
+    auto *ui = static_cast<RfidReadUi *>(lv_event_get_user_data(e));
+    if (!ui) return;
+
+    const uint32_t key = lv_event_get_key(e);
+    switch (active_tab(ui)) {
+    case ShortcutTab::Read:
+        shortcut_read_tab(ui, key);
+        break;
+    case ShortcutTab::Saved:
+        shortcut_saved_tab(ui, key);
+        break;
+    case ShortcutTab::Emu:
+        shortcut_emu_tab(ui, key);
+        break;
+    case ShortcutTab::Tools:
+        shortcut_tools_tab(ui, key);
+        break;
+    }
+}
+
 void on_timer(lv_timer_t *timer)
 {
     auto *ui = static_cast<RfidReadUi *>(lv_timer_get_user_data(timer));
@@ -924,7 +1464,7 @@ void on_timer(lv_timer_t *timer)
             }
         } else if (scan.has_result) {
             append_log(ui, "OK scan: " + scan.last_record.tag.uid + " [" + scan.last_record.tag.tag_type + "]");
-            set_status(ui, "Scan complete");
+            set_status(ui, scan_status_text(scan.last_record));
         } else {
             const std::string msg = scan.error.empty() ? scan.status : scan.error;
             append_log(ui, "ERR: " + msg);
@@ -1013,6 +1553,7 @@ lv_obj_t *create_button(lv_obj_t *parent,
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_size(btn, w, 24);
     lv_obj_set_pos(btn, x, y);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user_data);
     lv_obj_t *label = lv_label_create(btn);
     lv_label_set_text(label, text);
@@ -1039,13 +1580,20 @@ void build_ui(RfidReadUi *ui)
     lv_obj_set_pos(sub, 70, 10);
 
     lv_obj_t *tabview = lv_tabview_create(screen);
+    ui->tabview = tabview;
     lv_obj_set_size(tabview, 320, 140);
     lv_obj_set_pos(tabview, 0, 30);
+    lv_obj_add_flag(tabview, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     lv_obj_t *tab_read = lv_tabview_add_tab(tabview, "READ");
     lv_obj_t *tab_saved = lv_tabview_add_tab(tabview, "SAVED");
     lv_obj_t *tab_emu = lv_tabview_add_tab(tabview, "EMU");
     lv_obj_t *tab_tools = lv_tabview_add_tab(tabview, "TOOLS");
+    lv_obj_add_flag(tab_read, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(tab_saved, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(tab_emu, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(tab_tools, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(screen, on_global_key, LV_EVENT_KEY, ui);
 
     ui->endpoint_label = lv_label_create(tab_read);
     lv_obj_set_style_text_font(ui->endpoint_label, &lv_font_montserrat_10, 0);
@@ -1143,6 +1691,7 @@ int main()
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
+    configure_rfid_storage_paths();
     hal_paths_init(nullptr);
 
     lv_init();

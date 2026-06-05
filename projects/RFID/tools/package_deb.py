@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Build a Debian package for the standalone RFID app.
 
-This script follows the APPLaunch packaging guide layout:
-  debian-<AppName>/
-    DEBIAN/{control,postinst,prerm}
-    usr/share/APPLaunch/{applications,bin,share,...}
+This script follows the CardputerZero packaging layout:
+    debian-<AppName>/
+        DEBIAN/{control,postinst,prerm}
+        usr/share/APPLaunch/{applications,apps/<pkg>,share/images,...}
 """
 
 from __future__ import annotations
@@ -17,6 +17,11 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+
+FORCED_ICON_SOURCE = Path(
+    "/Users/wilson/Github/M5CardputerZero-UserDemo/projects/APPLaunch/APPLaunch/share/images/ic_rfid.png"
+)
 
 
 def fail(msg: str, code: int = 1) -> int:
@@ -105,21 +110,34 @@ def create_package(
 
     debian_dir = stage_dir / "DEBIAN"
     app_root = stage_dir / "usr" / "share" / "APPLaunch"
+    app_install_dir = app_root / "apps" / package_name
 
     (debian_dir).mkdir(parents=True, exist_ok=True)
     (app_root / "applications").mkdir(parents=True, exist_ok=True)
-    (app_root / "bin").mkdir(parents=True, exist_ok=True)
-    (app_root / "lib").mkdir(parents=True, exist_ok=True)
-    (app_root / "share").mkdir(parents=True, exist_ok=True)
+    (app_root / "apps").mkdir(parents=True, exist_ok=True)
+    (app_root / "share" / "images").mkdir(parents=True, exist_ok=True)
+    (app_install_dir).mkdir(parents=True, exist_ok=True)
+
+    if FORCED_ICON_SOURCE.exists():
+        forced_local_icon = project_root / "share" / "images" / "ic_rfid.png"
+        copy_if_exists(FORCED_ICON_SOURCE, forced_local_icon)
 
     # Binary + desktop + share assets
-    copy_if_exists(bin_src, app_root / "bin" / bin_name)
-    (app_root / "bin" / bin_name).chmod(0o755)
+    copy_if_exists(bin_src, app_install_dir / bin_name)
+    (app_install_dir / bin_name).chmod(0o755)
     copy_if_exists(desktop_src, app_root / "applications" / desktop_src.name)
 
     share_src = project_root / "share"
     if share_src.exists():
-        shutil.copytree(share_src, app_root / "share", dirs_exist_ok=True)
+        shutil.copytree(share_src, app_install_dir / "share", dirs_exist_ok=True)
+
+    icon_rel = Path(meta.get("icon", "share/images/ic_rfid.png")).as_posix().strip()
+    icon_dst = app_root / icon_rel
+    if FORCED_ICON_SOURCE.exists():
+        copy_if_exists(FORCED_ICON_SOURCE, icon_dst)
+    else:
+        icon_src = project_root / icon_rel
+        copy_if_exists(icon_src, icon_dst)
 
     control = (
         f"Package: {package_name}\n"
@@ -134,8 +152,15 @@ def create_package(
         f"Description: {description}\n"
     )
 
-    postinst = """#!/bin/sh
+    postinst = f"""#!/bin/sh
 set -e
+APP_DIR="/usr/share/APPLaunch/apps/{package_name}"
+mkdir -p "$APP_DIR/nfc_data"
+mkdir -p "$APP_DIR/share/nfc/records"
+mkdir -p "$APP_DIR/share/nfc/keys"
+if id -u pi >/dev/null 2>&1; then
+    chown -R pi:pi "$APP_DIR/nfc_data" "$APP_DIR/share/nfc"
+fi
 if [ -f \"/lib/systemd/system/APPLaunch.service\" ]; then
   systemctl restart APPLaunch.service || true
 fi
@@ -151,7 +176,7 @@ exit 0
     write_text(debian_dir / "postinst", postinst, mode=0o755)
     write_text(debian_dir / "prerm", prerm, mode=0o755)
 
-    run(["dpkg-deb", "-b", str(stage_dir), str(out_deb)])
+    run(["dpkg-deb", "--root-owner-group", "-b", str(stage_dir), str(out_deb)])
     return out_deb
 
 

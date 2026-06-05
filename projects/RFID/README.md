@@ -26,7 +26,7 @@ Desktop entry:
 
 Exec path:
 
-- /usr/share/APPLaunch/bin/M5CardputerZero-RFID
+- /usr/share/APPLaunch/apps/rfid/M5CardputerZero-RFID
 
 ## Debian packaging (official layout)
 
@@ -40,7 +40,8 @@ The script creates a package layout compatible with the APPLaunch guide:
 - DEBIAN/postinst
 - DEBIAN/prerm
 - usr/share/APPLaunch/applications/rfid.desktop
-- usr/share/APPLaunch/bin/M5CardputerZero-RFID
+- usr/share/APPLaunch/apps/rfid/M5CardputerZero-RFID
+- usr/share/APPLaunch/apps/rfid/share/**
 - usr/share/APPLaunch/share/images/ic_rfid.png
 
 Build and package:
@@ -61,6 +62,21 @@ Install on device:
 scp build/rfid_0.1-m5stack1_arm64.deb pi@<device-ip>:/tmp/
 ssh pi@<device-ip> "echo pi | sudo -S dpkg -i /tmp/rfid_0.1-m5stack1_arm64.deb"
 ```
+
+## Publish to AppStore (czdev)
+
+Follow the official publish flow:
+
+```bash
+czdev login
+czdev publish --deb build/rfid_0.1-m5stack1_arm64.deb
+```
+
+Recommended before publish:
+
+- Prepare icon: 100x100 PNG
+- Prepare screenshots: 320x170 PNG
+- Ensure package size < 100MB
 
 If `dist/M5CardputerZero-RFID` is missing, you can let the script build it:
 
