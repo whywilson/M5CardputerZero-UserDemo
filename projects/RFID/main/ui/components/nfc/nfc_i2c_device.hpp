@@ -2600,7 +2600,8 @@ private:
         for (uint8_t i = 0; i < 4; ++i) {
             reader_prng = prng_successor_local(reader_prng, 8U);
             const uint8_t plain_byte = static_cast<uint8_t>(reader_prng & 0xFFU);
-            ab[4U + i] = static_cast<uint8_t>(crypto.step8(plain_byte, false) ^ plain_byte);
+            // AR bytes use keystream generated with zero input, then XOR plain successor byte.
+            ab[4U + i] = static_cast<uint8_t>(crypto.step8(0x00, false) ^ plain_byte);
             parity |= static_cast<uint8_t>((crypto.parity_keystream_bit() ^ Crypto1Local::oddparity8(plain_byte)) & 0x01U) << (4U + i);
         }
         const uint32_t expected_at = prng_successor_local(reader_prng, 32U);
@@ -2675,7 +2676,7 @@ private:
 
         uint8_t at2[4] = {0};
         for (int i = 0; i < 4; ++i) {
-            at2[i] = static_cast<uint8_t>(ba[i] ^ crypto.step8(ba[i], true));
+            at2[i] = static_cast<uint8_t>(ba[i] ^ crypto.step8(0, false));
             const uint8_t plain_parity = static_cast<uint8_t>(crypto.parity_keystream_bit() ^ ba_parity[i]);
             if (Crypto1Local::oddparity8(at2[i]) != plain_parity) {
                 char pmsg[48];
