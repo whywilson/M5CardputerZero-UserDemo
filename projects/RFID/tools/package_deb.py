@@ -23,6 +23,10 @@ FORCED_ICON_SOURCE = Path(
     "/Users/wilson/Github/M5CardputerZero-UserDemo/projects/APPLaunch/APPLaunch/share/images/ic_rfid.png"
 )
 
+TOOL_BINARY_DIR_CANDIDATES = [
+    "dist_mfkey",
+]
+
 
 def fail(msg: str, code: int = 1) -> int:
     print(f"[RFID][pack] ERROR: {msg}", file=sys.stderr)
@@ -80,6 +84,26 @@ def copy_if_exists(src: Path, dst: Path) -> None:
     shutil.copy2(src, dst)
 
 
+def collect_tool_binaries(project_root: Path) -> list[Path]:
+    """Collect executable helper binaries that should ship with RFID package."""
+    tools: list[Path] = []
+    seen: set[Path] = set()
+    for rel_dir in TOOL_BINARY_DIR_CANDIDATES:
+        tool_dir = project_root / rel_dir
+        if not tool_dir.exists() or not tool_dir.is_dir():
+            continue
+        for path in sorted(tool_dir.glob("*")):
+            if not path.is_file():
+                continue
+            if not os.access(path, os.X_OK):
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            tools.append(path)
+    return tools
+
+
 def create_package(
     project_root: Path,
     revision: str,
@@ -111,12 +135,14 @@ def create_package(
     debian_dir = stage_dir / "DEBIAN"
     app_root = stage_dir / "usr" / "share" / "APPLaunch"
     app_install_dir = app_root / "apps" / package_name
+    tool_install_dir = app_install_dir / "bin"
 
     (debian_dir).mkdir(parents=True, exist_ok=True)
     (app_root / "applications").mkdir(parents=True, exist_ok=True)
     (app_root / "apps").mkdir(parents=True, exist_ok=True)
     (app_root / "share" / "images").mkdir(parents=True, exist_ok=True)
     (app_install_dir).mkdir(parents=True, exist_ok=True)
+    tool_install_dir.mkdir(parents=True, exist_ok=True)
 
     if FORCED_ICON_SOURCE.exists():
         forced_local_icon = project_root / "share" / "images" / "ic_rfid.png"
@@ -126,6 +152,13 @@ def create_package(
     copy_if_exists(bin_src, app_install_dir / bin_name)
     (app_install_dir / bin_name).chmod(0o755)
     copy_if_exists(desktop_src, app_root / "applications" / desktop_src.name)
+
+    # Helper tools (e.g. mfkey32v2/mfkey64) expected under /usr/share/APPLaunch/apps/rfid/bin
+    tool_binaries = collect_tool_binaries(project_root)
+    for tool_bin in tool_binaries:
+        dst = tool_install_dir / tool_bin.name
+        copy_if_exists(tool_bin, dst)
+        dst.chmod(0o755)
 
     share_src = project_root / "share"
     if share_src.exists():
@@ -177,6 +210,12 @@ exit 0
     write_text(debian_dir / "prerm", prerm, mode=0o755)
 
     run(["dpkg-deb", "--root-owner-group", "-b", str(stage_dir), str(out_deb)])
+    if tool_binaries:
+        print("[RFID][pack] Included tool binaries:")
+        for tool_bin in tool_binaries:
+            print(f"  - {tool_bin.name}")
+    else:
+        print("[RFID][pack] WARNING: no helper tool binaries found")
     return out_deb
 
 
