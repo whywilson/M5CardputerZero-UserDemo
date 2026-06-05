@@ -6,24 +6,20 @@ with open(env["PROJECT_TOOL_S"]) as f:
 
 component_dir = env.get("component_dir", os.getcwd())
 projects_dir = os.path.abspath(os.path.join(component_dir, "..", ".."))
-applaunch_main = os.path.join(projects_dir, "APPLaunch", "main")
 emulator_vendor = os.path.join(projects_dir, "CardputerZero-Emulator", "vendor")
 
 SRCS = Glob("src/*.c*")
+SRCS += [os.path.join(component_dir, "hal", "hal_paths_rfid.c")]
 INCLUDE = [
     ADir("."),
     ADir("include"),
-    applaunch_main,
-    os.path.join(applaunch_main, "ui", "components", "nfc"),
+    os.path.join(component_dir, "ui", "components", "nfc"),
     emulator_vendor,
 ]
 PRIVATE_INCLUDE = []
 REQUIREMENTS = ["lvgl_component", "pthread"]
 if "CONFIG_V9_5_LV_USE_SDL" not in os.environ:
     REQUIREMENTS += ["input", "xkbcommon", "udev"]
-    SRCS += [os.path.join(applaunch_main, "hal", "linux", "hal_paths_linux.c")]
-else:
-    SRCS += [os.path.join(applaunch_main, "hal", "sdl", "hal_paths_sdl.c")]
 STATIC_LIB = []
 DYNAMIC_LIB = []
 DEFINITIONS = ["-std=c++17"]

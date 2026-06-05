@@ -84,23 +84,19 @@ If `dist/M5CardputerZero-RFID` is missing, you can let the script build it:
 python3 tools/package_deb.py --build-if-missing --maintainer "yourname <you@example.com>"
 ```
 
-## Migration plan from APPLaunch NFC page
+## NFC migration status
 
-1. Extract NFC domain service from APPLaunch into reusable modules:
-   - APPLaunch main/ui/components/nfc/nfc_device_service.hpp
-   - APPLaunch main/ui/components/nfc/nfc_transport.hpp
-   - APPLaunch main/ui/components/nfc/nfc_spi_device.hpp
+RFID now has its own NFC component set under:
 
-2. Move READ tab features:
-   - device connect/switch, scan, dump, log pipeline.
+- main/ui/components/nfc/
 
-3. Move SAVED tab features:
-   - record list/edit/delete, key file and slot upload/download.
+Main entry points are already migrated to local files:
 
-4. Move EMU tab features:
-   - PN532Killer slot probe/dump/upload and NFCUnit profile control.
+- main/src/main.cpp -> main/ui/components/nfc/nfc_device_service.hpp
+- nfc_i2c_magic_probe.cpp -> main/ui/components/nfc/nfc_i2c_device.hpp
 
-5. Move TOOLS tab features:
-   - uid write flow, mfkey32v2/mfkey64 workflow, script bridges in this project.
+The build script uses local NFC + local HAL paths implementation:
 
-6. Replace placeholder tab content in main/src/main.cpp with migrated UI components.
+- main/SConstruct
+- main/hal/hal_paths.h
+- main/hal/hal_paths_rfid.c

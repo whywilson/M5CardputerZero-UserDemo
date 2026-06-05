@@ -1,4 +1,4 @@
-#include "../APPLaunch/main/ui/components/nfc/nfc_i2c_device.hpp"
+#include "main/ui/components/nfc/nfc_i2c_device.hpp"
 
 #include <chrono>
 #include <cstdint>

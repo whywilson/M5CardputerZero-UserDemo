@@ -1,8 +1,8 @@
 #include "lvgl/lvgl.h"
-#include "../../../APPLaunch/main/ui/components/nfc/nfc_device_service.hpp"
+#include "../ui/components/nfc/nfc_device_service.hpp"
 
 extern "C" {
-#include "../../../APPLaunch/main/hal/hal_paths.h"
+#include "../hal/hal_paths.h"
 }
 
 #include <algorithm>
