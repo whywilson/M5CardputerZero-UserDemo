@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../nfc/nfc_device_service.hpp"
+#include "nfc/nfc_device_service.hpp"
 #include "../ui_app_page.hpp"
 #include "compat/input_keys.h"
 #include "keyboard_input.h"

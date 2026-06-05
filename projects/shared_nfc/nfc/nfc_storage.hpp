@@ -1,7 +1,7 @@
 #pragma once
 
 #include "nfc_models.hpp"
-#include "../../../hal/hal_paths.h"
+#include "hal/hal_paths.h"
 
 #include <algorithm>
 #include <cctype>

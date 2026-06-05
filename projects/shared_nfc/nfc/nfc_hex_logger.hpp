@@ -27,7 +27,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#include "../../../hal/hal_paths.h"
+#include "hal/hal_paths.h"
 #ifdef __cplusplus
 }
 #endif

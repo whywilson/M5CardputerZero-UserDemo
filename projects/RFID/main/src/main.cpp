@@ -1,5 +1,5 @@
 #include "lvgl/lvgl.h"
-#include "../ui/components/nfc/nfc_device_service.hpp"
+#include "nfc/nfc_device_service.hpp"
 
 extern "C" {
 #include "../hal/hal_paths.h"

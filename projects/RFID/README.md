@@ -86,17 +86,14 @@ python3 tools/package_deb.py --build-if-missing --maintainer "yourname <you@exam
 
 ## NFC migration status
 
-RFID now has its own NFC component set under:
+NFC read/write stack is now shared between APPLaunch and RFID under:
 
-- main/ui/components/nfc/
+- ../shared_nfc/nfc/
 
-Main entry points are already migrated to local files:
+Both projects include this shared directory in their build scripts, and no
+longer keep separate per-project NFC component copies.
 
-- main/src/main.cpp -> main/ui/components/nfc/nfc_device_service.hpp
-- nfc_i2c_magic_probe.cpp -> main/ui/components/nfc/nfc_i2c_device.hpp
+RFID still keeps its own HAL paths implementation:
 
-The build script uses local NFC + local HAL paths implementation:
-
-- main/SConstruct
 - main/hal/hal_paths.h
 - main/hal/hal_paths_rfid.c
