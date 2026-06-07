@@ -709,6 +709,15 @@ private:
         case KEY_ENTER:
             activate();
             break;
+        case KEY_DELETE:
+            // DEL key on READ tab: clear the scan log area
+            if (current_tab_ == Tab::Read) {
+                scan_log_lines_.clear();
+                log_scroll_offset_ = 0;
+                ui_message_ = "Log cleared";
+                render_all();
+            }
+            break;
         case KEY_I:
             if (modal_ == Modal::None) {
                 modal_ = Modal::AppInfo;
@@ -3525,7 +3534,7 @@ private:
         }
     }
 
-    // ── PortSettings modal (TX / RX GPIO / BAUD / Test) ──────────────────────
+    // ── PortSettings modal (Device / Test only) ───────────────────────────────
     void render_port_settings_modal(lv_obj_t *parent)    {
         lv_obj_t *overlay = lv_obj_create(parent);
         lv_obj_remove_style_all(overlay);
@@ -3537,56 +3546,50 @@ private:
         lv_obj_set_style_border_width(overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *card = make_modal_card(overlay, 260, 118, 0xF7A600);
+        lv_obj_t *card = make_modal_card(overlay, 260, 90, 0xF7A600);
         create_text(card, 8, 4, "Port Settings", 0xF7A600, 12);
 
-        // Device path (read-only, shows which port will be tested)
+        // Device path (read-only)
         {
             std::string dev = uart_edit_buf_.device_path;
             if (dev.empty()) {
-                // Mirror the auto-discovery in test_uart_connection()
                 auto uart_eps = service_.uart_endpoints();
                 dev = uart_eps.empty() ? "(no UART port)" : uart_eps[0].path;
             }
-            // Trim /dev/ prefix for brevity
             if (dev.rfind("/dev/", 0) == 0) dev = dev.substr(5);
-            create_text(card, 8, 20, (std::string("Dev: ") + dev).c_str(), 0x888888, 10);
+            create_text(card, 8, 24, (std::string("Dev: ") + dev).c_str(), 0x888888, 10);
         }
 
-        const char *field_labels[] = {"TX GPIO:", "RX GPIO:"};
-        const int field_vals[] = { uart_edit_buf_.tx_pin, uart_edit_buf_.rx_pin };
-        for (int i = 0; i < 2; ++i) {
-            const bool sel = (port_settings_field_ == i);
-            char vbuf[16];
-            if (field_vals[i] < 0) std::snprintf(vbuf, sizeof(vbuf), "(unknown)");
-            else std::snprintf(vbuf, sizeof(vbuf), "%d", field_vals[i]);
-            std::string line = std::string(field_labels[i]) + " " + vbuf;
-            if (sel && !edit_buf_.empty()) line = std::string(field_labels[i]) + " " + edit_buf_ + "_";
-            uint32_t col = sel ? 0xFFFF00 : 0xD8D8D8;
-            create_text(card, 8, 32 + i * 16, line.c_str(), col, 11);
-        }
-        // Test Connection action row (field 2)
+        // TX/RX GPIO: informational display only (not editable)
         {
-            const bool sel = (port_settings_field_ == 2);
-            uint32_t col = sel ? 0x00FF88 : 0x44BB77;
-            create_text(card, 8, 66, sel ? "[ Test Connection ]" : "  Test Connection", col, 11);
+            char buf[32];
+            int tx = uart_edit_buf_.tx_pin, rx = uart_edit_buf_.rx_pin;
+            if (tx < 0 && rx < 0)
+                std::snprintf(buf, sizeof(buf), "TX/RX: default (14/15)");
+            else
+                std::snprintf(buf, sizeof(buf), "TX/RX: %d/%d", tx >= 0 ? tx : 14, rx >= 0 ? rx : 15);
+            create_text(card, 8, 38, buf, 0x888888, 10);
         }
+
+        // Test Connection — the only action, default selected
+        {
+            const bool sel = (port_settings_field_ == 0);
+            uint32_t col = sel ? 0x00FF88 : 0x44BB77;
+            create_text(card, 8, 56, sel ? "[ Test Connection ]" : "  Test Connection", col, 12);
+        }
+
         // Test result
         if (!uart_test_result_.empty()) {
             const bool ok = uart_test_result_.rfind("OK:", 0) == 0;
-            create_text(card, 8, 82, uart_test_result_.c_str(), ok ? 0x00FF88 : 0xFF6060, 10);
+            create_text(card, 8, 74, uart_test_result_.c_str(), ok ? 0x00FF88 : 0xFF6060, 10);
         }
     }
 
     void handle_port_settings_key(uint32_t key)
     {
-        const int FIELDS = 3;  // 0=TX  1=RX  2=Test
+        // Only 1 field: Test Connection (no more TX/RX editing)
         if (key == KEY_ESC) {
-            // Apply any pending edit and save
-            apply_port_settings_field();
             nfc_app::UartConfig cfg = service_.uart_config();
-            cfg.tx_pin    = uart_edit_buf_.tx_pin;
-            cfg.rx_pin    = uart_edit_buf_.rx_pin;
             cfg.baud_rate = 115200;
             service_.set_uart_config(cfg);
             ui_message_ = "Port settings saved";
@@ -3596,50 +3599,16 @@ private:
             uart_test_result_.clear();
             return;
         }
-        if (key == KEY_UP || key == KEY_F) {
-            apply_port_settings_field();
-            port_settings_field_ = (port_settings_field_ - 1 + FIELDS) % FIELDS;
-            return;
-        }
-        if (key == KEY_DOWN || key == KEY_X) {
-            apply_port_settings_field();
-            port_settings_field_ = (port_settings_field_ + 1) % FIELDS;
-            return;
-        }
         if (key == KEY_ENTER) {
-            if (port_settings_field_ == 2) {
-                // Test Connection: save current settings then start async probe
-                apply_port_settings_field();
-                nfc_app::UartConfig cfg = service_.uart_config();
-                cfg.tx_pin    = uart_edit_buf_.tx_pin;
-                cfg.rx_pin    = uart_edit_buf_.rx_pin;
-                cfg.baud_rate = 115200;
-                service_.set_uart_config(cfg);
-                uart_test_result_ = "Testing...";
-                service_.start_uart_test();
-            } else {
-                apply_port_settings_field();
-            }
+            nfc_app::UartConfig cfg = service_.uart_config();
+            cfg.tx_pin    = uart_edit_buf_.tx_pin;
+            cfg.rx_pin    = uart_edit_buf_.rx_pin;
+            cfg.baud_rate = 115200;
+            service_.set_uart_config(cfg);
+            uart_test_result_ = "Testing...";
+            service_.start_uart_test();
             return;
         }
-        if (key == KEY_BACKSPACE) {
-            if (!edit_buf_.empty()) edit_buf_.pop_back();
-            return;
-        }
-        // Accept digits only (TX/RX/Baud are all numeric)
-        char c = keycode_to_char(key);
-        if (c >= '0' && c <= '9' && edit_buf_.size() < 7) edit_buf_ += c;
-    }
-
-    void apply_port_settings_field()
-    {
-        if (edit_buf_.empty()) return;
-        try {
-            int v = std::stoi(edit_buf_);
-            if (port_settings_field_ == 0) uart_edit_buf_.tx_pin = v;
-            else if (port_settings_field_ == 1) uart_edit_buf_.rx_pin = v;
-        } catch (...) {}
-        edit_buf_.clear();
     }
 
     // ── Tool info popup ('i' key) ────────────────────────────────────────────
