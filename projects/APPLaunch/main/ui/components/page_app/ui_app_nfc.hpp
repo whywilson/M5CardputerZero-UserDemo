@@ -2563,6 +2563,8 @@ private:
                 (endpoint.kind == nfc_app::TransportKind::I2cBus &&
                  (emu_device_kind == nfc_app::DeviceKind::Unknown ||
                   emu_device_kind == nfc_app::DeviceKind::NotConnected)));
+            const bool is_grove_or_nfcunit = (emu_device_kind == nfc_app::DeviceKind::GroveNFC ||
+                                              emu_device_kind == nfc_app::DeviceKind::NFCUnit);
             const std::string nfc_unit_profile = is_nfc_unit ? service_.nfcunit_profile_label() : std::string();
             create_text(left, 6, 4,  is_st25r ? "SPI EMU" : "SW EMU", is_st25r ? 0x00B4FF : 0x00FF88, 12);
             if (is_nfc_unit) {
@@ -2572,11 +2574,17 @@ private:
             } else if (is_st25r) {
                 create_text(left, 6, 18, "Profile mode", 0xFFFFFF, 12);
             } else {
-                const std::string slot_str = "Slot " + std::to_string(hw_emu_slot_ + 1) + "/8";
-                create_text(left, 6, 18, slot_str.c_str(), 0xFFFFFF, 12);
+                // GroveNFC/NFCUnit: no slot, show protocol name
+                create_text(left, 6, 18, proto_name.c_str(), 0xFFFFFF, 12);
             }
             create_text(left, 6, 38, (is_nfc_unit || is_st25r) ? "Tab:profile" : "Tab:proto", 0xD8D8D8, 10);
-            create_text(left, 6, 50, (is_nfc_unit || is_st25r) ? "OK:start" : "F/X:slot", (is_nfc_unit || is_st25r) ? 0xF7A600 : 0xD8D8D8, 10);
+            if (is_grove_or_nfcunit) {
+                create_text(left, 6, 50, "OK:Simulate", 0xF7A600, 10);
+            } else if (!is_st25r) {
+                create_text(left, 6, 50, "F/X:slot", 0xD8D8D8, 10);
+            } else {
+                create_text(left, 6, 50, "OK:start", 0xF7A600, 10);
+            }
             if (!is_nfc_unit && !is_st25r) create_text(left, 6, 62, "OK:menu", 0xF7A600, 10);
             create_text(left, 6, 80, is_st25r ? "M5 NFC CAP SPI" : (is_nfc_unit ? "NFC Unit I2C" : "GroveNFC I2C"), is_st25r ? 0x00B4FF : 0x00FF88, 10);
 
@@ -4863,7 +4871,22 @@ private:
         case KEY_X:    modal_idx_ = (modal_idx_ + 1) % 4; break;
         case KEY_ENTER:
             if (modal_idx_ == 0) {
-                if (service_.emulation_allowed(&ui_message_)) {
+                // GrooveNFC/NFCUnit: no slots — emulate directly
+                const auto conn2 = service_.connection_state();
+                const auto emu_kind2 = effective_emu_device_kind(conn2);
+                const bool is_grove = (emu_kind2 == nfc_app::DeviceKind::GroveNFC ||
+                                       emu_kind2 == nfc_app::DeviceKind::NFCUnit);
+                if (is_grove && service_.emulation_allowed(&ui_message_)) {
+                    // Upload to I2C device and start emulation
+                    const auto &rec = saved_records_[saved_idx_];
+                    if (service_.i2c_emulate(rec.tag.protocol, rec, &ui_message_)) {
+                        // Switch to EMU tab
+                        current_tab_ = Tab::Emulator;
+                        ui_message_ = "Emulation started";
+                    }
+                    modal_     = Modal::None;
+                    modal_idx_ = 0;
+                } else if (service_.emulation_allowed(&ui_message_)) {
                     slot_select_idx_ = service_.selected_slot_index_for_protocol(saved_records_[saved_idx_].tag.protocol);
                     modal_ = Modal::SlotSelect;
                 }
