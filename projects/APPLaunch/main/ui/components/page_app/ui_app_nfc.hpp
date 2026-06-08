@@ -6,6 +6,7 @@
 #include "keyboard_input.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -168,6 +170,12 @@ private:
     std::string nfcunit_emu_autostart_error_;
     std::string nfcunit_emu_autostart_profile_;
     std::mutex nfcunit_emu_autostart_mutex_;
+    // Deferred GroveNFC emulation start (avoid blocking tab switch)
+    bool grovenfc_emu_pending_ = false;
+    // Async GroveNFC emulation result
+    std::atomic<bool> grovenfc_emu_result_ready_{false};
+    bool grovenfc_emu_result_ok_ = false;
+    std::string grovenfc_emu_result_msg_;
     // I2C device selection (index into i2c_select_list_)
     int i2c_select_idx_ = 0;
     // Cached I2C endpoint list for I2cSelect modal
@@ -682,10 +690,24 @@ private:
                     const auto proto = service_.current_emulator_protocol();
                     service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
                 } else if (emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
-                           emu_device_kind == nfc_app::DeviceKind::ST25RNFC) {
+                           emu_device_kind == nfc_app::DeviceKind::ST25RNFC ||
+                           emu_device_kind == nfc_app::DeviceKind::GroveNFC) {
                     if (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) {
                         service_.toggle_spi_profile();
                         ui_message_ = std::string("Profile -> ") + service_.spi_profile_label();
+                    } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC) {
+                        // Stop current, switch protocol, restart
+                        service_.grovenfc_deactivate();
+                        service_.cycle_hw_emu_protocol();
+                        emu_dump_scroll_ = 0;
+                        const auto proto2 = service_.current_emulator_protocol();
+                        std::string emuErr2;
+                        if (service_.grovenfc_activate(proto2, 0, &emuErr2)) {
+                            scan_log_lines_.push_back(std::string("> EMU: ") + nfc_app::to_string(proto2));
+                        } else {
+                            scan_log_lines_.push_back(std::string("ERR EMU: ") + (emuErr2.empty() ? "failed" : emuErr2));
+                        }
+                        ui_message_ = std::string("Protocol -> ") + nfc_app::to_string(proto2);
                     } else {
                         service_.toggle_nfcunit_profile_protocol();
                         ui_message_ = std::string("Profile -> ") + service_.nfcunit_profile_label();
@@ -741,6 +763,18 @@ private:
                         ui_message_ = "PN532 NDEF emulation running";
                     } else {
                         ui_message_ = err.empty() ? "NDEF start failed" : err;
+                    }
+                    render_all();
+                } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC) {
+                    const auto protocol = service_.current_emulator_protocol();
+                    std::string emuErr;
+                    if (service_.grovenfc_activate(protocol, 0, &emuErr)) {
+                        scan_log_lines_.push_back(std::string("> GroveNFC EMU: ") + nfc_app::to_string(protocol) + " started");
+                        ui_message_ = "GroveNFC emulation started";
+                    } else {
+                        scan_log_lines_.push_back(std::string("ERR GroveNFC EMU: ") + (emuErr.empty() ? "activate failed" : emuErr));
+                        scan_log_lines_.push_back(std::string("  proto=") + nfc_app::to_string(protocol));
+                        ui_message_ = emuErr.empty() ? "GroveNFC start failed" : emuErr;
                     }
                     render_all();
                 } else if (endpoint.kind == nfc_app::TransportKind::I2cBus || emu_device_kind == nfc_app::DeviceKind::NFCUnit) {
@@ -925,17 +959,11 @@ private:
         int tab_index = static_cast<int>(current_tab_);
         tab_index = (tab_index + delta + 4) % 4;
         current_tab_ = static_cast<Tab>(tab_index);
-        // Do not auto-reconnect during tab switch; serial probe can block UI for seconds.
-        // Reconnect remains available in explicit actions (Read/Emu OK flow).
-        // If leaving Emulator tab while PN532 NDEF emulation is running, stop it.
+        // When leaving Emulator tab, stop NDEF emulation only.
         if (prev_tab == Tab::Emulator && current_tab_ != Tab::Emulator) {
             if (service_.pn532_ndef_state().running) {
                 service_.stop_pn532_ndef_emulation();
                 ui_message_ = "NDEF emulation stopped";
-            }
-            if (service_.nfcunit_emulation_running()) {
-                service_.grovenfc_deactivate();
-                ui_message_ = "NFC Unit emulation stopped";
             }
             if (service_.spi_listener_active()) {
                 service_.spi_stop_listener();
@@ -946,11 +974,15 @@ private:
             ui_message_ = "EMU ready";
             const auto conn = service_.connection_state();
             cache_serial_device_kind(conn);
-            if (conn.connected &&
-                effective_emu_device_kind(conn) == nfc_app::DeviceKind::PN532Killer) {
+            const auto kind = effective_emu_device_kind(conn);
+            if (conn.connected && kind == nfc_app::DeviceKind::PN532Killer) {
                 emu_dump_scroll_ = 0;
                 const auto proto = service_.current_emulator_protocol();
                 service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
+            } else if (conn.connected &&
+                       (kind == nfc_app::DeviceKind::GroveNFC ||
+                        kind == nfc_app::DeviceKind::NFCUnit)) {
+                // GroveNFC: emulate on Tab key (manual protocol switch), not auto on entry
             }
         } else if (current_tab_ == Tab::Read) {
             // When entering READ tab with PN532Killer: always switch back to reader mode
@@ -988,6 +1020,31 @@ private:
 
     void consume_nfcunit_emu_autostart_result()
     {
+        // Handle deferred GroveNFC / NFCUnit emulation start (threaded)
+        if (grovenfc_emu_pending_) {
+            grovenfc_emu_pending_ = false;
+            const auto conn = service_.connection_state();
+            const auto kind = effective_emu_device_kind(conn);
+            if (conn.connected && (kind == nfc_app::DeviceKind::GroveNFC ||
+                                   kind == nfc_app::DeviceKind::NFCUnit)) {
+                const auto proto = service_.current_emulator_protocol();
+                std::thread([this, proto]() {
+                    std::string emuErr;
+                    bool ok = service_.grovenfc_activate(proto, 0, &emuErr);
+                    grovenfc_emu_result_ok_ = ok;
+                    grovenfc_emu_result_msg_ = ok
+                        ? (std::string("> EMU auto: ") + nfc_app::to_string(proto))
+                        : (std::string("ERR EMU auto: ") + (emuErr.empty() ? "failed" : emuErr));
+                    grovenfc_emu_result_ready_ = true;
+                }).detach();
+            }
+        }
+        if (grovenfc_emu_result_ready_) {
+            scan_log_lines_.push_back(grovenfc_emu_result_msg_);
+            grovenfc_emu_result_ready_ = false;
+            render_all();
+        }
+
         const auto state = service_.nfcunit_emu_start_state();
         if (state.running) {
             std::lock_guard<std::mutex> lock(nfcunit_emu_autostart_mutex_);
@@ -2554,7 +2611,7 @@ private:
                 (protocol == nfc_app::ProtocolKind::MifareClassic) ? "MFC-1K" :
                 (protocol == nfc_app::ProtocolKind::Iso14443B)     ? "ISO14B"  :
                 (protocol == nfc_app::ProtocolKind::Iso15693)      ? "ISO15693" :
-                                                                                 "NFC-A";
+                                                                                 "NTAG";
             const bool is_st25r =
                 (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) ||
                 (endpoint.kind == nfc_app::TransportKind::SpiBus && connection.connected);
@@ -4444,7 +4501,14 @@ private:
     {
         const int footer_y = std::max(0, static_cast<int>(lv_obj_get_height(parent)) - 14);
         lv_obj_t *footer = create_panel(parent, 0, footer_y, 320, 14, 0x0A0A0A);
-        create_text(footer, 4, 1, to_compact(text, 52).c_str(), 0x7FA5C9, 10);
+        // Show full text, left-aligned, use smaller font if available
+        lv_obj_t *label = lv_label_create(footer);
+        lv_label_set_text(label, text.c_str());
+        lv_obj_set_style_text_font(label, &lv_font_unscii_8, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_color(label, lv_color_hex(0x7FA5C9), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_pos(label, 2, 1);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_width(label, 316);
     }
 
     // ── Key code helpers (evdev scan codes → printable char) ────────────────
