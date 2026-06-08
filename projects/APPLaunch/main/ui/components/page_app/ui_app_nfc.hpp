@@ -4549,7 +4549,12 @@ private:
         const auto &rec = saved_records_[saved_idx_];
         create_text(card, 8, 6, to_compact(rec.meta.display_name, 26).c_str(), 0xFFFFFF, 12);
 
-        const char *options[] = {"Upload to Slot...", "Edit Name", "Edit Hex Data", "Delete"};
+        const auto conn = service_.connection_state();
+        const auto emu_kind = effective_emu_device_kind(conn);
+        const bool is_grove_nfc = (emu_kind == nfc_app::DeviceKind::GroveNFC ||
+                                   emu_kind == nfc_app::DeviceKind::NFCUnit);
+        const char *upload_label = is_grove_nfc ? "Emulate" : "Upload to Slot...";
+        const char *options[] = {upload_label, "Edit Name", "Edit Hex Data", "Delete"};
         for (int i = 0; i < 4; ++i) {
             const bool sel = (modal_idx_ == i);
             const bool is_delete = (i == 3);
