@@ -623,18 +623,32 @@ private:
             return;
         }
 
-        // In EMU tab: F/X always cycle hardware slot (even when dump is shown and UP/DOWN scrolls)
+        // In EMU tab: F/X scroll dump for GroveNFC, cycle slot for PN532Killer
         if (current_tab_ == Tab::Emulator && modal_ == Modal::None &&
             (raw_key == KEY_F || raw_key == KEY_X)) {
             const auto conn = service_.connection_state();
             cache_serial_device_kind(conn);
-            if (effective_emu_device_kind(conn) == nfc_app::DeviceKind::PN532Killer) {
+            const auto kind = effective_emu_device_kind(conn);
+            if (kind == nfc_app::DeviceKind::PN532Killer) {
                 const int delta = (raw_key == KEY_F) ? -1 : 1;
                 hw_emu_slot_ = (hw_emu_slot_ + delta + 8) % 8;
                 emu_dump_scroll_ = 0;
                 const auto proto = service_.current_emulator_protocol();
                 service_.hw_switch_emu_slot_and_probe(proto, hw_emu_slot_);
                 ui_message_ = "HW Slot " + std::to_string(hw_emu_slot_ + 1);
+                render_all();
+            } else if (kind == nfc_app::DeviceKind::GroveNFC ||
+                       kind == nfc_app::DeviceKind::NFCUnit) {
+                // Scroll entire right panel content (header + dump) as one block
+                const int delta = (raw_key == KEY_X) ? 1 : -1;
+                auto dump_lines = service_.i2c_emulator_dump_lines(service_.current_emulator_protocol());
+                const auto proto = service_.current_emulator_protocol();
+                const bool is_mfc = (proto == nfc_app::ProtocolKind::MifareClassic);
+                int header_lines = is_mfc ? 5 : 3;
+                int data_rows = (int)dump_lines.size();
+                int total = header_lines + std::max(1, data_rows);
+                const int MAX_VISIBLE = 11;
+                emu_dump_scroll_ = std::max(0, std::min(emu_dump_scroll_ + delta, std::max(0, total - MAX_VISIBLE)));
                 render_all();
             }
             return;
@@ -696,18 +710,15 @@ private:
                         service_.toggle_spi_profile();
                         ui_message_ = std::string("Profile -> ") + service_.spi_profile_label();
                     } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC) {
-                        // Stop current, switch protocol, restart
-                        service_.grovenfc_deactivate();
+                        // GroveNFC: only switch protocol, do NOT activate (I2C is slow)
                         service_.cycle_hw_emu_protocol();
                         emu_dump_scroll_ = 0;
                         const auto proto2 = service_.current_emulator_protocol();
-                        std::string emuErr2;
-                        if (service_.grovenfc_activate(proto2, 0, &emuErr2)) {
-                            scan_log_lines_.push_back(std::string("> EMU: ") + nfc_app::to_string(proto2));
-                        } else {
-                            scan_log_lines_.push_back(std::string("ERR EMU: ") + (emuErr2.empty() ? "failed" : emuErr2));
-                        }
-                        ui_message_ = std::string("Protocol -> ") + nfc_app::to_string(proto2);
+                        std::string src_file;
+                        if (proto2 == nfc_app::ProtocolKind::MifareClassic) src_file = "emulator/mfc1k_0.json";
+                        else if (proto2 == nfc_app::ProtocolKind::Iso15693) src_file = "emulator/iso15693_0.json";
+                        else src_file = "emulator/ntag213_0.json";
+                        ui_message_ = std::string("Protocol -> ") + nfc_app::to_string(proto2) + "  Load from " + src_file;
                     } else {
                         service_.toggle_nfcunit_profile_protocol();
                         ui_message_ = std::string("Profile -> ") + service_.nfcunit_profile_label();
@@ -767,6 +778,11 @@ private:
                     render_all();
                 } else if (emu_device_kind == nfc_app::DeviceKind::GroveNFC) {
                     const auto protocol = service_.current_emulator_protocol();
+                    // Before activating, reload I2C emulator dump from JSON so
+                    // the hardware emulates the data actually shown on screen.
+                    service_.i2c_emulator_dump_lines(protocol);  // triggers JSON→cache load
+                    service_.reload_i2c_profile_from_cache(protocol);
+
                     std::string emuErr;
                     if (service_.grovenfc_activate(protocol, 0, &emuErr)) {
                         scan_log_lines_.push_back(std::string("> GroveNFC EMU: ") + nfc_app::to_string(protocol) + " started");
@@ -971,7 +987,12 @@ private:
             }
         }
         if (current_tab_ == Tab::Emulator) {
-            ui_message_ = "EMU ready";
+            const auto proto = service_.current_emulator_protocol();
+            std::string src_filename;
+            if (proto == nfc_app::ProtocolKind::MifareClassic) src_filename = "emulator/mfc1k_0.json";
+            else if (proto == nfc_app::ProtocolKind::Iso15693) src_filename = "emulator/iso15693_0.json";
+            else src_filename = "emulator/ntag213_0.json";
+            ui_message_ = "Load from " + src_filename;
             const auto conn = service_.connection_state();
             cache_serial_device_kind(conn);
             const auto kind = effective_emu_device_kind(conn);
@@ -1544,11 +1565,17 @@ private:
             } else {
                 const auto emu_kind = effective_emu_device_kind(conn);
                 if (emu_kind == nfc_app::DeviceKind::NFCUnit ||
-                    emu_kind == nfc_app::DeviceKind::ST25RNFC) {
-                    hw_emu_slot_ = 0;
-                    ui_message_ = (emu_kind == nfc_app::DeviceKind::ST25RNFC)
-                                  ? "ST25R: Tab selects profile"
-                                  : "NFC Unit: Tab selects profile";
+                    emu_kind == nfc_app::DeviceKind::ST25RNFC ||
+                    emu_kind == nfc_app::DeviceKind::GroveNFC) {
+                    // No slot — scroll entire right panel content (header + dump)
+                    auto dump_lines = service_.i2c_emulator_dump_lines(service_.current_emulator_protocol());
+                    const auto proto2 = service_.current_emulator_protocol();
+                    const bool is_mfc2 = (proto2 == nfc_app::ProtocolKind::MifareClassic);
+                    int header_lines = is_mfc2 ? 5 : 3;
+                    int data_rows = (int)dump_lines.size();
+                    int total = header_lines + std::max(1, data_rows);
+                    const int MAX_VISIBLE = 11;
+                    emu_dump_scroll_ = std::max(0, std::min(emu_dump_scroll_ + delta, std::max(0, total - MAX_VISIBLE)));
                 } else {
                     service_.cycle_slot(delta);
                     ui_message_ = "Slot changed";
@@ -2486,8 +2513,8 @@ private:
         const auto emu_device_kind = effective_emu_device_kind(connection);
         const auto protocol = service_.current_emulator_protocol();
 
-        lv_obj_t *left  = create_panel(parent, 0, 0, 116, 104, 0x101010);
-        lv_obj_t *right = create_panel(parent, 120, 0, 200, 104, 0x101010);
+        lv_obj_t *left  = create_panel(parent, 0, 0, 80, 104, 0x101010);
+        lv_obj_t *right = create_panel(parent, 84, 0, 236, 104, 0x101010);
 
         if (emu_device_kind == nfc_app::DeviceKind::PN532Killer) {
             // ── HW EMU mode: show PN532Killer hardware slot ──────────────────
@@ -2645,7 +2672,8 @@ private:
             if (!is_nfc_unit && !is_st25r) create_text(left, 6, 62, "OK:menu", 0xF7A600, 10);
             create_text(left, 6, 80, is_st25r ? "M5 NFC CAP SPI" : (is_nfc_unit ? "NFC Unit I2C" : "GroveNFC I2C"), is_st25r ? 0x00B4FF : 0x00FF88, 10);
 
-            create_text(right, 6, 4,  is_nfc_unit ? nfc_unit_profile.c_str() : (is_st25r ? service_.spi_profile_label().c_str() : proto_name.c_str()), 0x00D2FF, 12);
+            if (!is_grove_or_nfcunit)
+                create_text(right, 6, 4,  is_nfc_unit ? nfc_unit_profile.c_str() : (is_st25r ? service_.spi_profile_label().c_str() : proto_name.c_str()), 0x00D2FF, 12);
             const auto start_state = service_.nfcunit_emu_start_state();
             if (is_nfc_unit) {
                 const auto emu_protocol = service_.current_emulator_protocol();
@@ -2678,6 +2706,125 @@ private:
                     create_text(right, 6, 52, "UID:0452A1B2C3D4E5", 0x9E9E9E, 10);
                     create_text(right, 6, 66, "ATQA:0044 SAK:00", 0x9E9E9E, 10);
                 }
+            } else if (is_grove_or_nfcunit) {
+                // Show card info + dump blocks — all content scrolls as one block
+                auto dump_lines = service_.i2c_emulator_dump_lines(protocol);
+
+                // Build source filename for footer display
+                std::string src_filename;
+                if (protocol == nfc_app::ProtocolKind::MifareClassic) src_filename = "emulator/mfc1k_0.json";
+                else if (protocol == nfc_app::ProtocolKind::Iso15693) src_filename = "emulator/iso15693_0.json";
+                else src_filename = "emulator/ntag213_0.json";
+                ui_message_ = "Load from " + src_filename;
+
+                struct ContentLine { std::string text; uint32_t color; bool mono; };
+                std::vector<ContentLine> lines;
+
+                // Title line
+                lines.push_back({proto_name, 0x00D2FF, true});
+
+                // Read UID from the cache (populated from JSON card.uid by i2c_emulator_dump_lines)
+                const auto slot_info = service_.emu_slot_info(protocol, 0);
+                std::string uid_str = slot_info.uid;
+                if (uid_str.empty()) uid_str = "-";
+                // Auto-detect SAK/ATQA from MFC protocol
+                std::string sak_str, atqa_str;
+                const bool is_mfc = (protocol == nfc_app::ProtocolKind::MifareClassic);
+                if (is_mfc) {
+                    sak_str = "SAK:08";
+                    atqa_str = "ATQA:0004";
+                }
+
+                lines.push_back({std::string("UID:") + uid_str, 0x00D2FF, true});
+                if (!sak_str.empty()) lines.push_back({sak_str, 0xD8D8D8, true});
+                if (!atqa_str.empty()) lines.push_back({atqa_str, 0xD8D8D8, true});
+
+                // Dump header
+                lines.push_back({"Dump:", 0x9E9E9E, true});
+
+                if (dump_lines.empty()) {
+                    lines.push_back({"(no dump loaded)", 0x666666, true});
+                } else {
+                    for (int i = 0; i < (int)dump_lines.size(); ++i) {
+                        // No word-wrap: each raw dump line = one display line.
+                        // Apply the same coloring as READ tab dump (render_dump_line_colored).
+                        const std::string &raw = dump_lines[i];
+                        std::string text_to_show = raw;
+                        uint32_t color = 0xD8D8D8;
+
+                        size_t colon = raw.find(':');
+                        bool looks_hex = (colon != std::string::npos && colon > 0);
+                        if (looks_hex) {
+                            for (size_t ci = 0; ci < colon; ++ci) {
+                                if (!std::isdigit((unsigned char)raw[ci])) { looks_hex = false; break; }
+                            }
+                        }
+                        int block_num = looks_hex ? std::stoi(raw.substr(0, colon)) : i;
+                        std::string hex = looks_hex ? raw.substr(colon + 1) : raw;
+
+                        if (is_mfc) {
+                            bool is_trailer = (block_num % 4 == 3);
+                            bool is_block0  = (block_num == 0);
+                            if (hex.size() >= 32 && looks_hex) {
+                                // Full per-byte coloring (same as render_dump_line_colored)
+                                // We'll store a simple 2-char prefix + mark for special rendering below.
+                                if (is_trailer) {
+                                    // Trailer: KeyA(0-11) green/orange, ACS(12-19) orange, KeyB(20-31) green/orange
+                                    lines.push_back({raw, 0x44CC88, true});  // placeholder, real coloring below
+                                    // We push individual segments instead for MFC trailers
+                                } else if (is_block0) {
+                                    // Block0 needs UID/BCC/SAK/ATQA coloring
+                                    lines.push_back({raw, 0x44BBFF, true});  // placeholder, real coloring below
+                                } else {
+                                    lines.push_back({raw, 0xC0C0C0, true});
+                                }
+                            } else {
+                                if (is_trailer) color = 0x44CC88;
+                                else if (is_block0) color = 0x44BBFF;
+                                else color = 0xC0C0C0;
+                                lines.push_back({raw, color, true});
+                            }
+                        } else {
+                            // NTAG / ISO15693: show blocks, append ASCII column
+                            std::string ascii_part;
+                            std::string pure;
+                            for (char c : hex) if (std::isxdigit((unsigned char)c)) pure += (char)std::toupper((unsigned char)c);
+                            if (pure.size() >= 2) {
+                                ascii_part = " |";
+                                for (size_t bi = 0; bi + 1 < pure.size(); bi += 2) {
+                                    unsigned long v = std::strtoul(pure.substr(bi, 2).c_str(), nullptr, 16);
+                                    char ch = static_cast<char>(v & 0xFF);
+                                    ascii_part += (ch >= 32 && ch <= 126) ? ch : '.';
+                                }
+                            }
+                            std::string display = raw + ascii_part;
+                            lines.push_back({display, 0xC0C0C0, true});
+                        }
+                    }
+                }
+
+                // Scroll & render — now with per-byte MFC coloring
+                static constexpr int ROW_H = 9;
+                static constexpr int PANEL_H = 104;
+                const int MAX_VISIBLE = (PANEL_H - 4) / ROW_H;
+                int total = (int)lines.size();
+                int max_scroll = std::max(0, total - MAX_VISIBLE);
+                int scroll = std::max(0, std::min(emu_dump_scroll_, max_scroll));
+
+                const int uid_hex_digits = (int)uid_str.size();
+                const int uid_len = uid_hex_digits / 2;
+
+                for (int i = 0; i < MAX_VISIBLE && (scroll + i) < total; ++i) {
+                    const auto &l = lines[scroll + i];
+                    int y = 2 + i * ROW_H;
+
+                    if (l.color == 0x44CC88 || l.color == 0x44BBFF) {
+                        // MFC trailer or block0 — render with per-byte colors
+                        render_dump_line_colored(right, 4, y, l.text, uid_len);
+                    } else {
+                        create_text_mono(right, 4, y, l.text.c_str(), l.color, 7);
+                    }
+                }
             } else {
                 create_text(right, 6, 20, "OK menu: Dn/Up/Save", 0xD8D8D8, 10);
                 create_text(right, 6, 34, "activate selected slot", 0xD8D8D8, 10);
@@ -2685,7 +2832,6 @@ private:
                 create_text(right, 6, 64, "MFC/NTAG/ISO14B", 0x9E9E9E, 10);
                 create_text(right, 6, 76, "ISO15693", 0x9E9E9E, 10);
             }
-            create_text(right, 6, 92, is_nfc_unit ? "I2C profile cache enabled" : (is_st25r ? "SPI profile cache enabled" : "I2C slot cache enabled"), 0x444444, 10);
         } else {
             // ── No device / unknown ───────────────────────────────────────────
             create_text(left, 6, 4,  "EMU", 0x888888, 12);
@@ -2723,7 +2869,8 @@ private:
         const bool st25r_mode =
             (emu_device_kind == nfc_app::DeviceKind::ST25RNFC) ||
             (endpoint.kind == nfc_app::TransportKind::SpiBus && conn.connected);
-        const bool nfc_unit_mode = !st25r_mode &&
+        const bool grove_mode = (emu_device_kind == nfc_app::DeviceKind::GroveNFC);
+        const bool nfc_unit_mode = !st25r_mode && !grove_mode &&
                                    (emu_device_kind == nfc_app::DeviceKind::NFCUnit ||
                                     endpoint.kind == nfc_app::TransportKind::I2cBus);
         const bool nfc_unit_url_mode = nfc_unit_mode &&
@@ -2747,12 +2894,14 @@ private:
                 create_text(card, 8, 5, (service_.nfcunit_profile_label() + " Profile").c_str(), 0xFFFFFF, 12);
             } else if (st25r_mode) {
                 create_text(card, 8, 5, (service_.spi_profile_label() + " SPI").c_str(), 0xFFFFFF, 12);
+            } else if (grove_mode) {
+                create_text(card, 8, 5, (std::string("GroveNFC ") + nfc_app::to_string(service_.current_emulator_protocol())).c_str(), 0xFFFFFF, 12);
             } else {
                 const auto slot = service_.selected_slot_index();
                 create_text(card, 8, 5, (std::string(nfc_app::to_string(service_.current_emulator_protocol())) + " Slot " + std::to_string(slot)).c_str(), 0xFFFFFF, 12);
             }
         }
-        const char *options[] = {"Download Data", "Upload Data", "Set Default"};  // Save via Ctrl+S
+        const char *options[] = {"Download Data", "Upload Data", "Reset to default MFC1K dump"};  // Save via Ctrl+S
         const char *nfc_unit_opts[] = {
             service_.nfcunit_emulation_running() ? "Stop Emulation" : "Start Emulating",
             "Download Data",
@@ -5226,8 +5375,8 @@ private:
                     }
                 }
             } else if (!nfc_unit_mode && modal_idx_ == 2) {
-                service_.set_default_slot();
-                ui_message_ = "Set as module default mode";
+                bool ok = service_.reset_emulator_json_from_default(service_.current_emulator_protocol());
+                ui_message_ = ok ? "Reset to default MFC1K dump" : "Reset failed";
             }
             modal_ = Modal::None;
             modal_idx_ = 0;
