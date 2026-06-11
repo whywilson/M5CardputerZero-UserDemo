@@ -120,14 +120,15 @@ static int open_restricted(const char *path, int flags, void *user_data) {
         fprintf(stderr, "无法打开 %s: %s\n", path, strerror(errno));
         return -errno;
     }
-    /* Grab the device exclusively. Without this, the kernel VT keyboard
-     * handler also feeds keystrokes from the integrated TCA8418 keypad to
-     * the foreground tty — leaking keys into any shell on tty1 / HDMI
-     * console at the same time APPLaunch is reading them. EBUSY here is
-     * non-fatal: another grabber already holds it, libinput will read
-     * normally without the VT-leak protection. */
-    if (ioctl(fd, EVIOCGRAB, 1) < 0 && errno != EBUSY) {
-        fprintf(stderr, "[KBD] EVIOCGRAB %s failed: %s\n", path, strerror(errno));
+    /* Default to non-exclusive keyboard access so standalone external apps
+     * (for example RFID launched from APPLaunch) can read /dev/input directly.
+     * Set APPLAUNCH_KEYBOARD_EVIOCGRAB=1 to force exclusive grab when needed. */
+    const char *grab_env = getenv("APPLAUNCH_KEYBOARD_EVIOCGRAB");
+    const int want_grab = (grab_env && strcmp(grab_env, "1") == 0);
+    if (want_grab) {
+        if (ioctl(fd, EVIOCGRAB, 1) < 0 && errno != EBUSY) {
+            fprintf(stderr, "[KBD] EVIOCGRAB %s failed: %s\n", path, strerror(errno));
+        }
     }
     return fd;
 }
